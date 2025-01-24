@@ -1,11 +1,104 @@
 import os
 from pathlib import Path
-
-import torch
-from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+import subprocess
+import sys
+from setuptools import find_packages, setup, Extension
+from setuptools.command.build_ext import build_ext
+from typing import Dict
 
 root = Path(__file__).parent.resolve()
+
+
+class CMakeExtension(Extension):
+    def __init__(self, name: str, cmake_lists_dir: str = '.', **kwa) -> None:
+        super().__init__(name, sources=[], py_limited_api=True, **kwa)
+        self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
+
+class cmake_build_ext(build_ext):
+    # A dict of extension directories that have been configured.
+    did_config: Dict[str, bool] = {}
+
+    #
+    # Perform cmake configuration for a single extension.
+    #
+    def configure(self, ext: CMakeExtension) -> None:
+        # If we've already configured using the CMakeLists.txt for
+        # this extension, exit early.
+        if ext.cmake_lists_dir in cmake_build_ext.did_config:
+            return
+
+        cmake_build_ext.did_config[ext.cmake_lists_dir] = True
+
+        subprocess.check_call(
+            ['cmake', ext.cmake_lists_dir],
+            cwd=self.build_temp)
+
+    def compute_num_jobs(self):
+        try:
+            # os.sched_getaffinity() isn't universally available, so fall
+            #  back to os.cpu_count() if we get an error here.
+            num_jobs = len(os.sched_getaffinity(0))
+        except AttributeError:
+            num_jobs = os.cpu_count()
+        nvcc_threads = 1
+        return num_jobs, nvcc_threads
+
+    def build_extensions(self) -> None:
+        # Ensure that CMake is present and working
+        try:
+            subprocess.check_output(['cmake', '--version'])
+        except OSError as e:
+            raise RuntimeError('Cannot find CMake executable') from e
+
+        # Create build directory if it does not exist.
+        if not os.path.exists(self.build_temp):
+            os.makedirs(self.build_temp)
+
+        targets = []
+
+        def target_name(s: str) -> str:
+            return s.removeprefix("sgl_kernel.ops.")
+
+        # Build all the extensions
+        for ext in self.extensions:
+            self.configure(ext)
+            targets.append(target_name(ext.name))
+
+        num_jobs, _ = self.compute_num_jobs()
+
+        build_args = [
+            "--build",
+            ".",
+            f"-j={num_jobs}",
+            *[f"--target={name}" for name in targets],
+        ]
+
+        subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
+
+        # Install the libraries
+        for ext in self.extensions:
+            # Install the extension into the proper location
+            outdir = Path(self.get_ext_fullpath(ext.name)).parent.absolute()
+
+            # Skip if the install directory is the same as the build directory
+            if outdir == self.build_temp:
+                continue
+
+            # CMake appends the extension prefix to the install path,
+            # and outdir already contains that prefix, so we need to remove it.
+            # We assume only the final component of extension prefix is added by
+            # CMake, this is currently true for current extensions but may not
+            # always be the case.
+            prefix = outdir
+            if '.' in ext.name:
+                prefix = prefix.parent
+
+            # prefix here should actually be the same for all components
+            install_args = [
+                "cmake", "--install", ".", "--prefix", prefix, "--component",
+                target_name(ext.name)
+            ]
+            subprocess.check_call(install_args, cwd=self.build_temp)
 
 
 def _update_wheel_platform_tag():
@@ -17,131 +110,14 @@ def _update_wheel_platform_tag():
         )
         old_wheel.rename(new_wheel)
 
-
-def _get_cuda_version():
-    if torch.version.cuda:
-        return tuple(map(int, torch.version.cuda.split(".")))
-    return (0, 0)
-
-
-def _get_device_sm():
-    if torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability()
-        return major * 10 + minor
-    return 0
-
-
 def _get_version():
     with open(root / "pyproject.toml") as f:
         for line in f:
             if line.startswith("version"):
                 return line.split("=")[1].strip().strip('"')
 
-
-cutlass = root / "3rdparty" / "cutlass"
-flashinfer = root / "3rdparty" / "flashinfer"
-include_dirs = [
-    cutlass.resolve() / "include",
-    cutlass.resolve() / "tools" / "util" / "include",
-    root / "src" / "sgl-kernel" / "csrc",
-    flashinfer.resolve() / "include",
-    flashinfer.resolve() / "include" / "gemm",
-    flashinfer.resolve() / "csrc",
-]
-nvcc_flags = [
-    "-DNDEBUG",
-    "-O3",
-    "-Xcompiler",
-    "-fPIC",
-    "-gencode=arch=compute_75,code=sm_75",
-    "-gencode=arch=compute_80,code=sm_80",
-    "-gencode=arch=compute_89,code=sm_89",
-    "-gencode=arch=compute_90,code=sm_90",
-    "-std=c++17",
-    "-use_fast_math",
-    "-DFLASHINFER_ENABLE_F16",
-]
-
-sources = [
-    "src/sgl-kernel/csrc/trt_reduce_internal.cu",
-    "src/sgl-kernel/csrc/trt_reduce_kernel.cu",
-    "src/sgl-kernel/csrc/moe_align_kernel.cu",
-    "src/sgl-kernel/csrc/int8_gemm_kernel.cu",
-    "src/sgl-kernel/csrc/sampling_scaling_penalties.cu",
-    "src/sgl-kernel/csrc/lightning_attention_decode_kernel.cu",
-    "src/sgl-kernel/csrc/sgl_kernel_ops.cu",
-    "src/sgl-kernel/csrc/rotary_embedding.cu",
-    "3rdparty/flashinfer/csrc/activation.cu",
-    "3rdparty/flashinfer/csrc/bmm_fp8.cu",
-    "3rdparty/flashinfer/csrc/group_gemm.cu",
-    "3rdparty/flashinfer/csrc/norm.cu",
-    "3rdparty/flashinfer/csrc/sampling.cu",
-    "3rdparty/flashinfer/csrc/renorm.cu",
-]
-
-enable_bf16 = os.getenv("SGL_KERNEL_ENABLE_BF16", "0") == "1"
-enable_fp8 = os.getenv("SGL_KERNEL_ENABLE_FP8", "0") == "1"
-enable_sm90a = os.getenv("SGL_KERNEL_ENABLE_SM90A", "0") == "1"
-cuda_version = _get_cuda_version()
-sm_version = _get_device_sm()
-
-if torch.cuda.is_available():
-    if cuda_version >= (12, 0) and sm_version >= 90:
-        nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
-        sources.append("3rdparty/flashinfer/csrc/group_gemm_sm90.cu")
-    if sm_version >= 90:
-        nvcc_flags.extend(
-            [
-                "-DFLASHINFER_ENABLE_FP8",
-                "-DFLASHINFER_ENABLE_FP8_E4M3",
-                "-DFLASHINFER_ENABLE_FP8_E5M2",
-            ]
-        )
-    if sm_version >= 80:
-        nvcc_flags.append("-DFLASHINFER_ENABLE_BF16")
-else:
-    # compilation environment without GPU
-    if enable_sm90a:
-        nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
-        sources.append("3rdparty/flashinfer/csrc/group_gemm_sm90.cu")
-    if enable_fp8:
-        nvcc_flags.extend(
-            [
-                "-DFLASHINFER_ENABLE_FP8",
-                "-DFLASHINFER_ENABLE_FP8_E4M3",
-                "-DFLASHINFER_ENABLE_FP8_E5M2",
-            ]
-        )
-    if enable_bf16:
-        nvcc_flags.append("-DFLASHINFER_ENABLE_BF16")
-
-for flag in [
-    "-D__CUDA_NO_HALF_OPERATORS__",
-    "-D__CUDA_NO_HALF_CONVERSIONS__",
-    "-D__CUDA_NO_BFLOAT16_CONVERSIONS__",
-    "-D__CUDA_NO_HALF2_OPERATORS__",
-]:
-    try:
-        torch.utils.cpp_extension.COMMON_NVCC_FLAGS.remove(flag)
-    except ValueError:
-        pass
-
-cxx_flags = ["-O3"]
-libraries = ["c10", "torch", "torch_python", "cuda"]
-extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", "-L/usr/lib/x86_64-linux-gnu"]
-
 ext_modules = [
-    CUDAExtension(
-        name="sgl_kernel.ops._kernels",
-        sources=sources,
-        include_dirs=include_dirs,
-        extra_compile_args={
-            "nvcc": nvcc_flags,
-            "cxx": cxx_flags,
-        },
-        libraries=libraries,
-        extra_link_args=extra_link_args,
-    ),
+    CMakeExtension(name="sgl_kernel.ops._kernels"),
 ]
 
 setup(
@@ -150,7 +126,7 @@ setup(
     packages=find_packages(),
     package_dir={"": "src"},
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass={"build_ext": cmake_build_ext},
 )
 
 _update_wheel_platform_tag()
