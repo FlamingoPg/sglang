@@ -14,6 +14,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     gelu_and_mul_triton_kernel,
     grouped_gemm_triton,
     post_reorder_triton_kernel,
+    pre_reorder,
     pre_reorder_triton_kernel,
     run_moe_ep_preproess,
     silu_and_mul_triton_kernel,
@@ -34,23 +35,16 @@ logger = logging.getLogger(__name__)
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
 
-    def __init__(self, device, use_flashinfer: bool = False):
+    def __init__(self, quantize, blockwise_quant):
         super().__init__()
-        self.device = device
-        self.use_flashinfer = use_flashinfer
-        if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_warpper is None:
-            GroupedGemmRunner._init_flashinfer_wrapper(device)
+        
+        self.grouped_gemm_type = "triton"
+        if quantize and blockwise_quant:
+            self.grouped_gemm_type = "deepgemm"
+        
+        assert self.grouped_gemm_type in ["triton", "deepgemm"], \
+            "We now just support triton or deepgemm grouped gemm."
 
-    @classmethod
-    def _init_flashinfer_wrapper(cls, device):
-        from flashinfer import SegmentGEMMWrapper
-
-        workspace_buffer = torch.empty(
-            128 * 1024 * 1024, dtype=torch.int8, device=device
-        )
-        cls.flashinfer_gemm_warpper = SegmentGEMMWrapper(workspace_buffer)
-
-    # c = a * b
     def forward(
         self,
         a: torch.Tensor,
@@ -65,21 +59,9 @@ class GroupedGemmRunner(torch.nn.Module):
         scale_b: torch.Tensor = None,
         block_shape: Optional[List[int]] = None,
     ):
-        if self.use_flashinfer:
-            # TODO: flashinfer
-            assert False
-            assert GroupedGemmRunner.flashinfer_gemm_warpper is not None
-            c = GroupedGemmRunner.flashinfer_gemm_warpper.run(
-                x=a,
-                weights=b,
-                batch_size=batch_size,
-                weight_column_major=weight_column_major,
-                seg_indptr=seg_indptr,
-                weight_indices=weight_indices,
-            )
-        else:
+        if self.grouped_gemm_type == "triton"
             assert weight_column_major == True
-            c = grouped_gemm_triton(
+            grouped_gemm_triton(
                 a,
                 b,
                 c,
@@ -91,6 +73,13 @@ class GroupedGemmRunner(torch.nn.Module):
                 scale_a,
                 scale_b,
                 block_shape=block_shape,
+            )
+        elif self.grouped_gemm_type == "sgl_kernel"
+            deepgemm(
+                a,
+                b,
+                c,
+                xx,
             )
         return c
 
@@ -125,29 +114,38 @@ class EPMoE(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
-        self.tp_size = (
-            tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
+        # ep parallel parameters
+        self.ep_size = (
+            ep_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.ep_rank = get_tensor_model_parallel_rank()
 
+        # ep parameters
         self.num_experts = num_experts
-        assert self.num_experts % self.tp_size == 0
-        self.num_experts_per_partition = self.num_experts // self.tp_size
-        self.start_expert_id = self.tp_rank * self.num_experts_per_partition
+        self.num_experts_per_partition = self.num_experts // self.ep_size
+        self.start_expert_id = self.ep_rank * self.num_experts_per_partition
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
 
-        self.top_k = top_k
         self.intermediate_size = intermediate_size
+
+        # select expert parameters
+        self.top_k = top_k
         self.renormalize = renormalize
         self.use_grouped_topk = use_grouped_topk
-        if self.use_grouped_topk:
-            assert num_expert_group is not None and topk_group is not None
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.correction_bias = correction_bias
         self.custom_routing_function = custom_routing_function
+        
+        # activation parameters
         self.activation = activation
 
+        # assert
+        assert self.num_experts % self.ep_size == 0
+        if self.use_grouped_topk:
+            assert num_expert_group is not None and topk_group is not None
+
+        # quantize paramters
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
             self.use_fp8_w8a8 = False
@@ -155,6 +153,7 @@ class EPMoE(torch.nn.Module):
             self.block_shape = None
             self.activation_scheme = None
         else:
+            # block quant / pertoken quant
             self.quant_method: Optional[QuantizeMethodBase] = Fp8EPMoEMethod(
                 quant_config
             )
@@ -168,6 +167,7 @@ class EPMoE(torch.nn.Module):
             self.fp8_dtype = torch.float8_e4m3fn
             self.activation_scheme = quant_config.activation_scheme
 
+        # create weight
         self.quant_method.create_weights(
             layer=self,
             num_experts_per_partition=self.num_experts_per_partition,
@@ -177,17 +177,11 @@ class EPMoE(torch.nn.Module):
             weight_loader=self.weight_loader,
         )
 
-        self.grouped_gemm_runner = None
+        self.grouped_gemm_runner = GroupedGemmRunner(self.use_fp8_w8a8, self.use_block_quant)
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        assert self.quant_method is not None
 
-        if self.grouped_gemm_runner is None:
-            self.grouped_gemm_runner = GroupedGemmRunner(
-                hidden_states.device,
-                use_flashinfer=False,  # TODO: use flashinfer
-            )
-
+        # select experts / get topk ids and topk weights
         topk_weights, topk_ids = select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -222,6 +216,7 @@ class EPMoE(torch.nn.Module):
             self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
 
         # PreReorder
+        
         pre_reorder_triton_kernel[(hidden_states.shape[0],)](
             hidden_states,
             gateup_input,
@@ -235,6 +230,7 @@ class EPMoE(torch.nn.Module):
             BLOCK_SIZE=512,
         )
 
+        # Seg Number
         seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
             0,
@@ -242,6 +238,7 @@ class EPMoE(torch.nn.Module):
             device=hidden_states.device,
             dtype=torch.int64,
         )
+        
         # GroupGemm-0
         gateup_output = torch.empty(
             gateup_input.shape[0],
