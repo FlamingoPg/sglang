@@ -584,6 +584,14 @@ def triton_mask(input: torch.Tensor, mask: torch.Tensor, output: torch.Tensor):
         BLOCK_SIZE_1=BLOCK_SIZE_N,
     )
 
+# @triton.jit
+# def _scatter_token_kernel(
+#     input,
+#     output,
+#     index,
+    
+# )
+
 
 def apply_token_ids(A, idx, topk, invalid_val):
     A = A.view(A.shape[0], -1, A.shape[1]).repeat(1, topk, 1).reshape(-1, A.shape[1])
@@ -592,23 +600,15 @@ def apply_token_ids(A, idx, topk, invalid_val):
     if Adtype == torch.float8_e4m3fn or Adtype == torch.float8_e4m3fnuz:
         A = A.view(dtype=torch.uint8)
 
-    TOPKM = A.shape[0]
     A = torch.concat(
         [A, torch.zeros([1, A.shape[1]], dtype=A.dtype, device=A.device)], axis=0
     )
     A = A[idx]
-    idx_inverse = torch.empty(TOPKM, device=idx.device, dtype=idx.dtype)
-    idx_inverse.fill_(-1)
-
-    idx_mask = torch.empty_like(idx_inverse)
-    triton_mask(idx, idx != invalid_val, idx_mask)
-
-    idx_inverse[idx_mask] = torch.arange(TOPKM, device=idx.device, dtype=idx.dtype)
-
+    
     if Adtype == torch.float8_e4m3fn or Adtype == torch.float8_e4m3fnuz:
         A = A.view(dtype=Adtype)
-
-    return A, idx_inverse
+    
+    return A
 
 
 def invoke_fused_moe_kernel(
@@ -674,7 +674,7 @@ def invoke_fused_moe_kernel(
     else:
         assert A_scale is None
         assert B_scale is None
-
+        
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
@@ -685,86 +685,44 @@ def invoke_fused_moe_kernel(
         even_Ks = True
     else:
         even_Ks = False
-
-    if _is_cuda and use_fp8_w8a8 and _enable_jit_deepgemm:
-        invalid_ids = topk_ids.numel()
-        M = (sorted_token_ids.shape[0] // config["BLOCK_SIZE_M"]) * config[
-            "BLOCK_SIZE_M"
-        ]
-        clipped_token_ids = torch.empty(
-            M, device=sorted_token_ids.device, dtype=sorted_token_ids.dtype
-        )
-        clipped_token_ids.copy_(sorted_token_ids[:M])
-
-        A, idx_inverse = apply_token_ids(A, clipped_token_ids, top_k, invalid_ids)
-        A_scale, _ = apply_token_ids(A_scale, clipped_token_ids, top_k, invalid_ids)
-
-        expert_ids_ = torch.empty(M, device=expert_ids.device, dtype=expert_ids.dtype)
-        expert_M = M // config["BLOCK_SIZE_M"]
-        expert_ids_.copy_(
-            torch.repeat_interleave(
-                expert_ids[:expert_M], config["BLOCK_SIZE_M"], dim=0
-            )
-        )
-        expert_ids_[clipped_token_ids == invalid_ids] = 0
-
-        C_2d = torch.empty(
-            (M, B.shape[1]),
-            device=C.device,
-            dtype=C.dtype,
-        )
-
-        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-            (A, A_scale), (B, B_scale), C_2d, expert_ids_
-        )
-
-        C_ = torch.empty(
-            (C.shape[0] * C.shape[1], C.shape[2]), device=C.device, dtype=C.dtype
-        )
-        triton_mask(C_2d, clipped_token_ids != invalid_ids, C_)
-        C_ = C_[idx_inverse].view(C.shape)
-
-        if mul_routed_weight:
-            C_ *= topk_weights[:, :, None]
-        C.copy_(C_)
-    else:
-        fused_moe_kernel[grid](
-            A,
-            B,
-            C,
-            A_scale,
-            B_scale,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            B.shape[1],
-            B.shape[2] - padded_size,
-            sorted_token_ids.shape[0],
-            topk_ids.numel(),
-            A.stride(0),
-            A.stride(1),
-            B.stride(0),
-            B.stride(2),
-            B.stride(1),
-            C.stride(1),
-            C.stride(2),
-            A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
-            A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
-            B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
-            B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
-            B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
-            0 if block_shape is None else block_shape[0],
-            0 if block_shape is None else block_shape[1],
-            MUL_ROUTED_WEIGHT=mul_routed_weight,
-            top_k=top_k,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            even_Ks=even_Ks,
-            **config,
-        )
+    
+    fused_moe_kernel[grid](
+        A,
+        B,
+        C,
+        A_scale,
+        B_scale,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        B.shape[1],
+        B.shape[2] - padded_size,
+        sorted_token_ids.shape[0],
+        topk_ids.numel(),
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        C.stride(2),
+        A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+        A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+        B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+        B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
+        B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+        0 if block_shape is None else block_shape[0],
+        0 if block_shape is None else block_shape[1],
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        even_Ks=even_Ks,
+        **config,
+    )
 
 
 def get_config_file_name(
@@ -1170,152 +1128,260 @@ def fused_experts_impl(
     )
 
     config = get_config_func(M)
-    if _is_cuda:
+
+    if _is_cuda and use_fp8_w8a8 and block_shape is not None and _enable_jit_deepgemm:
+        # this is for deepgemm cache
+        block_k = block_shape[0]
+        # 0. get config
+        invalid_ids = topk_ids.numel()
         config["BLOCK_SIZE_M"] = deep_gemm.get_m_alignment_for_contiguous_layout()
-
-    cache = torch.empty(
-        M * topk_ids.shape[1] * max(N, w2.shape[1]),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
-        (M, topk_ids.shape[1], N),
-    )
-    intermediate_cache2 = torch.empty(
-        (M * topk_ids.shape[1], N // 2),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
-        (M, topk_ids.shape[1], w2.shape[1]),
-    )
-
-    compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
-
-    if no_combine:
-        assert not inplace
-        out_hidden_states = torch.empty(
-            (num_tokens, topk_ids.shape[1], w2.shape[1]),
+        
+        # 1. align block size
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                topk_ids, config["BLOCK_SIZE_M"], E
+            )
+        
+        # 2. prepare cache
+        _M = (sorted_token_ids.shape[0] // config["BLOCK_SIZE_M"]) * \
+            config["BLOCK_SIZE_M"]
+        cache = torch.empty(
+            _M * max(N, w2.shape[1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype
+        )
+        intermediate_cache1 = cache[: _M * N].view(
+            (_M, N),
+        )
+        intermediate_cache2 = torch.empty(
+            (_M, N // 2),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-    elif inplace:
-        out_hidden_states = hidden_states
+        intermediate_cache3 = cache[:_M * w2.shape[1]].view(
+            (_M, w2.shape[1])
+        )
+        intermediate_cache4 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
+            (M * topk_ids.shape[1], w2.shape[1]),
+        )
+        # prepare quantize cache
+        hidden_dim = hidden_states.shape[1]
+        q_cache = torch.empty(
+            _M * max(N, hidden_dim),
+            device=hidden_states.device,
+            dtype=torch.float8_e4m3fn
+        )
+        q_hidden1 = q_cache[:num_tokens * hidden_dim].view(
+            num_tokens, hidden_dim
+        )
+        q_hidden1_premute = q_cache[:_M * hidden_dim].view(
+            _M, hidden_dim
+        )
+        q_hidden2 = q_cache[: _M * N // 2].view(
+            _M, N // 2
+        )
+        
+        # 3. quantize
+        q_hidden1, a1_scale = sglang_per_token_group_quant_fp8(hidden_states, block_k)
+        
+        # 4. prepare for premute
+        clipped_token_ids = sorted_token_ids[:_M]
+        
+        # 5. permute activation and weight (scatter)
+        q_hidden1_premute = apply_token_ids(q_hidden1, clipped_token_ids, topk_ids.shape[1], invalid_ids)
+        a1_scale = apply_token_ids(a1_scale, clipped_token_ids, topk_ids.shape[1], invalid_ids)
+        
+        # handle token ids
+        TOPK = q_hidden1.shape[0]
+        idx_inverse = torch.empty(TOPK, device=clipped_token_ids.device, dtype=clipped_token_ids.dtype)
+        idx_inverse.fill_(-1)
+
+        idx_mask = torch.empty_like(idx_inverse)
+        triton_mask(clipped_token_ids, clipped_token_ids != invalid_ids, idx_mask)
+
+        idx_inverse[idx_mask] = torch.arange(TOPK, device=clipped_token_ids.device, dtype=clipped_token_ids.dtype)
+        print("get idx inverse", idx_inverse.shape)
+        
+        # 6. prepare for expert weight
+        expert_M = _M // config["BLOCK_SIZE_M"]
+        expert_ids = torch.repeat_interleave(
+                expert_ids[:expert_M], config["BLOCK_SIZE_M"], dim=0
+            )
+        
+        # 7. deepgemm1
+        print(q_hidden1_premute.shape, a1_scale.shape, w1.shape, w1_scale.shape, intermediate_cache1.shape, expert_ids.shape)
+        # deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+        #     (q_hidden1_premute, a1_scale), (w1, w1_scale), intermediate_cache1, expert_ids 
+        # )
+        
+        # 8. silu and mul
+        silu_and_mul(intermediate_cache1, intermediate_cache2)
+        
+        # 9. quantize2
+        q_hidden2, a2_scale = sglang_per_token_group_quant_fp8(intermediate_cache2, block_k)
+        
+        # 10. deepgemm2
+        # deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+        #     (q_hidden2, a2_scale), (w2, w2_scale), intermediate_cache3, expert_ids
+        # )
+        
+        # 11. permute activation (gather)
+        triton_mask(intermediate_cache3, clipped_token_ids != invalid_ids, intermediate_cache4)
+        intermediate_cache4 = intermediate_cache4[idx_inverse].view(
+            M, topk_ids.shape[1], w2.shape[1]
+        )
+        
+        # 12. mul weight
+        intermediate_cache4.mul_(topk_weights.unsqueeze(-1))
+        
+        # 13. add to output
+        return torch.add(
+                        intermediate_cache4[:, 0],
+                        intermediate_cache4[:, 1]).squeeze(1)
     else:
-        out_hidden_states = torch.empty_like(hidden_states)
-
-    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
-        begin_chunk_idx, end_chunk_idx = (
-            chunk * CHUNK_SIZE,
-            min((chunk + 1) * CHUNK_SIZE, num_tokens),
+        # use triton moe
+        cache = torch.empty(
+            M * topk_ids.shape[1] * max(N, w2.shape[1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
-        curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
-        tokens_in_chunk, _ = curr_hidden_states.shape
-
-        if tokens_in_chunk == 0:
-            break
-
-        if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
-            # Adjust the intermediate cache size and config for the last
-            # chunk. Note that in most cases we only have one chunk
-            # so the cache size and config are already set correctly and
-            # do not need to be adjusted.
-            intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
-            intermediate_cache2 = intermediate_cache2[:tokens_in_chunk]
-            intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
-            config = get_config_func(tokens_in_chunk)
-
-        curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
-        curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
-
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            curr_topk_ids, config["BLOCK_SIZE_M"], E
+        intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
+            (M, topk_ids.shape[1], N),
+        )
+        intermediate_cache2 = torch.empty(
+            (M * topk_ids.shape[1], N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
+            (M, topk_ids.shape[1], w2.shape[1]),
         )
 
-        invoke_fused_moe_kernel(
-            curr_hidden_states,
-            w1,
-            intermediate_cache1,
-            a1_scale,
-            w1_scale,
-            curr_topk_weights,
-            curr_topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            False,
-            topk_ids.shape[1],
-            config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            block_shape=block_shape,
-        )
-        if activation == "silu":
-            if _is_cuda:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                vllm_ops.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
-        elif activation == "gelu":
-            if _is_cuda:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                vllm_ops.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
-        else:
-            raise ValueError(f"Unsupported activation: {activation=}")
-
-        invoke_fused_moe_kernel(
-            intermediate_cache2,
-            w2,
-            (
-                intermediate_cache3
-                if not no_combine and topk_ids.shape[1] != 1
-                else out_hidden_states[begin_chunk_idx:end_chunk_idx]
-            ),
-            a2_scale,
-            w2_scale,
-            curr_topk_weights,
-            curr_topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            True,
-            1,
-            config,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            block_shape=block_shape,
-        )
+        compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
 
         if no_combine:
-            pass
-        elif _is_hip:
-            vllm_ops.moe_sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states[begin_chunk_idx:end_chunk_idx],
+            assert not inplace
+            out_hidden_states = torch.empty(
+                (num_tokens, topk_ids.shape[1], w2.shape[1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
             )
+        elif inplace:
+            out_hidden_states = hidden_states
         else:
-            if topk_ids.shape[1] == 1:
-                pass  # we write directly into out_hidden_states
-            elif topk_ids.shape[1] == 2:
-                torch.add(
-                    intermediate_cache3[:, 0],
-                    intermediate_cache3[:, 1],
-                    out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
-                ).squeeze(dim=1)
-            elif topk_ids.shape[1] > 2:
-                torch.sum(
+            out_hidden_states = torch.empty_like(hidden_states)
+
+        for chunk in range((num_tokens // CHUNK_SIZE) + 1):
+            begin_chunk_idx, end_chunk_idx = (
+                chunk * CHUNK_SIZE,
+                min((chunk + 1) * CHUNK_SIZE, num_tokens),
+            )
+            curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
+            tokens_in_chunk, _ = curr_hidden_states.shape
+
+            if tokens_in_chunk == 0:
+                break
+
+            if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
+                # Adjust the intermediate cache size and config for the last
+                # chunk. Note that in most cases we only have one chunk
+                # so the cache size and config are already set correctly and
+                # do not need to be adjusted.
+                intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
+                intermediate_cache2 = intermediate_cache2[:tokens_in_chunk]
+                intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
+                config = get_config_func(tokens_in_chunk)
+
+            curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
+            curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
+
+            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                curr_topk_ids, config["BLOCK_SIZE_M"], E
+            )
+
+            invoke_fused_moe_kernel(
+                curr_hidden_states,
+                w1,
+                intermediate_cache1,
+                a1_scale,
+                w1_scale,
+                curr_topk_weights,
+                curr_topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                False,
+                topk_ids.shape[1],
+                config,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                block_shape=block_shape,
+            )
+            if activation == "silu":
+                if _is_cuda:
+                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                else:
+                    vllm_ops.silu_and_mul(
+                        intermediate_cache2, intermediate_cache1.view(-1, N)
+                    )
+            elif activation == "gelu":
+                if _is_cuda:
+                    gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                else:
+                    vllm_ops.gelu_and_mul(
+                        intermediate_cache2, intermediate_cache1.view(-1, N)
+                    )
+            else:
+                raise ValueError(f"Unsupported activation: {activation=}")
+
+            invoke_fused_moe_kernel(
+                intermediate_cache2,
+                w2,
+                (
+                    intermediate_cache3
+                    if not no_combine and topk_ids.shape[1] != 1
+                    else out_hidden_states[begin_chunk_idx:end_chunk_idx]
+                ),
+                a2_scale,
+                w2_scale,
+                curr_topk_weights,
+                curr_topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                True,
+                1,
+                config,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                block_shape=block_shape,
+            )
+
+            if no_combine:
+                pass
+            elif _is_hip:
+                vllm_ops.moe_sum(
                     intermediate_cache3.view(*intermediate_cache3.shape),
-                    dim=1,
-                    out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
                 )
+            else:
+                if topk_ids.shape[1] == 1:
+                    pass  # we write directly into out_hidden_states
+                elif topk_ids.shape[1] == 2:
+                    torch.add(
+                        intermediate_cache3[:, 0],
+                        intermediate_cache3[:, 1],
+                        out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    ).squeeze(dim=1)
+                elif topk_ids.shape[1] > 2:
+                    torch.sum(
+                        intermediate_cache3.view(*intermediate_cache3.shape),
+                        dim=1,
+                        out=out_hidden_states[begin_chunk_idx:end_chunk_idx],
+                    )
 
     return out_hidden_states
 
