@@ -52,6 +52,18 @@ if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
 
+import ctypes
+from contextlib import contextmanager
+
+@contextmanager
+def ensure_gil():
+    """确保GIL在上下文中被正确持有"""
+    gstate = ctypes.pythonapi.PyGILState_Ensure()
+    try:
+        yield
+    finally:
+        ctypes.pythonapi.PyGILState_Release(gstate)
+
 @triton.jit
 def fused_moe_kernel(
     # Pointers to matrices
@@ -1130,11 +1142,12 @@ def fused_experts_impl(
     config = get_config_func(M)
 
     if _is_cuda and use_fp8_w8a8 and block_shape is not None and _enable_jit_deepgemm:
+        print("use deepgemm")
         # this is for deepgemm cache
         block_k = block_shape[0]
         # 0. get config
         invalid_ids = topk_ids.numel()
-        config["BLOCK_SIZE_M"] = deep_gemm.get_m_alignment_for_contiguous_layout()
+        config["BLOCK_SIZE_M"] = 128
         
         # 1. align block size
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
@@ -1191,7 +1204,7 @@ def fused_experts_impl(
         a1_scale = apply_token_ids(a1_scale, clipped_token_ids, topk_ids.shape[1], invalid_ids)
         
         # handle token ids
-        TOPK = q_hidden1.shape[0]
+        TOPK = q_hidden1.shape[0] * topk_ids.shape[1]
         idx_inverse = torch.empty(TOPK, device=clipped_token_ids.device, dtype=clipped_token_ids.dtype)
         idx_inverse.fill_(-1)
 
@@ -1199,19 +1212,20 @@ def fused_experts_impl(
         triton_mask(clipped_token_ids, clipped_token_ids != invalid_ids, idx_mask)
 
         idx_inverse[idx_mask] = torch.arange(TOPK, device=clipped_token_ids.device, dtype=clipped_token_ids.dtype)
-        print("get idx inverse", idx_inverse.shape)
         
         # 6. prepare for expert weight
         expert_M = _M // config["BLOCK_SIZE_M"]
         expert_ids = torch.repeat_interleave(
                 expert_ids[:expert_M], config["BLOCK_SIZE_M"], dim=0
             )
+        expert_ids_[clipped_token_ids == invalid_ids] = 0
         
         # 7. deepgemm1
         print(q_hidden1_premute.shape, a1_scale.shape, w1.shape, w1_scale.shape, intermediate_cache1.shape, expert_ids.shape)
-        # deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-        #     (q_hidden1_premute, a1_scale), (w1, w1_scale), intermediate_cache1, expert_ids 
-        # )
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+            (q_hidden1_premute, a1_scale), (w1, w1_scale), intermediate_cache1, expert_ids 
+        )
+        torch.cuda.synchronize()
         
         # 8. silu and mul
         silu_and_mul(intermediate_cache1, intermediate_cache2)
@@ -1220,9 +1234,9 @@ def fused_experts_impl(
         q_hidden2, a2_scale = sglang_per_token_group_quant_fp8(intermediate_cache2, block_k)
         
         # 10. deepgemm2
-        # deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
-        #     (q_hidden2, a2_scale), (w2, w2_scale), intermediate_cache3, expert_ids
-        # )
+        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+            (q_hidden2, a2_scale), (w2, w2_scale), intermediate_cache3, expert_ids
+        )
         
         # 11. permute activation (gather)
         triton_mask(intermediate_cache3, clipped_token_ids != invalid_ids, intermediate_cache4)
@@ -1238,6 +1252,7 @@ def fused_experts_impl(
                         intermediate_cache4[:, 0],
                         intermediate_cache4[:, 1]).squeeze(1)
     else:
+        print("not use deepgemm")
         # use triton moe
         cache = torch.empty(
             M * topk_ids.shape[1] * max(N, w2.shape[1]),
