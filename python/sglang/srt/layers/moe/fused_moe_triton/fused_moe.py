@@ -51,19 +51,6 @@ if _is_cuda:
 if _is_cuda or _is_hip:
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
-
-import ctypes
-from contextlib import contextmanager
-
-@contextmanager
-def ensure_gil():
-    """确保GIL在上下文中被正确持有"""
-    gstate = ctypes.pythonapi.PyGILState_Ensure()
-    try:
-        yield
-    finally:
-        ctypes.pythonapi.PyGILState_Release(gstate)
-
 @triton.jit
 def fused_moe_kernel(
     # Pointers to matrices
@@ -511,116 +498,105 @@ def moe_align_block_size(
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
-@triton.jit
-def _mask_kernel(
+@trion.jit
+def moe_gather_token_with_mul_kernel(
     input_ptr,
-    mask_ptr,
     output_ptr,
-    acc_ptr,
-    element_0,
-    element_1,
-    input_stride_0,
-    input_stride_1,
-    output_stride_0,
-    output_stride_1,
-    BLOCK_SIZE_0: tl.constexpr,
-    BLOCK_SIZE_1: tl.constexpr,
+    sorted_token_ids,
+    num_valid_tokens,
+    stride_am,
+    top_k,
+    expert_weight,
+    BLOCK_SIZE: tl.constexpr
 ):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE_0
-    acc_vals = tl.load(acc_ptr + pid)
-    next_vals = tl.load(acc_ptr + pid + 1)
-
-    offset_0 = block_start + tl.arange(0, BLOCK_SIZE_0)
-    offset_0 = offset_0[:, None]
-    mask_vals = tl.load(mask_ptr + offset_0, mask=offset_0 < element_0, other=0)
-    output_offset_0 = acc_vals + tl.arange(0, BLOCK_SIZE_0)
-    output_offset_0 = output_offset_0[:, None]
-
-    for m in tl.range(0, tl.cdiv(element_1, BLOCK_SIZE_1)):
-        offset_1 = m * BLOCK_SIZE_1 + tl.arange(0, BLOCK_SIZE_1)
-        offset_1 = offset_1[None, :]
-
-        input_mask = (offset_0 < element_0) & mask_vals & (offset_1 < element_1)
-        input_mask = tl.cast(input_mask, tl.int1)
-        input_vals = tl.load(
-            input_ptr + offset_0 * input_stride_0 + offset_1 * input_stride_1,
-            mask=input_mask,
-            other=0,
-        )
-
-        output_mask = (
-            mask_vals & (output_offset_0 < next_vals) & (offset_1 < element_1)
-        ) != 0
-        output_mask = tl.cast(output_mask, tl.int1)
-        tl.store(
-            output_ptr + output_offset_0 * output_stride_0 + offset_1 * output_stride_1,
-            input_vals,
-            mask=output_mask,
-        )
-
-
-def triton_mask(input: torch.Tensor, mask: torch.Tensor, output: torch.Tensor):
-    assert input.shape[0] == mask.shape[0]
-
-    if len(input.shape) == 1:
-        input = input[:, None]
-        output = output[:, None]
-
-    assert input.shape[1] == output.shape[1]
-
-    M = input.shape[0]
-    N = input.shape[1]
-    BLOCK_SIZE_M = 32
-    BLOCK_SIZE_N = 128
-
-    pad_size = (M + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * BLOCK_SIZE_M - M
-    mask = torch.nn.functional.pad(mask, (0, pad_size), "constant", 0)
-    mask_acc = mask.reshape(-1, BLOCK_SIZE_M).sum(1)
-    mask_acc = torch.cumsum(mask_acc, 0)
-    mask_acc = torch.nn.functional.pad(mask_acc, (1, 0), "constant", 0)
-
-    grid = (triton.cdiv(M, BLOCK_SIZE_M),)
-    _mask_kernel[grid](
-        input,
-        mask,
-        output,
-        mask_acc,
-        M,
-        N,
-        input.stride(0),
-        input.stride(1),
-        output.stride(0),
-        output.stride(1),
-        BLOCK_SIZE_0=BLOCK_SIZE_M,
-        BLOCK_SIZE_1=BLOCK_SIZE_N,
+    
+    ids_offset = tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * pid
+    ids = tl.load(sorted_token_ids_ptr, ids_offset)
+    
+    # read input ids
+    input_offset = ids
+    input_scatter = tl.load(
+        input_ptr
+        + ids * 
     )
-
-# @triton.jit
-# def _scatter_token_kernel(
-#     input,
-#     output,
-#     index,
     
-# )
+    
 
 
-def apply_token_ids(A, idx, topk, invalid_val):
-    A = A.view(A.shape[0], -1, A.shape[1]).repeat(1, topk, 1).reshape(-1, A.shape[1])
+def moe_gather_token_with_mul(
+    input_tensor,
+    sorted_token_ids_ptr,
+    output_ptr,
+    num_valid_tokens,
+    top_k,
+    expert_weight
+):
+    """
+    This kernel gather deepgemm output tokens, mul expert weight
+    and add the scatter output.
+    """
 
-    Adtype = A.dtype
-    if Adtype == torch.float8_e4m3fn or Adtype == torch.float8_e4m3fnuz:
-        A = A.view(dtype=torch.uint8)
 
-    A = torch.concat(
-        [A, torch.zeros([1, A.shape[1]], dtype=A.dtype, device=A.device)], axis=0
+@triton.jit
+def moe_scatter_token_kernel(
+    input_ptr,
+    output_ptr,
+    sorted_token_ids_ptr,
+    num_valid_tokens,
+    stride_am,
+    stride_cm,
+    top_k: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    
+    ids_offset = tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * pid
+    ids = tl.load(sorted_token_ids_ptr, ids_offset)
+    
+    # load input ptr
+    input_offset = ids // top_k
+    input_mask = ids < num_valid_tokens
+    input_orig = tl.load(
+        input_ptr
+        + input_offset * stride_am,
+        mask=input_mask
+        other=0.0
     )
-    A = A[idx]
     
-    if Adtype == torch.float8_e4m3fn or Adtype == torch.float8_e4m3fnuz:
-        A = A.view(dtype=Adtype)
+    # save output ptr
+    tl.save(
+        output_ptr
+        + ids_offset * stride_cm,
+        input_orig
+    )
     
-    return A
+
+def moe_scatter_token(
+    A: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    out: torch.Tensor,
+    num_valid_tokens: torch.Tensor,
+    top_k: int,
+):
+    M = sorted_token_ids.shape[0]
+    K = A.shape[1]
+
+    assert M == out.shape[0] and K == out.shape[1]
+    
+    BLOCK_SIZE = 512
+
+    grid = sorted_token_ids.shape[0] // BLOCK_SIZE
+    moe_scatter_token_kernel[(grid,)](
+        A,
+        out,
+        sorted_token_ids,
+        num_valid_tokens,
+        A.stride(0),
+        out.stride(0),
+        top_k,
+        BLOCK_SIZE
+    )
 
 
 def invoke_fused_moe_kernel(
@@ -1142,7 +1118,6 @@ def fused_experts_impl(
     config = get_config_func(M)
 
     if _is_cuda and use_fp8_w8a8 and block_shape is not None and _enable_jit_deepgemm:
-        print("use deepgemm")
         # this is for deepgemm cache
         block_k = block_shape[0]
         # 0. get config
@@ -1173,7 +1148,12 @@ def fused_experts_impl(
         intermediate_cache3 = cache[:_M * w2.shape[1]].view(
             (_M, w2.shape[1])
         )
-        intermediate_cache4 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
+        intermediate_cache4 = torch.empty(
+            (M * topk_ids.shape[1], w2.shape[1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
             (M * topk_ids.shape[1], w2.shape[1]),
         )
         # prepare quantize cache
@@ -1200,32 +1180,20 @@ def fused_experts_impl(
         clipped_token_ids = sorted_token_ids[:_M]
         
         # 5. permute activation and weight (scatter)
-        q_hidden1_premute = apply_token_ids(q_hidden1, clipped_token_ids, topk_ids.shape[1], invalid_ids)
-        a1_scale = apply_token_ids(a1_scale, clipped_token_ids, topk_ids.shape[1], invalid_ids)
-        
-        # handle token ids
-        TOPK = q_hidden1.shape[0] * topk_ids.shape[1]
-        idx_inverse = torch.empty(TOPK, device=clipped_token_ids.device, dtype=clipped_token_ids.dtype)
-        idx_inverse.fill_(-1)
-
-        idx_mask = torch.empty_like(idx_inverse)
-        triton_mask(clipped_token_ids, clipped_token_ids != invalid_ids, idx_mask)
-
-        idx_inverse[idx_mask] = torch.arange(TOPK, device=clipped_token_ids.device, dtype=clipped_token_ids.dtype)
+        q_hidden1_premute, a1_scale, idx_inverse = \
+            apply_token_ids_new(q_hidden1, a1_scale, clipped_token_ids, topk_ids.shape[1], invalid_ids)
         
         # 6. prepare for expert weight
         expert_M = _M // config["BLOCK_SIZE_M"]
         expert_ids = torch.repeat_interleave(
                 expert_ids[:expert_M], config["BLOCK_SIZE_M"], dim=0
             )
-        expert_ids_[clipped_token_ids == invalid_ids] = 0
+        expert_ids[clipped_token_ids == invalid_ids] = 0
         
         # 7. deepgemm1
-        print(q_hidden1_premute.shape, a1_scale.shape, w1.shape, w1_scale.shape, intermediate_cache1.shape, expert_ids.shape)
         deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
             (q_hidden1_premute, a1_scale), (w1, w1_scale), intermediate_cache1, expert_ids 
         )
-        torch.cuda.synchronize()
         
         # 8. silu and mul
         silu_and_mul(intermediate_cache1, intermediate_cache2)
@@ -1247,12 +1215,22 @@ def fused_experts_impl(
         # 12. mul weight
         intermediate_cache4.mul_(topk_weights.unsqueeze(-1))
         
+        
         # 13. add to output
-        return torch.add(
-                        intermediate_cache4[:, 0],
-                        intermediate_cache4[:, 1]).squeeze(1)
+        if topk_ids.shape[1] == 1:
+            pass  # we write directly into out_hidden_states
+        elif topk_ids.shape[1] == 2:
+            return torch.add(
+                intermediate_cache4[:, 0],
+                intermediate_cache4[:, 1],
+            ).squeeze(dim=1)
+        elif topk_ids.shape[1] > 2:
+            return torch.sum(
+                intermediate_cache4.view(*intermediate_cache4.shape),
+                dim=1,
+            )
     else:
-        print("not use deepgemm")
+
         # use triton moe
         cache = torch.empty(
             M * topk_ids.shape[1] * max(N, w2.shape[1]),
