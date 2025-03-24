@@ -507,22 +507,46 @@ def moe_gather_token_with_mul_kernel(
     stride_am,
     top_k,
     expert_weight,
-    BLOCK_SIZE: tl.constexpr
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr
 ):
+    """
+    BLOCK_SIZE_M for M row
+    BLOCK_SIZE_N for N col
+    """
     pid = tl.program_id(0)
-    
-    ids_offset = tl.arange(0, BLOCK_SIZE) + BLOCK_SIZE * pid
-    ids = tl.load(sorted_token_ids_ptr, ids_offset)
-    
-    # read input ids
-    input_offset = ids
-    input_scatter = tl.load(
-        input_ptr
-        + ids * 
-    )
-    
-    
 
+    input_m_offset = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+
+    token_id = tl.load(
+        sorted_token_ids
+        + input_m_offset
+    )
+
+    # load weight
+    topk_mask = token_id < num_valid_tokens
+    topk_weight = tl.load(
+        expert_weight
+        + token_id
+        mask=topk_mask,
+        other=1.0
+    )
+    topk_weight = topk_weight[:, None]
+
+    for n in tl.range(0, tl.cdiv(stride_am, BLOCK_SIZE_N)):
+        input_n_offset = n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        input_n_mask = input_n_offset < stride_am
+
+        input_data = tl.load(
+            input_ptr
+            + input_m_offset * stride_am
+            + input_n_offset,
+            mask=input_n_mask,
+        )
+
+        output_data = input_data * topk_weight
+        tl.atomic_add(output_ptr + token_id // topk, output_data)
+    
 
 def moe_gather_token_with_mul(
     input_tensor,
@@ -574,8 +598,10 @@ def moe_scatter_token_kernel(
 
 def moe_scatter_token(
     A: torch.Tensor,
+    A_scale: torch.Tensor,
     sorted_token_ids: torch.Tensor,
     out: torch.Tensor,
+    out_scale: torch.Tensor,
     num_valid_tokens: torch.Tensor,
     top_k: int,
 ):
@@ -589,7 +615,9 @@ def moe_scatter_token(
     grid = sorted_token_ids.shape[0] // BLOCK_SIZE
     moe_scatter_token_kernel[(grid,)](
         A,
+        A_scale,
         out,
+        out_scale,
         sorted_token_ids,
         num_valid_tokens,
         A.stride(0),
@@ -1230,7 +1258,6 @@ def fused_experts_impl(
                 dim=1,
             )
     else:
-
         # use triton moe
         cache = torch.empty(
             M * topk_ids.shape[1] * max(N, w2.shape[1]),
