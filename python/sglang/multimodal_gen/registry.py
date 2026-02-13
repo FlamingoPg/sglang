@@ -31,6 +31,10 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
     HunyuanConfig,
+    HunyuanImage3I2IPipelineConfig,
+    HunyuanImage3InstructDistilPipelineConfig,
+    HunyuanImage3InstructPipelineConfig,
+    HunyuanImage3PipelineConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -70,6 +74,12 @@ from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
 from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.hunyuan_image import (
+    HunyuanImage3I2ISamplingParams,
+    HunyuanImage3InstructDistilSamplingParams,
+    HunyuanImage3InstructSamplingParams,
+    HunyuanImage3SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.ltx_2 import LTX2SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage import (
@@ -451,6 +461,45 @@ def _register_configs():
             "FastVideo/FastHunyuan-diffusers",
         ],
     )
+
+    # HunyuanImage-3.0
+    register_configs(
+        sampling_param_cls=HunyuanImage3SamplingParams,
+        pipeline_config_cls=HunyuanImage3PipelineConfig,
+        hf_model_paths=[
+            "Tencent-Hunyuan/HunyuanImage-3.0",
+            "Tencent-Hunyuan/HunyuanImage-3",
+        ],
+        model_detectors=[
+            lambda hf_id: "hunyuanimage-3" in hf_id.lower() and "instruct" not in hf_id.lower(),
+            lambda hf_id: "hunyuan-image-3" in hf_id.lower() and "instruct" not in hf_id.lower(),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=HunyuanImage3InstructSamplingParams,
+        pipeline_config_cls=HunyuanImage3InstructPipelineConfig,
+        hf_model_paths=[
+            "Tencent-Hunyuan/HunyuanImage-3.0-Instruct",
+            "Tencent-Hunyuan/HunyuanImage-3-Instruct",
+        ],
+        model_detectors=[
+            lambda hf_id: "hunyuanimage-3" in hf_id.lower() and "instruct" in hf_id.lower() and "distil" not in hf_id.lower(),
+            lambda hf_id: "hunyuan-image-3" in hf_id.lower() and "instruct" in hf_id.lower() and "distil" not in hf_id.lower(),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=HunyuanImage3InstructDistilSamplingParams,
+        pipeline_config_cls=HunyuanImage3InstructDistilPipelineConfig,
+        hf_model_paths=[
+            "Tencent-Hunyuan/HunyuanImage-3.0-Instruct-Distil",
+            "Tencent-Hunyuan/HunyuanImage-3-Instruct-Distil",
+        ],
+        model_detectors=[
+            lambda hf_id: "hunyuanimage-3" in hf_id.lower() and "instruct" in hf_id.lower() and "distil" in hf_id.lower(),
+            lambda hf_id: "hunyuan-image-3" in hf_id.lower() and "instruct" in hf_id.lower() and "distil" in hf_id.lower(),
+        ],
+    )
+
     # Wan
     register_configs(
         sampling_param_cls=WanT2V_1_3B_SamplingParams,

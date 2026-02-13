@@ -19,6 +19,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     FastHunyuanConfig,
     HunyuanConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan_image import (
+    HunyuanImage3I2IPipelineConfig,
+    HunyuanImage3InstructDistilPipelineConfig,
+    HunyuanImage3InstructPipelineConfig,
+    HunyuanImage3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     SelfForcingWanT2V480PConfig,
@@ -33,6 +39,10 @@ __all__ = [
     "DiffusersGenericPipelineConfig",
     "HunyuanConfig",
     "FastHunyuanConfig",
+    "HunyuanImage3PipelineConfig",
+    "HunyuanImage3InstructPipelineConfig",
+    "HunyuanImage3InstructDistilPipelineConfig",
+    "HunyuanImage3I2IPipelineConfig",
     "FluxPipelineConfig",
     "Flux2PipelineConfig",
     "Flux2KleinPipelineConfig",
