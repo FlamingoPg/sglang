@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 from collections import defaultdict
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ from sglang.srt.ug.adapter import (
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
+    UGLatentDecodeRequest,
     UGVelocityRequest,
 )
 
@@ -266,23 +268,25 @@ class BAGELInterleaveContextBackend:
             if message.type == "text":
                 text = str(message.content)
                 state.cfg_text_context = _clone_context(state.gen_context)
-                state.gen_context = self.inferencer.update_context_text(
-                    text,
-                    state.gen_context,
-                )
-                state.cfg_img_context = self.inferencer.update_context_text(
-                    text,
-                    state.cfg_img_context,
-                )
+                with _bagel_autocast(self.inferencer.model):
+                    state.gen_context = self.inferencer.update_context_text(
+                        text,
+                        state.gen_context,
+                    )
+                    state.cfg_img_context = self.inferencer.update_context_text(
+                        text,
+                        state.cfg_img_context,
+                    )
                 added_tokens += len(text.split())
             elif message.type == "image":
                 image = self._prepare_image(message.content)
-                state.gen_context = self.inferencer.update_context_image(
-                    image,
-                    state.gen_context,
-                    vae=True,
-                    vit=True,
-                )
+                with _bagel_autocast(self.inferencer.model):
+                    state.gen_context = self.inferencer.update_context_image(
+                        image,
+                        state.gen_context,
+                        vae=True,
+                        vit=True,
+                    )
                 state.image_shape = self._image_shape(image)
                 state.cfg_text_context = _clone_context(state.gen_context)
                 added_tokens += 2
@@ -298,12 +302,13 @@ class BAGELInterleaveContextBackend:
             return UGDecodeResult(type="image_marker")
         if state.append_image_count > 0 and state.decode_count == 1:
             state.decode_count += 1
-            text = self.inferencer.gen_text(
-                state.gen_context,
-                do_sample=False,
-                temperature=0.3,
-                max_length=512,
-            )
+            with _bagel_autocast(self.inferencer.model):
+                text = self.inferencer.gen_text(
+                    state.gen_context,
+                    do_sample=False,
+                    temperature=0.3,
+                    max_length=512,
+                )
             return UGDecodeResult(type="text", text=text)
         state.decode_count += 1
         return UGDecodeResult(type="done")
@@ -316,29 +321,66 @@ class BAGELInterleaveContextBackend:
             state.prepared_denoise = self._prepare_denoise(
                 state, request.sampling_params
             )
-        return self.step_runner.predict_velocity(
-            model=self.inferencer.model,
-            prepared=state.prepared_denoise,
-            latent_tokens=request.latent_tokens,
-            timestep=request.timestep,
-        )
+        latent_tokens = request.latent_tokens
+        timestep = request.timestep
+        runtime_device = _bagel_runtime_device(self.inferencer.model)
+        if runtime_device is not None:
+            latent_tokens = latent_tokens.to(runtime_device)
+            timestep = timestep.to(runtime_device)
+
+        with torch.autocast(
+            device_type="cuda",
+            enabled=latent_tokens.is_cuda,
+            dtype=torch.bfloat16,
+        ):
+            velocity = self.step_runner.predict_velocity(
+                model=self.inferencer.model,
+                prepared=state.prepared_denoise,
+                latent_tokens=latent_tokens,
+                timestep=timestep,
+            )
+        return velocity.to(request.latent_tokens.device)
 
     def append_generated_image(
         self, *, session, image: Any | None
     ) -> UGModelAppendImageResult:
         state = self._state_for(session.handle.session_id)
         image = self._prepare_image(image)
-        state.gen_context = self.inferencer.update_context_image(
-            image,
-            state.gen_context,
-            vae=True,
-            vit=True,
-        )
+        with _bagel_autocast(self.inferencer.model):
+            state.gen_context = self.inferencer.update_context_image(
+                image,
+                state.gen_context,
+                vae=True,
+                vit=True,
+            )
         state.image_shape = self._image_shape(image)
         state.cfg_text_context = _clone_context(state.gen_context)
         state.append_image_count += 1
         state.prepared_denoise = None
         return UGModelAppendImageResult(added_tokens=2)
+
+    def decode_latents_to_image(
+        self, *, session, request: UGLatentDecodeRequest
+    ) -> Any | None:
+        state = self._state_for(session.handle.session_id)
+        image_shape = self._image_shape_from_params(
+            request.sampling_params,
+            state.image_shape,
+        )
+        latent_tokens = request.latent_tokens
+        if latent_tokens.ndim == 3:
+            latent_tokens = latent_tokens[0]
+
+        vae_model = getattr(self.inferencer, "vae_model", None)
+        vae_device = _bagel_runtime_device(vae_model)
+        if vae_device is not None:
+            latent_tokens = latent_tokens.to(vae_device)
+
+        vae_dtype = _bagel_runtime_dtype(vae_model)
+        if vae_dtype is not None and latent_tokens.is_floating_point():
+            latent_tokens = latent_tokens.to(dtype=vae_dtype)
+
+        return self.inferencer.decode_image(latent_tokens, image_shape)
 
     def close_session(self, *, session_id: str) -> None:
         self.sessions.pop(session_id, None)
@@ -439,6 +481,10 @@ class BAGELBackendProtocol(Protocol):
         self, *, session, image: Any | None
     ) -> UGModelAppendImageResult: ...
 
+    def decode_latents_to_image(
+        self, *, session, request: UGLatentDecodeRequest
+    ) -> Any | None: ...
+
     def close_session(self, *, session_id: str) -> None: ...
 
 
@@ -480,6 +526,14 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
         self, *, session, image: Any | None
     ) -> UGModelAppendImageResult:
         return self.backend.append_generated_image(session=session, image=image)
+
+    def decode_latents_to_image(
+        self, *, session, request: UGLatentDecodeRequest
+    ) -> Any | None:
+        return self.backend.decode_latents_to_image(
+            session=session,
+            request=request,
+        )
 
     def close_session(self, *, session_id: str) -> None:
         self.backend.close_session(session_id=session_id)
@@ -570,6 +624,13 @@ class MockBAGELBackend:
         self._record("append_image", session)
         return UGModelAppendImageResult(added_tokens=2)
 
+    def decode_latents_to_image(
+        self, *, session, request: UGLatentDecodeRequest
+    ) -> Any | None:
+        del request
+        self._record("decode_latents", session)
+        return None
+
     def close_session(self, *, session_id: str) -> None:
         self.events.append(("close", session_id))
         self.closed_sessions.append(session_id)
@@ -594,6 +655,29 @@ def _require_keys(
 
 def _clone_context(context: dict[str, Any]) -> dict[str, Any]:
     return deepcopy(context)
+
+
+def _bagel_runtime_device(model: Any) -> torch.device | None:
+    try:
+        parameter = next(model.parameters())
+    except (AttributeError, StopIteration, TypeError):
+        return None
+    return parameter.device
+
+
+def _bagel_runtime_dtype(model: Any) -> torch.dtype | None:
+    try:
+        parameter = next(model.parameters())
+    except (AttributeError, StopIteration, TypeError):
+        return None
+    return parameter.dtype
+
+
+def _bagel_autocast(model: Any):
+    device = _bagel_runtime_device(model)
+    if device is not None and device.type == "cuda":
+        return torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16)
+    return nullcontext()
 
 
 def _build_official_bagel_inferencer(

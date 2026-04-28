@@ -11,6 +11,7 @@ from sglang.srt.ug.context import UGSessionHandle
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
+    UGLatentDecodeRequest,
     UGSegmentState,
     UGSessionRecord,
     UGVelocityRequest,
@@ -48,32 +49,32 @@ class UGModelAdapterProtocol(Protocol):
         *,
         session: UGModelSessionView,
         messages: list[UGInterleavedMessage],
-    ) -> UGModelPrefillResult:
-        ...
+    ) -> UGModelPrefillResult: ...
 
-    def decode_next_segment(
-        self, *, session: UGModelSessionView
-    ) -> UGDecodeResult:
-        ...
+    def decode_next_segment(self, *, session: UGModelSessionView) -> UGDecodeResult: ...
 
     def predict_velocity_from_session(
         self,
         *,
         session: UGModelSessionView,
         request: UGVelocityRequest,
-    ) -> torch.Tensor:
-        ...
+    ) -> torch.Tensor: ...
 
     def append_generated_image(
         self,
         *,
         session: UGModelSessionView,
         image: Any | None,
-    ) -> UGModelAppendImageResult:
-        ...
+    ) -> UGModelAppendImageResult: ...
 
-    def close_session(self, *, session_id: str) -> None:
-        ...
+    def decode_latents_to_image(
+        self,
+        *,
+        session: UGModelSessionView,
+        request: UGLatentDecodeRequest,
+    ) -> Any | None: ...
+
+    def close_session(self, *, session_id: str) -> None: ...
 
 
 class UGModelRunnerAdapter:
@@ -110,6 +111,14 @@ class UGModelRunnerAdapter:
             image=image,
         )
         return result.added_tokens
+
+    def decode_latents_to_image(
+        self, *, request: UGLatentDecodeRequest, record: UGSessionRecord
+    ) -> Any | None:
+        return self.adapter.decode_latents_to_image(
+            session=self._session_view(record),
+            request=request,
+        )
 
     def close_session(self, *, session_id: str) -> None:
         self.adapter.close_session(session_id=session_id)

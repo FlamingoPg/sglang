@@ -10,6 +10,7 @@ from sglang.srt.ug.context import UGContextBundle, UGContextHandle
 from sglang.srt.ug.runtime import (
     FakeUGModelRunner,
     UGDecodeResult,
+    UGLatentDecodeRequest,
     UGSessionRuntime,
     UGVelocityRequest,
 )
@@ -18,8 +19,7 @@ from sglang.srt.ug.runtime import (
 class UGDenoiserBridge(Protocol):
     def build_contexts(
         self, *, prompt: str | list[str] | None, image: Any | None
-    ) -> UGContextBundle:
-        ...
+    ) -> UGContextBundle: ...
 
     def predict_velocity(
         self,
@@ -29,19 +29,23 @@ class UGDenoiserBridge(Protocol):
         timestep: torch.Tensor,
         latent_position_ids: torch.Tensor,
         sampling_params: Any,
-    ) -> torch.Tensor:
-        ...
+    ) -> torch.Tensor: ...
 
-    def release_contexts(self, contexts: UGContextBundle) -> None:
-        ...
+    def release_contexts(self, contexts: UGContextBundle) -> None: ...
 
     def append_generated_image(
         self, *, contexts: UGContextBundle, image: Any | None
-    ) -> None:
-        ...
+    ) -> None: ...
 
-    def decode_next_segment(self, *, contexts: UGContextBundle) -> UGDecodeResult:
-        ...
+    def decode_latents(
+        self,
+        *,
+        contexts: UGContextBundle,
+        latent_tokens: torch.Tensor,
+        sampling_params: Any,
+    ) -> Any | None: ...
+
+    def decode_next_segment(self, *, contexts: UGContextBundle) -> UGDecodeResult: ...
 
 
 class FakeUGDenoiserBridge:
@@ -77,6 +81,16 @@ class FakeUGDenoiserBridge:
         self, *, contexts: UGContextBundle, image: Any | None
     ) -> None:
         del contexts, image
+
+    def decode_latents(
+        self,
+        *,
+        contexts: UGContextBundle,
+        latent_tokens: torch.Tensor,
+        sampling_params: Any,
+    ) -> Any | None:
+        del contexts, latent_tokens, sampling_params
+        return None
 
     def decode_next_segment(self, *, contexts: UGContextBundle) -> UGDecodeResult:
         del contexts
@@ -156,12 +170,31 @@ class SRTBackedUGDenoiserBridge:
     ) -> None:
         if contexts.full.session is None:
             raise ValueError("SRT-backed UG contexts require a session handle")
-        session = self.runtime.append_generated_image(contexts.full.session, image=image)
+        session = self.runtime.append_generated_image(
+            contexts.full.session, image=image
+        )
         contexts.full.request_id = session.anchor_request_id
         contexts.full.token_count = session.context_length
         contexts.full.session = session
         contexts.text_cfg.session = session
         contexts.image_cfg.session = session
+
+    def decode_latents(
+        self,
+        *,
+        contexts: UGContextBundle,
+        latent_tokens: torch.Tensor,
+        sampling_params: Any,
+    ) -> Any | None:
+        if contexts.full.session is None:
+            raise ValueError("SRT-backed UG contexts require a session handle")
+        return self.runtime.decode_latents_to_image(
+            UGLatentDecodeRequest(
+                session=contexts.full.session,
+                latent_tokens=latent_tokens,
+                sampling_params=sampling_params,
+            )
+        )
 
     def decode_next_segment(self, *, contexts: UGContextBundle) -> UGDecodeResult:
         if contexts.full.session is None:

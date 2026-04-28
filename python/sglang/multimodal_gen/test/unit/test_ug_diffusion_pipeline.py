@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.ug import UGPipelineConfig
@@ -14,6 +15,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
     SyncExecutor,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.srt.ug.context import UGContextBundle, UGContextHandle
+from sglang.srt.ug.runtime import UGDecodeResult
 
 _GLOBAL_ARGS_PATCH = (
     "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args"
@@ -110,6 +113,78 @@ class TestUGDiffusionPipeline(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "enable_cfg_parallel"):
             pipeline.forward(batch, server_args)
+
+    def test_decode_stage_appends_single_pil_image_to_ug_session(self):
+        server_args = _make_server_args()
+        bridge = RecordingUGBridge()
+        with patch(_GLOBAL_ARGS_PATCH, return_value=server_args):
+            pipeline = UGPipeline(
+                "recording-ug",
+                server_args,
+                loaded_modules={"ug_bridge": bridge},
+                executor=SyncExecutor(server_args),
+            )
+
+        batch = Req(
+            sampling_params=UGSamplingParams(
+                prompt="draw then explain",
+                width=32,
+                height=32,
+                seed=123,
+                num_inference_steps=2,
+                suppress_logs=True,
+            )
+        )
+
+        result = pipeline.forward(batch, server_args)
+
+        self.assertEqual(bridge.velocity_calls, 1)
+        self.assertIsInstance(bridge.appended_image, Image.Image)
+        self.assertEqual(bridge.appended_image.size, (32, 32))
+        self.assertEqual(result.extra["ug_post_image_segment"].type, "text")
+        self.assertEqual(result.extra["ug_post_image_segment"].text, "after_image")
+
+
+class RecordingUGBridge:
+    def __init__(self):
+        self.appended_image = None
+        self.velocity_calls = 0
+
+    def build_contexts(self, *, prompt, image):
+        del prompt, image
+        return UGContextBundle(
+            full=UGContextHandle("full", 1),
+            text_cfg=UGContextHandle("text_cfg", 0),
+            image_cfg=UGContextHandle("image_cfg", 1),
+        )
+
+    def predict_velocity(
+        self,
+        *,
+        contexts,
+        latent_tokens,
+        timestep,
+        latent_position_ids,
+        sampling_params,
+    ):
+        del contexts, timestep, latent_position_ids, sampling_params
+        self.velocity_calls += 1
+        return torch.zeros_like(latent_tokens)
+
+    def release_contexts(self, contexts):
+        del contexts
+
+    def append_generated_image(self, *, contexts, image):
+        del contexts
+        self.appended_image = image
+
+    def decode_latents(self, *, contexts, latent_tokens, sampling_params):
+        del contexts, latent_tokens, sampling_params
+        return None
+
+    def decode_next_segment(self, *, contexts):
+        del contexts
+        return UGDecodeResult(type="text", text="after_image")
 
 
 if __name__ == "__main__":

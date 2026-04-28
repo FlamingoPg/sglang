@@ -66,6 +66,13 @@ class UGVelocityResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class UGLatentDecodeRequest:
+    session: UGSessionHandle
+    latent_tokens: torch.Tensor
+    sampling_params: Any
+
+
+@dataclass(frozen=True, slots=True)
 class UGDecodeResult:
     type: Literal["text", "image_marker", "done"]
     text: str | None = None
@@ -102,24 +109,23 @@ class UGSessionRecord:
 class UGModelRunnerProtocol(Protocol):
     def prefill_interleaved(
         self, *, record: UGSessionRecord, messages: list[UGInterleavedMessage]
-    ) -> int:
-        ...
+    ) -> int: ...
 
-    def decode_next_segment(self, *, record: UGSessionRecord) -> UGDecodeResult:
-        ...
+    def decode_next_segment(self, *, record: UGSessionRecord) -> UGDecodeResult: ...
 
     def predict_velocity_from_session(
         self, *, request: UGVelocityRequest, record: UGSessionRecord
-    ) -> torch.Tensor:
-        ...
+    ) -> torch.Tensor: ...
 
     def append_generated_image(
         self, *, record: UGSessionRecord, image: Any | None
-    ) -> int:
-        ...
+    ) -> int: ...
 
-    def close_session(self, *, session_id: str) -> None:
-        ...
+    def decode_latents_to_image(
+        self, *, request: UGLatentDecodeRequest, record: UGSessionRecord
+    ) -> Any | None: ...
+
+    def close_session(self, *, session_id: str) -> None: ...
 
 
 class FakeUGModelRunner:
@@ -159,6 +165,12 @@ class FakeUGModelRunner:
     ) -> int:
         del record, image
         return 2
+
+    def decode_latents_to_image(
+        self, *, request: UGLatentDecodeRequest, record: UGSessionRecord
+    ) -> Any | None:
+        del request, record
+        return None
 
     def close_session(self, *, session_id: str) -> None:
         del session_id
@@ -278,6 +290,18 @@ class UGSessionRuntime:
         )
         record.velocity_count += 1
         return UGVelocityResponse(session=record.handle(), velocity=velocity)
+
+    def decode_latents_to_image(self, request: UGLatentDecodeRequest) -> Any | None:
+        record = self._record_for(request.session)
+        if record.state != UGSegmentState.G_DENOISE:
+            raise ValueError(
+                f"Cannot decode UG latents from state {record.state} "
+                f"for UG session {request.session.session_id}"
+            )
+        return self.model_runner.decode_latents_to_image(
+            request=request,
+            record=record,
+        )
 
     def append_generated_image(
         self, handle: UGSessionHandle, image: Any | None

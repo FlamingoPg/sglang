@@ -111,8 +111,10 @@ class UGDenoiseStage(PipelineStage):
             raise ValueError(f"num_inference_steps must be positive, got {num_steps}")
 
         timesteps = torch.linspace(1, 0, num_steps, dtype=x_t.dtype)
-        timesteps = params.timestep_shift * timesteps / (
-            1 + (params.timestep_shift - 1) * timesteps
+        timesteps = (
+            params.timestep_shift
+            * timesteps
+            / (1 + (params.timestep_shift - 1) * timesteps)
         )
         dts = timesteps[:-1] - timesteps[1:]
         trajectory_latents = []
@@ -151,16 +153,47 @@ class UGDecodeStage(PipelineStage):
         return RoleType.DECODER
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        value = int(batch.latents.mean().abs().item() * 255) % 255
-        batch.output = np.full(
-            (1, int(batch.height), int(batch.width), 3),
-            value,
-            dtype=np.uint8,
-        )
         contexts = batch.extra.get("ug_contexts")
+        image = None
         if contexts is not None:
-            self.bridge.append_generated_image(contexts=contexts, image=batch.output)
+            image = self.bridge.decode_latents(
+                contexts=contexts,
+                latent_tokens=batch.latents,
+                sampling_params=batch.sampling_params,
+            )
+        if image is None:
+            value = int(batch.latents.mean().abs().item() * 255) % 255
+            image = Image.fromarray(
+                np.full(
+                    (int(batch.height), int(batch.width), 3),
+                    value,
+                    dtype=np.uint8,
+                )
+            )
+        batch.output = _image_to_numpy_batch(image)
+        image_for_append = (
+            image
+            if isinstance(image, Image.Image)
+            else Image.fromarray(batch.output[0])
+        )
+        if contexts is not None:
+            self.bridge.append_generated_image(
+                contexts=contexts,
+                image=image_for_append,
+            )
             batch.extra["ug_post_image_segment"] = self.bridge.decode_next_segment(
                 contexts=contexts
             )
         return batch
+
+
+def _image_to_numpy_batch(image) -> np.ndarray:
+    if isinstance(image, Image.Image):
+        array = np.asarray(image.convert("RGB"))
+    else:
+        array = np.asarray(image)
+    if array.ndim == 3:
+        array = array[None, ...]
+    if array.dtype != np.uint8:
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    return array

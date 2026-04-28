@@ -41,11 +41,15 @@ flowchart LR
 - `python/sglang/srt/ug/bagel.py` 新增 `BAGELInterleaveContextBackend`，可包住一个已经加载好的官方 `InterleaveInferencer`，把 `init/update_context_* -> prepare_vae_latent* -> _forward_flow -> append image -> gen_text` 接到 UG adapter 边界。
 - `python/sglang/srt/ug/bagel.py` 的真 BAGEL loader 已开始按官方 `app.py` 的结构构造 `InterleaveInferencer`：加载 config/AE/tokenizer，`init_empty_weights` 下建 Bagel，再用 `load_checkpoint_and_dispatch` 加载 `ema.safetensors`，最后交给 `BAGELInterleaveContextBackend`。
 - 真权重 smoke 已在 `sgl_flamingo` 容器里用 `/data/models/BAGEL-7B-MoT` 和 `CUDA_VISIBLE_DEVICES=0` 跑通：`U prefill -> image marker -> predict_velocity_from_session` 返回 `velocity_shape=(4, 64)`、`velocity_dtype=torch.bfloat16`、`velocity_device=cuda:0`。
+- 真权重多步 UGPipeline 已跑通：`UGContextStage -> UGLatentStage -> UGDenoiseStage -> UGDecodeStage`，`num_inference_steps=4` 时输出 `trajectory_latents_shape=(3, 1, 4, 64)`，debug counter 为 `prefill_count=1`、`velocity_count=3`、`append_image_count=1`、`decode_count=2`，状态回到 `u_decode`。这证明当前路径已经不是一次性 image edit，而是 `U prefill -> G denoise 多步 -> append image -> U decode text`。
+- 真权重多步路径暴露了两个真实集成点：SGLD 侧 latent/timestep 初始在 CPU，需要在 BAGEL adapter 内迁到模型 runtime device；BAGEL 官方 image/text context update 和 `gen_text` 依赖 bfloat16 autocast，否则 append generated image 会在 `update_context_image` 里触发 Float/BFloat16 matmul dtype mismatch。
+- G decode 又向真实路径推进了一步：`UGDecodeStage` 新增 `decode_latents` 窄接口，SRT-backed BAGEL adapter 通过官方 `InterleaveInferencer.decode_image(...)` 走 VAE decode。真权重脚本输出 `output_shape=(1, 32, 32, 3)`、`output_dtype=uint8`、`output_minmax=0..197`、`output_mean=96.56`，随后同一 session append image 并继续 U decode。
 - `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake official model 验证 `_forward_flow` 只调用一次、CFG interval 规则一致、timestep 会扩展到 latent batch。
-- `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake official inferencer 验证 U-G-U 闭环：同一 session prefill 一次、denoise 多步复用 prepared context、append image 后继续 U decode，并且追加新 U 输入后能进入下一轮 G marker。
+- `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake official inferencer 验证 U-G-U 闭环：同一 session prefill 一次、denoise 多步复用 prepared context、BAGEL decode latents 到 image、append image 后继续 U decode，并且追加新 U 输入后能进入下一轮 G marker。
 - `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake loader symbols 验证真 loader 的官方构造形状和单卡 device-map pinning，不需要真实 7B 权重。
+- `python/sglang/multimodal_gen/test/unit/test_ug_diffusion_pipeline.py` 固定了 diffusion decode 边界：`UGDecodeStage` append 回 UG session 的是单张 `PIL.Image`，不是 numpy batch。
 
 ## 仍未解决
 
-- 真实权重只验证到单步 velocity，还没把 velocity 接回 SGLD 的完整多步 denoise loop。
-- append generated image 后继续真实 BAGEL U decode 还没跑；当前真实 smoke 只证明 `U prefill -> G velocity` 的 shared-context 路径。
+- 真权重已证明同 session 的 `U -> G 多步 -> append image -> U text` 控制流，但还没有把这套路径挂进 SRT engine 的真实 request/scheduler 入口。
+- 当前 `UGLatentStage` 仍由 SGLD 侧按 pipeline config 创建初始 noise；下一步要让 BAGEL adapter 提供 official init noise/latent shape，避免 pipeline config 和 BAGEL config 发生漂移。

@@ -25,6 +25,7 @@ from sglang.srt.ug.bagel import (
 from sglang.srt.ug.context import UGSessionHandle
 from sglang.srt.ug.runtime import (
     UGInterleavedMessage,
+    UGLatentDecodeRequest,
     UGSegmentState,
     UGSessionRuntime,
     UGVelocityRequest,
@@ -207,6 +208,7 @@ class FakeBAGELInferencer:
         self.new_token_ids = {"start_of_image": 1, "end_of_image": 2}
         self.vae_transform = FakeBAGELImageTransform()
         self.events = []
+        self.decode_image_calls = []
 
     def init_gen_context(self):
         self.events.append(("init",))
@@ -239,6 +241,15 @@ class FakeBAGELInferencer:
     def gen_text(self, gen_context, **kwargs):
         self.events.append(("gen_text", gen_context["past_key_values"]["id"], kwargs))
         return "context_backend_text_after_image"
+
+    def decode_image(self, latent, image_shape):
+        self.decode_image_calls.append(
+            {
+                "latent": latent,
+                "image_shape": image_shape,
+            }
+        )
+        return FakeImage(size=(image_shape[1], image_shape[0]))
 
 
 def _write_required_checkpoint_files(checkpoint_dir: Path) -> None:
@@ -609,7 +620,25 @@ class TestBAGELInterleaveContextBackend(unittest.TestCase):
         self.assertEqual(flow_call["cfg_renorm_type"], "channel")
         self.assertTrue(torch.equal(flow_call["key_values_lens"], torch.tensor([6])))
 
-        generated_image = FakeImage()
+        generated_image = runtime.decode_latents_to_image(
+            UGLatentDecodeRequest(
+                session=response.session,
+                latent_tokens=torch.zeros(1, 8, 64),
+                sampling_params=sampling_params,
+            )
+        )
+        self.assertIsInstance(generated_image, FakeImage)
+        self.assertEqual(generated_image.size, (32, 64))
+        self.assertEqual(len(inferencer.decode_image_calls), 1)
+        self.assertEqual(
+            tuple(inferencer.decode_image_calls[0]["latent"].shape),
+            (8, 64),
+        )
+        self.assertEqual(
+            inferencer.decode_image_calls[0]["image_shape"],
+            (64, 32),
+        )
+
         handle = runtime.append_generated_image(response.session, image=generated_image)
         text = runtime.decode_next_segment(handle)
 
