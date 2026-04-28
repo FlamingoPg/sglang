@@ -3,13 +3,37 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal, Protocol
 
 import torch
 
 from sglang.srt.ug.context import UGSessionHandle
+
+
+class _UGSimpleTokenizer:
+    bos_token_id = 1
+
+
+@dataclass(slots=True)
+class _UGSessionMMItem:
+    offsets: list[tuple[int, int]]
+    feature: Any | None = field(default_factory=object)
+
+
+@dataclass(slots=True)
+class _UGSessionMMInputs:
+    mm_items: list[_UGSessionMMItem]
+    release_count: int = 0
+
+    def merge(self, other: "_UGSessionMMInputs") -> None:
+        self.mm_items.extend(other.mm_items)
+
+    def release_features(self) -> None:
+        self.release_count += 1
+        for item in self.mm_items:
+            item.feature = None
 
 
 class UGSegmentState(str, Enum):
@@ -58,6 +82,12 @@ class UGSessionRecord:
     velocity_count: int = 0
     append_image_count: int = 0
     decode_count: int = 0
+    srt_request_count: int = 0
+    srt_last_request_id: str | None = None
+    srt_last_origin_input_len: int = 0
+    srt_last_origin_input_ids: list[int] = field(default_factory=list)
+    srt_mm_offsets: list[tuple[int, int]] = field(default_factory=list)
+    srt_mm_inputs: _UGSessionMMInputs | None = None
     closed: bool = False
 
     def handle(self) -> UGSessionHandle:
@@ -143,10 +173,14 @@ class UGSessionRuntime:
         model_runner: UGModelRunnerProtocol | None = None,
         session_controller: Any | None = None,
         capacity_of_str_len: int = 4096,
+        tokenizer: Any | None = None,
+        vocab_size: int = 32000,
     ) -> None:
         self.model_runner = model_runner or FakeUGModelRunner()
         self.session_controller = session_controller
         self.capacity_of_str_len = capacity_of_str_len
+        self.tokenizer = tokenizer or _UGSimpleTokenizer()
+        self.vocab_size = vocab_size
         self._records: dict[str, UGSessionRecord] = {}
 
     @staticmethod
@@ -191,10 +225,17 @@ class UGSessionRuntime:
         added_tokens = self.model_runner.prefill_interleaved(
             session_id=session_id, messages=messages
         )
+        next_context_version = record.context_version + 1
+        next_anchor_request_id = f"{session_id}:u{next_context_version}"
+        self._append_srt_session_request(
+            record,
+            messages,
+            request_id=next_anchor_request_id,
+        )
         record.context_length += added_tokens
-        record.context_version += 1
+        record.context_version = next_context_version
         record.prefill_count += 1
-        record.anchor_request_id = f"{session_id}:u{record.context_version}"
+        record.anchor_request_id = next_anchor_request_id
         record.state = UGSegmentState.U_DECODE
         return record.handle()
 
@@ -251,10 +292,17 @@ class UGSessionRuntime:
         added_tokens = self.model_runner.append_generated_image(
             record=record, image=image
         )
+        next_context_version = record.context_version + 1
+        next_anchor_request_id = f"{record.session_id}:u{next_context_version}"
+        self._append_srt_session_request(
+            record,
+            [UGInterleavedMessage(type="image", content=image)],
+            request_id=next_anchor_request_id,
+        )
         record.context_length += added_tokens
-        record.context_version += 1
+        record.context_version = next_context_version
         record.append_image_count += 1
-        record.anchor_request_id = f"{record.session_id}:u{record.context_version}"
+        record.anchor_request_id = next_anchor_request_id
         record.state = UGSegmentState.U_DECODE
         return record.handle()
 
@@ -275,26 +323,38 @@ class UGSessionRuntime:
         return self._record_for(handle_or_session_id).state
 
     def get_debug_counters(self, handle_or_session_id: UGSessionHandle | str) -> dict:
-        record = self._record_for(handle_or_session_id)
+        record = self._record_for(handle_or_session_id, allow_closed=True)
         return {
             "session_id": record.session_id,
             "state": record.state.value,
+            "closed": record.closed,
             "context_length": record.context_length,
             "context_version": record.context_version,
             "prefill_count": record.prefill_count,
             "velocity_count": record.velocity_count,
             "append_image_count": record.append_image_count,
             "decode_count": record.decode_count,
+            "srt_request_count": record.srt_request_count,
+            "srt_last_request_id": record.srt_last_request_id,
+            "srt_last_origin_input_len": record.srt_last_origin_input_len,
+            "srt_last_origin_input_ids": record.srt_last_origin_input_ids,
+            "srt_mm_offsets": record.srt_mm_offsets,
+            "srt_mm_features_released": self._srt_mm_features_released(record),
         }
 
-    def _record_for(self, handle_or_session_id: UGSessionHandle | str) -> UGSessionRecord:
+    def _record_for(
+        self,
+        handle_or_session_id: UGSessionHandle | str,
+        *,
+        allow_closed: bool = False,
+    ) -> UGSessionRecord:
         session_id = (
             handle_or_session_id.session_id
             if isinstance(handle_or_session_id, UGSessionHandle)
             else handle_or_session_id
         )
         record = self._records.get(session_id)
-        if record is None or record.closed:
+        if record is None or (record.closed and not allow_closed):
             raise ValueError(f"Unknown or closed UG session: {session_id}")
         if isinstance(handle_or_session_id, UGSessionHandle):
             if handle_or_session_id.context_version != record.context_version:
@@ -304,6 +364,115 @@ class UGSessionRuntime:
                     f"{record.context_version}"
                 )
         return record
+
+    def _append_srt_session_request(
+        self,
+        record: UGSessionRecord,
+        messages: list[UGInterleavedMessage],
+        *,
+        request_id: str,
+    ) -> None:
+        if self.session_controller is None or not hasattr(
+            self.session_controller, "get"
+        ):
+            return
+        session = self.session_controller.get(record.session_id)
+        if session is None:
+            raise RuntimeError(
+                f"SRT session {record.session_id} is not open for UG request"
+            )
+
+        from sglang.srt.managers.io_struct import (
+            SessionParams,
+            TokenizedGenerateReqInput,
+        )
+        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+        from sglang.srt.sampling.sampling_params import SamplingParams
+        from sglang.srt.session.session_controller import SessionController
+
+        input_ids, input_text, mm_inputs = self._tokenize_interleaved_messages(messages)
+        recv_req = TokenizedGenerateReqInput(
+            rid=request_id,
+            input_text=input_text,
+            input_ids=input_ids,
+            mm_inputs=mm_inputs,
+            sampling_params=SamplingParams(max_new_tokens=0),
+            return_logprob=False,
+            logprob_start_len=0,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            session_params=SessionParams(
+                id=record.session_id,
+                rid=record.srt_last_request_id,
+                replace=False,
+                drop_previous_output=False,
+            ),
+        )
+        req = session.create_req(
+            recv_req,
+            tokenizer=self.tokenizer,
+            vocab_size=self.vocab_size,
+        )
+        if req.to_finish is not None:
+            raise RuntimeError(
+                f"Failed to create SRT UG session request {request_id}: "
+                f"{req.to_finish.to_json()}"
+            )
+        if mm_inputs is not None:
+            SessionController.adjust_mm_offsets(recv_req, req, mm_inputs)
+            req.extend_image_inputs(mm_inputs)
+
+        req.finished_reason = FINISH_LENGTH(0)
+        record.srt_request_count += 1
+        record.srt_last_request_id = request_id
+        record.srt_last_origin_input_len = len(req.origin_input_ids)
+        record.srt_last_origin_input_ids = list(req.origin_input_ids)
+        record.srt_mm_inputs = req.multimodal_inputs
+        record.srt_mm_offsets = self._collect_mm_offsets(req.multimodal_inputs)
+
+    def _tokenize_interleaved_messages(
+        self, messages: list[UGInterleavedMessage]
+    ) -> tuple[list[int], str, _UGSessionMMInputs | None]:
+        input_ids = [self.tokenizer.bos_token_id]
+        text_parts: list[str] = []
+        mm_items: list[_UGSessionMMItem] = []
+        for message in messages:
+            if message.type == "text":
+                text = str(message.content)
+                text_parts.append(text)
+                input_ids.extend(self._fake_text_token_ids(text))
+            elif message.type == "image":
+                start = len(input_ids)
+                input_ids.extend([self.vocab_size + 1, self.vocab_size + 2])
+                mm_items.append(_UGSessionMMItem(offsets=[(start, len(input_ids))]))
+                text_parts.append("<image>")
+            else:
+                raise ValueError(f"Unsupported UG message type: {message.type}")
+        mm_inputs = _UGSessionMMInputs(mm_items) if mm_items else None
+        return input_ids, " ".join(text_parts), mm_inputs
+
+    @staticmethod
+    def _fake_text_token_ids(text: str) -> list[int]:
+        return [100 + (sum(word.encode("utf-8")) % 1000) for word in text.split()]
+
+    @staticmethod
+    def _collect_mm_offsets(mm_inputs: Any | None) -> list[tuple[int, int]]:
+        if mm_inputs is None:
+            return []
+        offsets: list[tuple[int, int]] = []
+        for item in getattr(mm_inputs, "mm_items", []):
+            offsets.extend(getattr(item, "offsets", []) or [])
+        return offsets
+
+    @staticmethod
+    def _srt_mm_features_released(record: UGSessionRecord) -> bool:
+        if record.srt_mm_inputs is None:
+            return False
+        for item in record.srt_mm_inputs.mm_items:
+            if item.feature is not None:
+                return False
+        return True
 
     def _ensure_srt_session(self, session_id: str) -> None:
         if self.session_controller is None or session_id in self.session_controller:

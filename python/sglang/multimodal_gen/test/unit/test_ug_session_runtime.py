@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.session.session_controller import SessionController
 from sglang.srt.ug.context import UGSessionHandle
 from sglang.srt.ug.runtime import (
     FakeUGModelRunner,
@@ -14,6 +15,14 @@ from sglang.srt.ug.runtime import (
     UGSessionRuntime,
     UGVelocityRequest,
 )
+
+
+class FakeTreeCache:
+    def __init__(self):
+        self.released_sessions = []
+
+    def release_session(self, session_id):
+        self.released_sessions.append(session_id)
 
 
 class TestUGSessionRuntime(unittest.TestCase):
@@ -67,6 +76,91 @@ class TestUGSessionRuntime(unittest.TestCase):
 
         runtime.close_session(handle)
         self.assertEqual(controller.closed, ["srt-session"])
+
+    def test_prefill_uses_srt_create_req_and_appends_to_same_session(self):
+        controller = SessionController(FakeTreeCache())
+        runtime = UGSessionRuntime(
+            model_runner=FakeUGModelRunner(), session_controller=controller
+        )
+
+        first = runtime.prefill_interleaved(
+            [
+                UGInterleavedMessage(type="image", content=object()),
+                UGInterleavedMessage(type="text", content="hello"),
+            ],
+            session_id="srt-backed-prefill",
+        )
+        first_debug = runtime.get_debug_counters(first)
+
+        self.assertEqual(first_debug["srt_request_count"], 1)
+        self.assertEqual(first_debug["srt_last_request_id"], first.anchor_request_id)
+        self.assertEqual(first_debug["srt_last_origin_input_len"], 4)
+        self.assertEqual(first_debug["srt_mm_offsets"], [(1, 3)])
+
+        second = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="again")],
+            session_id=first.session_id,
+        )
+        second_debug = runtime.get_debug_counters(second)
+
+        self.assertEqual(second.session_id, first.session_id)
+        self.assertEqual(controller.sessions.keys(), {"srt-backed-prefill"})
+        self.assertEqual(second_debug["prefill_count"], 2)
+        self.assertEqual(second_debug["srt_request_count"], 2)
+        self.assertEqual(second_debug["srt_last_request_id"], second.anchor_request_id)
+        self.assertEqual(second_debug["srt_last_origin_input_len"], 5)
+        self.assertEqual(second_debug["srt_mm_offsets"], [(1, 3)])
+        self.assertEqual(len(controller.get(second.session_id).req_nodes), 2)
+
+    def test_append_generated_image_uses_srt_session_offset_shift(self):
+        controller = SessionController(FakeTreeCache())
+        runtime = UGSessionRuntime(
+            model_runner=FakeUGModelRunner(), session_controller=controller
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="hello world")],
+            session_id="srt-backed-image-append",
+        )
+        self.assertEqual(runtime.get_debug_counters(handle)["srt_mm_offsets"], [])
+
+        decode = runtime.decode_next_segment(handle)
+        self.assertEqual(decode.type, "image_marker")
+        handle = runtime.append_generated_image(handle, image=object())
+        debug = runtime.get_debug_counters(handle)
+
+        self.assertEqual(debug["srt_request_count"], 2)
+        self.assertEqual(debug["srt_last_request_id"], handle.anchor_request_id)
+        self.assertEqual(debug["srt_last_origin_input_len"], 5)
+        self.assertEqual(debug["srt_mm_offsets"], [(3, 5)])
+        self.assertEqual(debug["append_image_count"], 1)
+        self.assertEqual(debug["state"], "u_decode")
+
+        post_image = runtime.decode_next_segment(handle)
+        self.assertEqual(post_image.type, "text")
+        self.assertEqual(post_image.text, "generated_text_after_image")
+
+    def test_close_session_releases_srt_multimodal_features(self):
+        tree_cache = FakeTreeCache()
+        controller = SessionController(tree_cache)
+        runtime = UGSessionRuntime(
+            model_runner=FakeUGModelRunner(), session_controller=controller
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="image", content=object())],
+            session_id="srt-backed-close",
+        )
+        self.assertFalse(runtime.get_debug_counters(handle)["srt_mm_features_released"])
+
+        runtime.close_session(handle)
+        debug = runtime.get_debug_counters("srt-backed-close")
+
+        self.assertTrue(debug["closed"])
+        self.assertEqual(debug["state"], "done")
+        self.assertTrue(debug["srt_mm_features_released"])
+        self.assertEqual(tree_cache.released_sessions, ["srt-backed-close"])
+        self.assertNotIn("srt-backed-close", controller.sessions)
 
     def test_u_g_u_minimal_loop_keeps_one_session(self):
         runtime = UGSessionRuntime(model_runner=FakeUGModelRunner())
