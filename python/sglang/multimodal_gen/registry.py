@@ -629,6 +629,7 @@ def _register_configs():
         pipeline_config_cls=UGPipelineConfig,
         hf_model_paths=[
             "ByteDance-Seed/BAGEL-7B-MoT",
+            "sglang-internal/mock-bagel",
             "sglang-internal/fake-ug",
         ],
         model_detectors=[

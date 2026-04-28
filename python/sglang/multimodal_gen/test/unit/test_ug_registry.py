@@ -25,6 +25,14 @@ class TestUGRegistry(unittest.TestCase):
         self.assertIs(info.pipeline_config_cls, UGPipelineConfig)
         self.assertIs(info.sampling_param_cls, UGSamplingParams)
 
+    def test_mock_bagel_resolves_without_model_index(self):
+        info = get_model_info("sglang-internal/mock-bagel", backend="sglang")
+
+        self.assertIsNotNone(info)
+        self.assertIs(info.pipeline_cls, UGPipeline)
+        self.assertIs(info.pipeline_config_cls, UGPipelineConfig)
+        self.assertIs(info.sampling_param_cls, UGSamplingParams)
+
     def test_bagel_resolves_to_ug_pipeline(self):
         info = get_model_info("ByteDance-Seed/BAGEL-7B-MoT", backend="sglang")
 

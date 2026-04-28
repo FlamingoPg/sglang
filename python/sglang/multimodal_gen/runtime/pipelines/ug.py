@@ -12,7 +12,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
     UGLatentStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.srt.ug.adapter import UGModelRunnerAdapter
+from sglang.srt.ug.bagel import create_bagel_ug_model_adapter
 from sglang.srt.ug.denoiser import SRTBackedUGDenoiserBridge, UGDenoiserBridge
+from sglang.srt.ug.runtime import UGSessionRuntime
 
 
 def _load_ug_bridge(model_path: str) -> UGDenoiserBridge:
@@ -20,9 +23,9 @@ def _load_ug_bridge(model_path: str) -> UGDenoiserBridge:
     if "fake-ug" in model_path_lower:
         return SRTBackedUGDenoiserBridge()
     if "bagel" in model_path_lower:
-        raise NotImplementedError(
-            "BAGEL UG bridge is not wired yet. Use sglang-internal/fake-ug "
-            "for diffusion runtime tests until the SRT UG model path lands."
+        adapter = create_bagel_ug_model_adapter(model_path)
+        return SRTBackedUGDenoiserBridge(
+            UGSessionRuntime(model_runner=UGModelRunnerAdapter(adapter))
         )
     raise ValueError(f"Unsupported UG model path: {model_path}")
 

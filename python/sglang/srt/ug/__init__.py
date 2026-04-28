@@ -7,6 +7,12 @@ from sglang.srt.ug.adapter import (
     UGModelRunnerAdapter,
     UGModelSessionView,
 )
+from sglang.srt.ug.bagel import (
+    BAGELAdapterError,
+    BAGELUGModelAdapter,
+    MockBAGELBackend,
+    create_bagel_ug_model_adapter,
+)
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle, UGSessionHandle
 from sglang.srt.ug.denoiser import (
     FakeUGDenoiserBridge,
@@ -26,6 +32,9 @@ from sglang.srt.ug.runtime import (
 __all__ = [
     "FakeUGDenoiserBridge",
     "FakeUGModelRunner",
+    "BAGELAdapterError",
+    "BAGELUGModelAdapter",
+    "MockBAGELBackend",
     "SRTBackedUGDenoiserBridge",
     "UGContextBundle",
     "UGContextHandle",
@@ -42,4 +51,5 @@ __all__ = [
     "UGSessionRuntime",
     "UGVelocityRequest",
     "UGVelocityResponse",
+    "create_bagel_ug_model_adapter",
 ]
