@@ -38,11 +38,11 @@ flowchart LR
 
 - `python/sglang/srt/ug/bagel.py` 新增 `BAGELPreparedDenoise`，用于保存官方 `prepare_vae_latent*` 产物和主/CFG BAGEL cache。
 - `python/sglang/srt/ug/bagel.py` 新增 `BAGELDenoiseStepRunner.predict_velocity(...)`，按官方 `generate_image` 的单步参数映射调用 `_forward_flow`。
+- `python/sglang/srt/ug/bagel.py` 新增 `BAGELInterleaveContextBackend`，可包住一个已经加载好的官方 `InterleaveInferencer`，把 `init/update_context_* -> prepare_vae_latent* -> _forward_flow -> append image -> gen_text` 接到 UG adapter 边界。
 - `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake official model 验证 `_forward_flow` 只调用一次、CFG interval 规则一致、timestep 会扩展到 latent batch。
+- `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake official inferencer 验证 U-G-U 闭环：同一 session prefill 一次、denoise 多步复用 prepared context、append image 后继续 U decode，并且追加新 U 输入后能进入下一轮 G marker。
 
 ## 仍未解决
 
-- 真 BAGEL checkpoint loader 还没接进来。
-- 官方 `InterleaveInferencer.gen_image` 仍是整段生成入口；SGLang 需要继续把 `prepare_vae_latent*` 和 `past_key_values` 生命周期接到 SRT-owned UG session。
-- 真权重验证前，`predict_velocity_from_session` 仍只能通过 fake/mock backend 或 fake official model 测 shape/调用链。
-
+- 真 BAGEL checkpoint loader 还没接进来；当前只支持把已经构造好的官方 `InterleaveInferencer` 包成 backend。
+- 真权重验证前，`predict_velocity_from_session` 仍只能通过 fake/mock backend 或 fake official inferencer 测 shape/调用链。

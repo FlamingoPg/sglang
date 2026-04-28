@@ -2,22 +2,29 @@
 
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from sglang.multimodal_gen.runtime.pipelines.ug import _load_ug_bridge
-from sglang.srt.ug.adapter import UGModelSessionView
+from sglang.srt.ug.adapter import UGModelRunnerAdapter, UGModelSessionView
 from sglang.srt.ug.bagel import (
     BAGELAdapterError,
     BAGELDenoiseStepError,
     BAGELDenoiseStepRunner,
+    BAGELInterleaveContextBackend,
     BAGELPreparedDenoise,
     BAGELUGModelAdapter,
     MockBAGELBackend,
     create_bagel_ug_model_adapter,
 )
 from sglang.srt.ug.context import UGSessionHandle
-from sglang.srt.ug.runtime import UGSegmentState, UGVelocityRequest
+from sglang.srt.ug.runtime import (
+    UGInterleavedMessage,
+    UGSegmentState,
+    UGSessionRuntime,
+    UGVelocityRequest,
+)
 
 
 class TestBAGELUGModelAdapter(unittest.TestCase):
@@ -108,6 +115,99 @@ class FakeOfficialBAGELModel:
             kwargs["x_t"],
             kwargs["cfg_text_scale"] + kwargs["cfg_img_scale"],
         )
+
+
+class FakeContextBAGELModel(FakeOfficialBAGELModel):
+    def __init__(self):
+        super().__init__()
+        self.prepare_vae_latent_calls = []
+        self.prepare_vae_latent_cfg_calls = []
+
+    def prepare_vae_latent(
+        self,
+        *,
+        curr_kvlens,
+        curr_rope,
+        image_sizes,
+        new_token_ids,
+    ):
+        self.prepare_vae_latent_calls.append(
+            {
+                "curr_kvlens": list(curr_kvlens),
+                "curr_rope": list(curr_rope),
+                "image_sizes": list(image_sizes),
+                "new_token_ids": dict(new_token_ids),
+            }
+        )
+        payload = dict(_fake_bagel_prepared().generation_input)
+        payload["key_values_lens"] = torch.tensor(curr_kvlens, dtype=torch.int)
+        return payload
+
+    def prepare_vae_latent_cfg(self, *, curr_kvlens, curr_rope, image_sizes):
+        self.prepare_vae_latent_cfg_calls.append(
+            {
+                "curr_kvlens": list(curr_kvlens),
+                "curr_rope": list(curr_rope),
+                "image_sizes": list(image_sizes),
+            }
+        )
+        payload = dict(_fake_bagel_prepared().cfg_text_generation_input)
+        payload["cfg_key_values_lens"] = torch.tensor(curr_kvlens, dtype=torch.int)
+        return payload
+
+
+class FakeImage:
+    def __init__(self, size=(16, 8)):
+        self.size = size
+
+
+class FakeBAGELImageTransform:
+    def __init__(self):
+        self.resize_calls = []
+
+    def resize_transform(self, image):
+        self.resize_calls.append(image)
+        return image
+
+
+class FakeBAGELInferencer:
+    def __init__(self):
+        self.model = FakeContextBAGELModel()
+        self.new_token_ids = {"start_of_image": 1, "end_of_image": 2}
+        self.vae_transform = FakeBAGELImageTransform()
+        self.events = []
+
+    def init_gen_context(self):
+        self.events.append(("init",))
+        return {
+            "kv_lens": [0],
+            "ropes": [0],
+            "past_key_values": {"id": "ctx0"},
+        }
+
+    def update_context_text(self, text, gen_context):
+        self.events.append(("text", text, gen_context["past_key_values"]["id"]))
+        return {
+            "kv_lens": [gen_context["kv_lens"][0] + len(text.split())],
+            "ropes": [gen_context["ropes"][0] + 1],
+            "past_key_values": {
+                "id": f"{gen_context['past_key_values']['id']}:t{text}"
+            },
+        }
+
+    def update_context_image(self, image, gen_context, vae=True, vit=True):
+        self.events.append(
+            ("image", image, vae, vit, gen_context["past_key_values"]["id"])
+        )
+        return {
+            "kv_lens": [gen_context["kv_lens"][0] + 2],
+            "ropes": [gen_context["ropes"][0] + 1],
+            "past_key_values": {"id": f"{gen_context['past_key_values']['id']}:i"},
+        }
+
+    def gen_text(self, gen_context, **kwargs):
+        self.events.append(("gen_text", gen_context["past_key_values"]["id"], kwargs))
+        return "context_backend_text_after_image"
 
 
 def _fake_bagel_prepared() -> BAGELPreparedDenoise:
@@ -212,6 +312,116 @@ class TestBAGELDenoiseStepRunner(unittest.TestCase):
                 latent_tokens=torch.zeros(1, 3),
                 timestep=torch.tensor([0.5]),
             )
+
+
+class TestBAGELInterleaveContextBackend(unittest.TestCase):
+    def test_context_backend_runs_u_g_u_with_single_prepare(self):
+        inferencer = FakeBAGELInferencer()
+        adapter = BAGELUGModelAdapter(
+            "already-loaded-bagel",
+            backend=BAGELInterleaveContextBackend(
+                inferencer,
+                default_image_shape=(32, 32),
+            ),
+        )
+        runtime = UGSessionRuntime(model_runner=UGModelRunnerAdapter(adapter))
+        image = FakeImage(size=(16, 8))
+
+        handle = runtime.prefill_interleaved(
+            [
+                UGInterleavedMessage(type="image", content=image),
+                UGInterleavedMessage(type="text", content="draw a calm lake"),
+            ],
+            session_id="bagel-context-session",
+        )
+        marker = runtime.decode_next_segment(handle)
+        self.assertEqual(marker.type, "image_marker")
+
+        sampling_params = SimpleNamespace(
+            height=64,
+            width=32,
+            cfg_text_scale=5.0,
+            cfg_img_scale=2.0,
+            cfg_interval=(0.4, 1.0),
+            cfg_renorm_min=0.1,
+            cfg_renorm_type="channel",
+        )
+        latents = torch.zeros(2, 3)
+        response = runtime.predict_velocity(
+            UGVelocityRequest(
+                session=handle,
+                latent_tokens=latents,
+                timestep=torch.tensor([0.5]),
+                latent_position_ids=torch.arange(3),
+                sampling_params=sampling_params,
+            )
+        )
+        response = runtime.predict_velocity(
+            UGVelocityRequest(
+                session=response.session,
+                latent_tokens=latents,
+                timestep=torch.tensor([0.45]),
+                latent_position_ids=torch.arange(3),
+                sampling_params=sampling_params,
+            )
+        )
+
+        self.assertTrue(
+            torch.allclose(response.velocity, torch.full_like(latents, 7.0))
+        )
+        self.assertEqual(len(inferencer.model.prepare_vae_latent_calls), 1)
+        self.assertEqual(len(inferencer.model.prepare_vae_latent_cfg_calls), 2)
+        self.assertEqual(len(inferencer.model.forward_flow_calls), 2)
+        self.assertEqual(
+            inferencer.model.prepare_vae_latent_calls[0]["image_sizes"],
+            [(64, 32)],
+        )
+        flow_call = inferencer.model.forward_flow_calls[0]
+        self.assertEqual(flow_call["cfg_text_scale"], 5.0)
+        self.assertEqual(flow_call["cfg_img_scale"], 2.0)
+        self.assertEqual(flow_call["cfg_renorm_min"], 0.1)
+        self.assertEqual(flow_call["cfg_renorm_type"], "channel")
+        self.assertTrue(torch.equal(flow_call["key_values_lens"], torch.tensor([6])))
+
+        generated_image = FakeImage()
+        handle = runtime.append_generated_image(response.session, image=generated_image)
+        text = runtime.decode_next_segment(handle)
+
+        self.assertEqual(text.type, "text")
+        self.assertEqual(text.text, "context_backend_text_after_image")
+        self.assertEqual(
+            inferencer.vae_transform.resize_calls, [image, generated_image]
+        )
+        self.assertEqual(runtime.get_debug_counters(handle)["prefill_count"], 1)
+        self.assertEqual(runtime.get_debug_counters(handle)["velocity_count"], 2)
+        self.assertEqual(runtime.get_debug_counters(handle)["append_image_count"], 1)
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="now draw a boat")],
+            session_id="bagel-context-session",
+        )
+        marker = runtime.decode_next_segment(handle)
+        self.assertEqual(marker.type, "image_marker")
+        self.assertEqual(handle.session_id, response.session.session_id)
+        self.assertEqual(runtime.get_debug_counters(handle)["prefill_count"], 2)
+
+        runtime.close_session(handle)
+        self.assertNotIn("bagel-context-session", adapter.backend.sessions)
+
+    def test_context_backend_release_closes_backend_session(self):
+        inferencer = FakeBAGELInferencer()
+        backend = BAGELInterleaveContextBackend(inferencer)
+        adapter = BAGELUGModelAdapter("already-loaded-bagel", backend=backend)
+        runtime = UGSessionRuntime(model_runner=UGModelRunnerAdapter(adapter))
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a cat")],
+            session_id="bagel-close-session",
+        )
+        self.assertIn("bagel-close-session", backend.sessions)
+
+        runtime.close_session(handle)
+
+        self.assertNotIn("bagel-close-session", backend.sessions)
 
 
 if __name__ == "__main__":

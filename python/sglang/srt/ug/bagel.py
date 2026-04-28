@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 from collections import defaultdict
+from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -157,9 +159,7 @@ class BAGELDenoiseStepRunner:
                 f"num_timesteps must be > 1, got {num_timesteps}"
             )
         timesteps = torch.linspace(1, 0, num_timesteps, device=device, dtype=dtype)
-        timesteps = timestep_shift * timesteps / (
-            1 + (timestep_shift - 1) * timesteps
-        )
+        timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
         dts = timesteps[:-1] - timesteps[1:]
         return timesteps[:-1], dts
 
@@ -208,27 +208,216 @@ class BAGELDenoiseStepRunner:
         )
 
 
-class BAGELBackendProtocol(Protocol):
+@dataclass
+class BAGELSessionContext:
+    gen_context: dict[str, Any]
+    cfg_text_context: dict[str, Any]
+    cfg_img_context: dict[str, Any]
+    image_shape: tuple[int, int]
+    prepared_denoise: BAGELPreparedDenoise | None = None
+    decode_count: int = 0
+    append_image_count: int = 0
+
+
+class BAGELInterleaveContextBackend:
+    """Wraps an official BAGEL InterleaveInferencer behind UG adapter methods."""
+
+    def __init__(
+        self,
+        inferencer: Any,
+        *,
+        step_runner: BAGELDenoiseStepRunner | None = None,
+        default_image_shape: tuple[int, int] = (1024, 1024),
+    ) -> None:
+        self.inferencer = inferencer
+        self.step_runner = step_runner or BAGELDenoiseStepRunner()
+        self.default_image_shape = default_image_shape
+        self.sessions: dict[str, BAGELSessionContext] = {}
+
     def prefill_interleaved(
         self, *, session, messages: list[UGInterleavedMessage]
     ) -> UGModelPrefillResult:
-        ...
+        state = self._state_for(session.handle.session_id)
+        state.decode_count = 0
+        added_tokens = 0
+        for message in messages:
+            if message.type == "text":
+                text = str(message.content)
+                state.cfg_text_context = _clone_context(state.gen_context)
+                state.gen_context = self.inferencer.update_context_text(
+                    text,
+                    state.gen_context,
+                )
+                state.cfg_img_context = self.inferencer.update_context_text(
+                    text,
+                    state.cfg_img_context,
+                )
+                added_tokens += len(text.split())
+            elif message.type == "image":
+                image = self._prepare_image(message.content)
+                state.gen_context = self.inferencer.update_context_image(
+                    image,
+                    state.gen_context,
+                    vae=True,
+                    vit=True,
+                )
+                state.image_shape = self._image_shape(image)
+                state.cfg_text_context = _clone_context(state.gen_context)
+                added_tokens += 2
+            else:
+                raise ValueError(f"Unsupported BAGEL message type: {message.type}")
+            state.prepared_denoise = None
+        return UGModelPrefillResult(added_tokens=added_tokens)
 
     def decode_next_segment(self, *, session) -> UGDecodeResult:
-        ...
+        state = self._state_for(session.handle.session_id)
+        if state.decode_count == 0:
+            state.decode_count += 1
+            return UGDecodeResult(type="image_marker")
+        if state.append_image_count > 0 and state.decode_count == 1:
+            state.decode_count += 1
+            text = self.inferencer.gen_text(
+                state.gen_context,
+                do_sample=False,
+                temperature=0.3,
+                max_length=512,
+            )
+            return UGDecodeResult(type="text", text=text)
+        state.decode_count += 1
+        return UGDecodeResult(type="done")
 
     def predict_velocity_from_session(
         self, *, session, request: UGVelocityRequest
     ) -> torch.Tensor:
-        ...
+        state = self._state_for(session.handle.session_id)
+        if state.prepared_denoise is None:
+            state.prepared_denoise = self._prepare_denoise(
+                state, request.sampling_params
+            )
+        return self.step_runner.predict_velocity(
+            model=self.inferencer.model,
+            prepared=state.prepared_denoise,
+            latent_tokens=request.latent_tokens,
+            timestep=request.timestep,
+        )
 
     def append_generated_image(
         self, *, session, image: Any | None
     ) -> UGModelAppendImageResult:
-        ...
+        state = self._state_for(session.handle.session_id)
+        image = self._prepare_image(image)
+        state.gen_context = self.inferencer.update_context_image(
+            image,
+            state.gen_context,
+            vae=True,
+            vit=True,
+        )
+        state.image_shape = self._image_shape(image)
+        state.cfg_text_context = _clone_context(state.gen_context)
+        state.append_image_count += 1
+        state.prepared_denoise = None
+        return UGModelAppendImageResult(added_tokens=2)
 
     def close_session(self, *, session_id: str) -> None:
-        ...
+        self.sessions.pop(session_id, None)
+
+    def _state_for(self, session_id: str) -> BAGELSessionContext:
+        state = self.sessions.get(session_id)
+        if state is not None:
+            return state
+        gen_context = self.inferencer.init_gen_context()
+        state = BAGELSessionContext(
+            gen_context=gen_context,
+            cfg_text_context=_clone_context(gen_context),
+            cfg_img_context=_clone_context(gen_context),
+            image_shape=self.default_image_shape,
+        )
+        self.sessions[session_id] = state
+        return state
+
+    def _prepare_denoise(
+        self,
+        state: BAGELSessionContext,
+        sampling_params: Any | None,
+    ) -> BAGELPreparedDenoise:
+        image_shape = self._image_shape_from_params(sampling_params, state.image_shape)
+        model = self.inferencer.model
+        generation_input = model.prepare_vae_latent(
+            curr_kvlens=state.gen_context["kv_lens"],
+            curr_rope=state.gen_context["ropes"],
+            image_sizes=[image_shape],
+            new_token_ids=self.inferencer.new_token_ids,
+        )
+        cfg_text_generation_input = model.prepare_vae_latent_cfg(
+            curr_kvlens=state.cfg_text_context["kv_lens"],
+            curr_rope=state.cfg_text_context["ropes"],
+            image_sizes=[image_shape],
+        )
+        cfg_img_generation_input = model.prepare_vae_latent_cfg(
+            curr_kvlens=state.cfg_img_context["kv_lens"],
+            curr_rope=state.cfg_img_context["ropes"],
+            image_sizes=[image_shape],
+        )
+        return BAGELPreparedDenoise(
+            generation_input=generation_input,
+            cfg_text_generation_input=cfg_text_generation_input,
+            cfg_img_generation_input=cfg_img_generation_input,
+            past_key_values=state.gen_context["past_key_values"],
+            cfg_text_past_key_values=state.cfg_text_context["past_key_values"],
+            cfg_img_past_key_values=state.cfg_img_context["past_key_values"],
+            cfg_text_scale=float(getattr(sampling_params, "cfg_text_scale", 4.0)),
+            cfg_img_scale=float(getattr(sampling_params, "cfg_img_scale", 1.5)),
+            cfg_interval=tuple(getattr(sampling_params, "cfg_interval", (0.4, 1.0))),
+            cfg_renorm_min=float(getattr(sampling_params, "cfg_renorm_min", 0.0)),
+            cfg_renorm_type=getattr(sampling_params, "cfg_renorm_type", "global"),
+        )
+
+    def _prepare_image(self, image: Any | None) -> Any | None:
+        if image is None:
+            return None
+        transform = getattr(self.inferencer, "vae_transform", None)
+        if transform is None:
+            return image
+        resize_transform = getattr(transform, "resize_transform", None)
+        if resize_transform is None:
+            return image
+        return resize_transform(image)
+
+    def _image_shape(self, image: Any | None) -> tuple[int, int]:
+        size = getattr(image, "size", None)
+        if isinstance(size, tuple) and len(size) == 2:
+            width, height = size
+            return int(height), int(width)
+        return self.default_image_shape
+
+    @staticmethod
+    def _image_shape_from_params(
+        sampling_params: Any | None,
+        default: tuple[int, int],
+    ) -> tuple[int, int]:
+        if sampling_params is None:
+            return default
+        height = getattr(sampling_params, "height", None) or default[0]
+        width = getattr(sampling_params, "width", None) or default[1]
+        return int(height), int(width)
+
+
+class BAGELBackendProtocol(Protocol):
+    def prefill_interleaved(
+        self, *, session, messages: list[UGInterleavedMessage]
+    ) -> UGModelPrefillResult: ...
+
+    def decode_next_segment(self, *, session) -> UGDecodeResult: ...
+
+    def predict_velocity_from_session(
+        self, *, session, request: UGVelocityRequest
+    ) -> torch.Tensor: ...
+
+    def append_generated_image(
+        self, *, session, image: Any | None
+    ) -> UGModelAppendImageResult: ...
+
+    def close_session(self, *, session_id: str) -> None: ...
 
 
 class BAGELUGModelAdapter(UGModelAdapterProtocol):
@@ -307,9 +496,10 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
             )
 
         raise BAGELAdapterError(
-            "Real BAGEL backend loading is not wired yet: official BAGEL "
-            "InterleaveInferencer.gen_image owns the denoising loop, while "
-            "SGLang UG requires predict_velocity_from_session for each G step."
+            "Real BAGEL checkpoint construction is not wired yet. "
+            "BAGELInterleaveContextBackend can wrap an already loaded official "
+            "InterleaveInferencer, but the loader still needs to construct that "
+            "inferencer from checkpoint files inside SRT."
         )
 
 
@@ -376,10 +566,16 @@ def create_bagel_ug_model_adapter(model_path: str) -> BAGELUGModelAdapter:
     return BAGELUGModelAdapter(model_path)
 
 
-def _require_keys(payload: dict[str, Any], required: tuple[str, ...], name: str) -> None:
+def _require_keys(
+    payload: dict[str, Any], required: tuple[str, ...], name: str
+) -> None:
     missing = [key for key in required if key not in payload]
     if missing:
         raise BAGELDenoiseStepError(f"{name} is missing required keys: {missing}")
+
+
+def _clone_context(context: dict[str, Any]) -> dict[str, Any]:
+    return deepcopy(context)
 
 
 def _find_spec(module_name: str):
