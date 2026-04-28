@@ -31,10 +31,181 @@ _BAGEL_REQUIRED_MODULES = (
     "modeling.bagel",
     "data.transforms",
 )
+_BAGEL_GENERATION_INPUT_KEYS = (
+    "packed_text_ids",
+    "packed_text_indexes",
+    "packed_vae_token_indexes",
+    "packed_vae_position_ids",
+    "packed_seqlens",
+    "packed_position_ids",
+    "packed_indexes",
+    "key_values_lens",
+    "packed_key_value_indexes",
+)
+_BAGEL_CFG_TEXT_INPUT_KEYS = (
+    "cfg_packed_position_ids",
+    "cfg_packed_query_indexes",
+    "cfg_key_values_lens",
+    "cfg_packed_key_value_indexes",
+)
+_BAGEL_CFG_IMG_INPUT_KEYS = _BAGEL_CFG_TEXT_INPUT_KEYS
 
 
 class BAGELAdapterError(RuntimeError):
     """Raised when the BAGEL adapter cannot be constructed safely."""
+
+
+class BAGELDenoiseStepError(RuntimeError):
+    """Raised when a BAGEL single-step denoise call is malformed."""
+
+
+class BAGELPreparedDenoise:
+    """Official BAGEL denoise inputs prepared from a SRT-owned UG session."""
+
+    def __init__(
+        self,
+        *,
+        generation_input: dict[str, Any],
+        cfg_text_generation_input: dict[str, Any],
+        cfg_img_generation_input: dict[str, Any],
+        past_key_values: Any,
+        cfg_text_past_key_values: Any | None = None,
+        cfg_img_past_key_values: Any | None = None,
+        cfg_text_scale: float = 4.0,
+        cfg_img_scale: float = 1.5,
+        cfg_interval: tuple[float, float] = (0.4, 1.0),
+        cfg_renorm_min: float = 0.0,
+        cfg_renorm_type: str = "global",
+        cfg_type: str = "parallel",
+    ) -> None:
+        self.generation_input = generation_input
+        self.cfg_text_generation_input = cfg_text_generation_input
+        self.cfg_img_generation_input = cfg_img_generation_input
+        self.past_key_values = past_key_values
+        self.cfg_text_past_key_values = cfg_text_past_key_values
+        self.cfg_img_past_key_values = cfg_img_past_key_values
+        self.cfg_text_scale = cfg_text_scale
+        self.cfg_img_scale = cfg_img_scale
+        self.cfg_interval = cfg_interval
+        self.cfg_renorm_min = cfg_renorm_min
+        self.cfg_renorm_type = cfg_renorm_type
+        self.cfg_type = cfg_type
+
+
+class BAGELDenoiseStepRunner:
+    """Runs the single `_forward_flow` step extracted from BAGEL.generate_image."""
+
+    def predict_velocity(
+        self,
+        *,
+        model: Any,
+        prepared: BAGELPreparedDenoise,
+        latent_tokens: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        self._validate_prepared(prepared)
+        timestep = self._expand_timestep(timestep, latent_tokens)
+        cfg_text_scale, cfg_img_scale = self._effective_cfg_scales(prepared, timestep)
+        generation_input = prepared.generation_input
+        cfg_text_input = prepared.cfg_text_generation_input
+        cfg_img_input = prepared.cfg_img_generation_input
+
+        return model._forward_flow(
+            x_t=latent_tokens,
+            timestep=timestep,
+            packed_vae_token_indexes=generation_input["packed_vae_token_indexes"],
+            packed_vae_position_ids=generation_input["packed_vae_position_ids"],
+            packed_text_ids=generation_input["packed_text_ids"],
+            packed_text_indexes=generation_input["packed_text_indexes"],
+            packed_position_ids=generation_input["packed_position_ids"],
+            packed_indexes=generation_input["packed_indexes"],
+            packed_seqlens=generation_input["packed_seqlens"],
+            key_values_lens=generation_input["key_values_lens"],
+            past_key_values=prepared.past_key_values,
+            packed_key_value_indexes=generation_input["packed_key_value_indexes"],
+            cfg_renorm_min=prepared.cfg_renorm_min,
+            cfg_renorm_type=prepared.cfg_renorm_type,
+            cfg_text_scale=cfg_text_scale,
+            cfg_text_packed_position_ids=cfg_text_input["cfg_packed_position_ids"],
+            cfg_text_packed_query_indexes=cfg_text_input["cfg_packed_query_indexes"],
+            cfg_text_key_values_lens=cfg_text_input["cfg_key_values_lens"],
+            cfg_text_past_key_values=prepared.cfg_text_past_key_values,
+            cfg_text_packed_key_value_indexes=cfg_text_input[
+                "cfg_packed_key_value_indexes"
+            ],
+            cfg_img_scale=cfg_img_scale,
+            cfg_img_packed_position_ids=cfg_img_input["cfg_packed_position_ids"],
+            cfg_img_packed_query_indexes=cfg_img_input["cfg_packed_query_indexes"],
+            cfg_img_key_values_lens=cfg_img_input["cfg_key_values_lens"],
+            cfg_img_past_key_values=prepared.cfg_img_past_key_values,
+            cfg_img_packed_key_value_indexes=cfg_img_input[
+                "cfg_packed_key_value_indexes"
+            ],
+            cfg_type=prepared.cfg_type,
+        )
+
+    @staticmethod
+    def build_timesteps(
+        *,
+        num_timesteps: int,
+        timestep_shift: float,
+        device: torch.device | str,
+        dtype: torch.dtype = torch.float32,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if num_timesteps <= 1:
+            raise BAGELDenoiseStepError(
+                f"num_timesteps must be > 1, got {num_timesteps}"
+            )
+        timesteps = torch.linspace(1, 0, num_timesteps, device=device, dtype=dtype)
+        timesteps = timestep_shift * timesteps / (
+            1 + (timestep_shift - 1) * timesteps
+        )
+        dts = timesteps[:-1] - timesteps[1:]
+        return timesteps[:-1], dts
+
+    @staticmethod
+    def _effective_cfg_scales(
+        prepared: BAGELPreparedDenoise,
+        timestep: torch.Tensor,
+    ) -> tuple[float, float]:
+        t = float(timestep.flatten()[0].detach().cpu())
+        start, end = prepared.cfg_interval
+        if t > start and t <= end:
+            return prepared.cfg_text_scale, prepared.cfg_img_scale
+        return 1.0, 1.0
+
+    @staticmethod
+    def _expand_timestep(
+        timestep: torch.Tensor,
+        latent_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        timestep = timestep.to(device=latent_tokens.device)
+        if timestep.numel() == 1:
+            return timestep.reshape(1).expand(latent_tokens.shape[0])
+        if timestep.shape[0] != latent_tokens.shape[0]:
+            raise BAGELDenoiseStepError(
+                "BAGEL timestep must be scalar or match latent token batch size: "
+                f"{tuple(timestep.shape)} vs {tuple(latent_tokens.shape)}"
+            )
+        return timestep
+
+    @staticmethod
+    def _validate_prepared(prepared: BAGELPreparedDenoise) -> None:
+        _require_keys(
+            prepared.generation_input,
+            _BAGEL_GENERATION_INPUT_KEYS,
+            "generation_input",
+        )
+        _require_keys(
+            prepared.cfg_text_generation_input,
+            _BAGEL_CFG_TEXT_INPUT_KEYS,
+            "cfg_text_generation_input",
+        )
+        _require_keys(
+            prepared.cfg_img_generation_input,
+            _BAGEL_CFG_IMG_INPUT_KEYS,
+            "cfg_img_generation_input",
+        )
 
 
 class BAGELBackendProtocol(Protocol):
@@ -203,6 +374,12 @@ def create_bagel_ug_model_adapter(model_path: str) -> BAGELUGModelAdapter:
     if "mock-bagel" in model_path.lower():
         return BAGELUGModelAdapter(model_path, backend=MockBAGELBackend())
     return BAGELUGModelAdapter(model_path)
+
+
+def _require_keys(payload: dict[str, Any], required: tuple[str, ...], name: str) -> None:
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise BAGELDenoiseStepError(f"{name} is missing required keys: {missing}")
 
 
 def _find_spec(module_name: str):

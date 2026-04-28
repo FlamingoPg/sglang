@@ -9,6 +9,9 @@ from sglang.srt.ug.adapter import (
 )
 from sglang.srt.ug.bagel import (
     BAGELAdapterError,
+    BAGELDenoiseStepError,
+    BAGELDenoiseStepRunner,
+    BAGELPreparedDenoise,
     BAGELUGModelAdapter,
     MockBAGELBackend,
     create_bagel_ug_model_adapter,
@@ -33,6 +36,9 @@ __all__ = [
     "FakeUGDenoiserBridge",
     "FakeUGModelRunner",
     "BAGELAdapterError",
+    "BAGELDenoiseStepError",
+    "BAGELDenoiseStepRunner",
+    "BAGELPreparedDenoise",
     "BAGELUGModelAdapter",
     "MockBAGELBackend",
     "SRTBackedUGDenoiserBridge",
