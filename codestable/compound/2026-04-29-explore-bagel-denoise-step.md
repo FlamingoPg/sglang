@@ -40,11 +40,12 @@ flowchart LR
 - `python/sglang/srt/ug/bagel.py` 新增 `BAGELDenoiseStepRunner.predict_velocity(...)`，按官方 `generate_image` 的单步参数映射调用 `_forward_flow`。
 - `python/sglang/srt/ug/bagel.py` 新增 `BAGELInterleaveContextBackend`，可包住一个已经加载好的官方 `InterleaveInferencer`，把 `init/update_context_* -> prepare_vae_latent* -> _forward_flow -> append image -> gen_text` 接到 UG adapter 边界。
 - `python/sglang/srt/ug/bagel.py` 的真 BAGEL loader 已开始按官方 `app.py` 的结构构造 `InterleaveInferencer`：加载 config/AE/tokenizer，`init_empty_weights` 下建 Bagel，再用 `load_checkpoint_and_dispatch` 加载 `ema.safetensors`，最后交给 `BAGELInterleaveContextBackend`。
+- 真权重 smoke 已在 `sgl_flamingo` 容器里用 `/data/models/BAGEL-7B-MoT` 和 `CUDA_VISIBLE_DEVICES=0` 跑通：`U prefill -> image marker -> predict_velocity_from_session` 返回 `velocity_shape=(4, 64)`、`velocity_dtype=torch.bfloat16`、`velocity_device=cuda:0`。
 - `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake official model 验证 `_forward_flow` 只调用一次、CFG interval 规则一致、timestep 会扩展到 latent batch。
 - `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake official inferencer 验证 U-G-U 闭环：同一 session prefill 一次、denoise 多步复用 prepared context、append image 后继续 U decode，并且追加新 U 输入后能进入下一轮 G marker。
 - `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake loader symbols 验证真 loader 的官方构造形状和单卡 device-map pinning，不需要真实 7B 权重。
 
 ## 仍未解决
 
-- 真权重验证还没跑；当前已能在代码层构造官方 `InterleaveInferencer`，但还没有用 `ByteDance-Seed/BAGEL-7B-MoT` 权重做单卡 velocity smoke。
-- `predict_velocity_from_session` 的真实权重数值正确性仍待下一步用空卡验证。
+- 真实权重只验证到单步 velocity，还没把 velocity 接回 SGLD 的完整多步 denoise loop。
+- append generated image 后继续真实 BAGEL U decode 还没跑；当前真实 smoke 只证明 `U prefill -> G velocity` 的 shared-context 路径。

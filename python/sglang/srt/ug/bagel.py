@@ -125,6 +125,7 @@ class BAGELDenoiseStepRunner:
         generation_input = prepared.generation_input
         cfg_text_input = prepared.cfg_text_generation_input
         cfg_img_input = prepared.cfg_img_generation_input
+        self._ensure_flow_runtime_flags(model)
 
         return model._forward_flow(
             x_t=latent_tokens,
@@ -220,6 +221,13 @@ class BAGELDenoiseStepRunner:
             _BAGEL_CFG_IMG_INPUT_KEYS,
             "cfg_img_generation_input",
         )
+
+    @staticmethod
+    def _ensure_flow_runtime_flags(model: Any) -> None:
+        language_model = getattr(model, "language_model", None)
+        inner_model = getattr(language_model, "model", None)
+        if inner_model is not None and not hasattr(inner_model, "enable_taylorseer"):
+            inner_model.enable_taylorseer = False
 
 
 @dataclass
@@ -599,6 +607,7 @@ def _build_official_bagel_inferencer(
             "Use sglang-internal/mock-bagel for CPU-only adapter tests."
         )
 
+    _ensure_bagel_transformers_compat()
     symbols = loader_symbols or _import_bagel_loader_symbols()
 
     llm_config = symbols["Qwen2Config"].from_json_file(
@@ -607,6 +616,8 @@ def _build_official_bagel_inferencer(
     llm_config.qk_norm = True
     llm_config.tie_word_embeddings = False
     llm_config.layer_module = "Qwen2MoTDecoderLayer"
+    if getattr(llm_config, "pad_token_id", None) is None:
+        llm_config.pad_token_id = getattr(llm_config, "eos_token_id", None)
 
     vit_config = symbols["SiglipVisionConfig"].from_json_file(
         str(checkpoint_dir / "vit_config.json")
@@ -721,6 +732,35 @@ def _import_bagel_loader_symbols() -> dict[str, Any]:
         "SiglipVisionModel": _module_attr(bagel, "SiglipVisionModel"),
         "Qwen2Tokenizer": _module_attr(qwen2, "Qwen2Tokenizer"),
     }
+
+
+def _ensure_bagel_transformers_compat() -> None:
+    try:
+        rope_utils = importlib.import_module("transformers.modeling_rope_utils")
+    except ImportError:
+        return
+
+    rope_init_functions = getattr(rope_utils, "ROPE_INIT_FUNCTIONS", None)
+    if not isinstance(rope_init_functions, dict) or "default" in rope_init_functions:
+        return
+
+    def _compute_default_rope_parameters(config, device=None, seq_len=None, **kwargs):
+        del seq_len, kwargs
+        base = getattr(config, "rope_theta", 10000.0)
+        head_dim = getattr(
+            config,
+            "head_dim",
+            getattr(config, "hidden_size") // getattr(config, "num_attention_heads"),
+        )
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        dim = int(head_dim * partial_rotary_factor)
+        inv_freq = 1.0 / (
+            base
+            ** (torch.arange(0, dim, 2, dtype=torch.int64, device=device).float() / dim)
+        )
+        return inv_freq, 1.0
+
+    rope_init_functions["default"] = _compute_default_rope_parameters
 
 
 def _import_module(module_name: str):

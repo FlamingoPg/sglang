@@ -19,6 +19,7 @@ from sglang.srt.ug.bagel import (
     BAGELUGModelAdapter,
     MockBAGELBackend,
     _build_official_bagel_inferencer,
+    _ensure_bagel_transformers_compat,
     create_bagel_ug_model_adapter,
 )
 from sglang.srt.ug.context import UGSessionHandle
@@ -137,6 +138,7 @@ class TestBAGELUGModelAdapter(unittest.TestCase):
 class FakeOfficialBAGELModel:
     def __init__(self):
         self.forward_flow_calls = []
+        self.language_model = SimpleNamespace(model=SimpleNamespace())
 
     def _forward_flow(self, **kwargs):
         self.forward_flow_calls.append(kwargs)
@@ -304,6 +306,7 @@ class TestBAGELDenoiseStepRunner(unittest.TestCase):
         )
         self.assertEqual(call["cfg_text_scale"], 4.0)
         self.assertEqual(call["cfg_img_scale"], 1.5)
+        self.assertFalse(model.language_model.model.enable_taylorseer)
         self.assertEqual(tuple(call["timestep"].shape), (2,))
         self.assertTrue(torch.equal(call["packed_text_ids"], torch.tensor([1, 2])))
         self.assertTrue(torch.allclose(velocity, torch.full_like(latents, 5.5)))
@@ -353,6 +356,7 @@ class TestBAGELDenoiseStepRunner(unittest.TestCase):
 class FakeOfficialConfig:
     def __init__(self):
         self.num_hidden_layers = 4
+        self.eos_token_id = 42
 
     @classmethod
     def from_json_file(cls, path):
@@ -455,6 +459,30 @@ def _fake_bagel_loader_symbols(records):
 
 
 class TestBAGELRealLoader(unittest.TestCase):
+    def test_transformers_rope_default_compat(self):
+        import transformers.modeling_rope_utils as rope_utils
+
+        original = dict(rope_utils.ROPE_INIT_FUNCTIONS)
+        try:
+            rope_utils.ROPE_INIT_FUNCTIONS.pop("default", None)
+            _ensure_bagel_transformers_compat()
+            self.assertIn("default", rope_utils.ROPE_INIT_FUNCTIONS)
+
+            inv_freq, attention_scaling = rope_utils.ROPE_INIT_FUNCTIONS["default"](
+                SimpleNamespace(
+                    rope_theta=10000.0,
+                    hidden_size=8,
+                    num_attention_heads=2,
+                ),
+                device=torch.device("cpu"),
+            )
+
+            self.assertEqual(tuple(inv_freq.shape), (2,))
+            self.assertEqual(attention_scaling, 1.0)
+        finally:
+            rope_utils.ROPE_INIT_FUNCTIONS.clear()
+            rope_utils.ROPE_INIT_FUNCTIONS.update(original)
+
     def test_build_official_inferencer_follows_bagel_app_loader_shape(self):
         records = {}
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -475,6 +503,9 @@ class TestBAGELRealLoader(unittest.TestCase):
             records["load_ae_path"], str(checkpoint_dir / "ae.safetensors")
         )
         self.assertEqual(records["max_memory"], {0: "80GiB"})
+        self.assertEqual(
+            records["dispatch_model"].language_model.config.pad_token_id, 42
+        )
         self.assertEqual(
             records["no_split_module_classes"],
             ["Bagel", "Qwen2MoTDecoderLayer"],
