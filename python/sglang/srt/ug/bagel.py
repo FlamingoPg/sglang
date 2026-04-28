@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 from collections import defaultdict
 from copy import deepcopy
@@ -29,9 +30,22 @@ _BAGEL_REQUIRED_CHECKPOINT_FILES = (
     "ema.safetensors",
 )
 _BAGEL_REQUIRED_MODULES = (
-    "inferencer",
-    "modeling.bagel",
+    "accelerate",
+    "data.data_utils",
     "data.transforms",
+    "inferencer",
+    "modeling.autoencoder",
+    "modeling.bagel",
+    "modeling.qwen2",
+)
+_BAGEL_SAME_DEVICE_MODULES = (
+    "language_model.model.embed_tokens",
+    "time_embedder",
+    "latent_pos_embed",
+    "vae2llm",
+    "llm2vae",
+    "connector",
+    "vit_pos_embed",
 )
 _BAGEL_GENERATION_INPUT_KEYS = (
     "packed_text_ids",
@@ -495,12 +509,8 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
                 "the real BAGEL backend."
             )
 
-        raise BAGELAdapterError(
-            "Real BAGEL checkpoint construction is not wired yet. "
-            "BAGELInterleaveContextBackend can wrap an already loaded official "
-            "InterleaveInferencer, but the loader still needs to construct that "
-            "inferencer from checkpoint files inside SRT."
-        )
+        inferencer = _build_official_bagel_inferencer(checkpoint_dir)
+        return BAGELInterleaveContextBackend(inferencer)
 
 
 class MockBAGELBackend:
@@ -576,6 +586,162 @@ def _require_keys(
 
 def _clone_context(context: dict[str, Any]) -> dict[str, Any]:
     return deepcopy(context)
+
+
+def _build_official_bagel_inferencer(
+    checkpoint_dir: Path,
+    *,
+    loader_symbols: dict[str, Any] | None = None,
+) -> Any:
+    if torch.cuda.device_count() < 1:
+        raise BAGELAdapterError(
+            "Real BAGEL backend requires at least one CUDA device. "
+            "Use sglang-internal/mock-bagel for CPU-only adapter tests."
+        )
+
+    symbols = loader_symbols or _import_bagel_loader_symbols()
+
+    llm_config = symbols["Qwen2Config"].from_json_file(
+        str(checkpoint_dir / "llm_config.json")
+    )
+    llm_config.qk_norm = True
+    llm_config.tie_word_embeddings = False
+    llm_config.layer_module = "Qwen2MoTDecoderLayer"
+
+    vit_config = symbols["SiglipVisionConfig"].from_json_file(
+        str(checkpoint_dir / "vit_config.json")
+    )
+    vit_config.rope = False
+    vit_config.num_hidden_layers -= 1
+
+    vae_model, vae_config = symbols["load_ae"](
+        local_path=str(checkpoint_dir / "ae.safetensors")
+    )
+    config = symbols["BagelConfig"](
+        visual_gen=True,
+        visual_und=True,
+        llm_config=llm_config,
+        vit_config=vit_config,
+        vae_config=vae_config,
+        vit_max_num_patch_per_side=70,
+        connector_act="gelu_pytorch_tanh",
+        latent_patch_size=2,
+        max_latent_size=64,
+    )
+
+    with symbols["init_empty_weights"]():
+        language_model = symbols["Qwen2ForCausalLM"](llm_config)
+        vit_model = symbols["SiglipVisionModel"](vit_config)
+        model = symbols["Bagel"](language_model, vit_model, config)
+        model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(
+            vit_config,
+            meta=True,
+        )
+
+    tokenizer = symbols["Qwen2Tokenizer"].from_pretrained(str(checkpoint_dir))
+    tokenizer, new_token_ids, _ = symbols["add_special_tokens"](tokenizer)
+
+    vae_transform = symbols["ImageTransform"](1024, 512, 16)
+    vit_transform = symbols["ImageTransform"](980, 224, 14)
+
+    device_map = symbols["infer_auto_device_map"](
+        model,
+        max_memory={
+            device_id: "80GiB" for device_id in range(torch.cuda.device_count())
+        },
+        no_split_module_classes=["Bagel", "Qwen2MoTDecoderLayer"],
+    )
+    device_map = _pin_bagel_shared_modules(device_map)
+
+    model = symbols["load_checkpoint_and_dispatch"](
+        model,
+        checkpoint=str(checkpoint_dir / "ema.safetensors"),
+        device_map=device_map,
+        offload_buffers=True,
+        offload_folder=str(checkpoint_dir / "offload"),
+        dtype=torch.bfloat16,
+        force_hooks=True,
+    ).eval()
+
+    return symbols["InterleaveInferencer"](
+        model=model,
+        vae_model=vae_model,
+        tokenizer=tokenizer,
+        vae_transform=vae_transform,
+        vit_transform=vit_transform,
+        new_token_ids=new_token_ids,
+    )
+
+
+def _pin_bagel_shared_modules(device_map: dict[str, Any]) -> dict[str, Any]:
+    device_map = dict(device_map)
+    if torch.cuda.device_count() == 1:
+        first_device = device_map.get(_BAGEL_SAME_DEVICE_MODULES[0], "cuda:0")
+        for module_name in _BAGEL_SAME_DEVICE_MODULES:
+            device_map[module_name] = first_device
+        return device_map
+
+    first_device = device_map.get(_BAGEL_SAME_DEVICE_MODULES[0])
+    if first_device is None:
+        return device_map
+    for module_name in _BAGEL_SAME_DEVICE_MODULES:
+        if module_name in device_map:
+            device_map[module_name] = first_device
+    return device_map
+
+
+def _import_bagel_loader_symbols() -> dict[str, Any]:
+    accelerate = _import_module("accelerate")
+    data_utils = _import_module("data.data_utils")
+    transforms = _import_module("data.transforms")
+    inferencer_module = _import_module("inferencer")
+    autoencoder = _import_module("modeling.autoencoder")
+    bagel = _import_module("modeling.bagel")
+    qwen2 = _import_module("modeling.qwen2")
+
+    return {
+        "infer_auto_device_map": _module_attr(accelerate, "infer_auto_device_map"),
+        "load_checkpoint_and_dispatch": _module_attr(
+            accelerate,
+            "load_checkpoint_and_dispatch",
+        ),
+        "init_empty_weights": _module_attr(accelerate, "init_empty_weights"),
+        "add_special_tokens": _module_attr(data_utils, "add_special_tokens"),
+        "ImageTransform": _module_attr(transforms, "ImageTransform"),
+        "InterleaveInferencer": _module_attr(
+            inferencer_module,
+            "InterleaveInferencer",
+        ),
+        "load_ae": _module_attr(autoencoder, "load_ae"),
+        "BagelConfig": _module_attr(bagel, "BagelConfig"),
+        "Bagel": _module_attr(bagel, "Bagel"),
+        "Qwen2Config": _module_attr(bagel, "Qwen2Config"),
+        "Qwen2ForCausalLM": _module_attr(bagel, "Qwen2ForCausalLM"),
+        "SiglipVisionConfig": _module_attr(bagel, "SiglipVisionConfig"),
+        "SiglipVisionModel": _module_attr(bagel, "SiglipVisionModel"),
+        "Qwen2Tokenizer": _module_attr(qwen2, "Qwen2Tokenizer"),
+    }
+
+
+def _import_module(module_name: str):
+    try:
+        return importlib.import_module(module_name)
+    except ImportError as exc:
+        raise BAGELAdapterError(
+            f"BAGEL Python module is not importable: {module_name}. "
+            "Add the official ByteDance-Seed/BAGEL repo to PYTHONPATH before "
+            "enabling the real BAGEL backend."
+        ) from exc
+
+
+def _module_attr(module: Any, attr_name: str) -> Any:
+    try:
+        return getattr(module, attr_name)
+    except AttributeError as exc:
+        raise BAGELAdapterError(
+            f"BAGEL Python module {module.__name__} is missing required symbol "
+            f"{attr_name}."
+        ) from exc
 
 
 def _find_spec(module_name: str):

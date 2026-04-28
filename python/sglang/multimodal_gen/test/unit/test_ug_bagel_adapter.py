@@ -2,7 +2,9 @@
 
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -16,6 +18,7 @@ from sglang.srt.ug.bagel import (
     BAGELPreparedDenoise,
     BAGELUGModelAdapter,
     MockBAGELBackend,
+    _build_official_bagel_inferencer,
     create_bagel_ug_model_adapter,
 )
 from sglang.srt.ug.context import UGSessionHandle
@@ -42,6 +45,32 @@ class TestBAGELUGModelAdapter(unittest.TestCase):
                 "missing required files",
             ):
                 BAGELUGModelAdapter(tmpdir)
+
+    def test_missing_official_modules_reports_actionable_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _write_required_checkpoint_files(Path(tmpdir))
+            with patch("sglang.srt.ug.bagel._find_spec", return_value=None):
+                with self.assertRaisesRegex(
+                    BAGELAdapterError,
+                    "Python modules are not importable",
+                ):
+                    BAGELUGModelAdapter(tmpdir)
+
+    def test_real_loader_wraps_official_inferencer_in_context_backend(self):
+        inferencer = FakeBAGELInferencer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_dir = Path(tmpdir)
+            _write_required_checkpoint_files(checkpoint_dir)
+            with patch("sglang.srt.ug.bagel._find_spec", return_value=object()):
+                with patch(
+                    "sglang.srt.ug.bagel._build_official_bagel_inferencer",
+                    return_value=inferencer,
+                ) as build:
+                    adapter = BAGELUGModelAdapter(tmpdir)
+
+        self.assertIsInstance(adapter.backend, BAGELInterleaveContextBackend)
+        self.assertIs(adapter.backend.inferencer, inferencer)
+        build.assert_called_once_with(checkpoint_dir)
 
     def test_mock_bagel_adapter_factory_runs_u_g_u_loop(self):
         adapter = create_bagel_ug_model_adapter("sglang-internal/mock-bagel")
@@ -210,6 +239,13 @@ class FakeBAGELInferencer:
         return "context_backend_text_after_image"
 
 
+def _write_required_checkpoint_files(checkpoint_dir: Path) -> None:
+    for name in ("llm_config.json", "vit_config.json"):
+        (checkpoint_dir / name).write_text("{}", encoding="utf-8")
+    for name in ("ae.safetensors", "ema.safetensors"):
+        (checkpoint_dir / name).write_bytes(b"fake")
+
+
 def _fake_bagel_prepared() -> BAGELPreparedDenoise:
     generation_input = {
         "packed_text_ids": torch.tensor([1, 2]),
@@ -312,6 +348,165 @@ class TestBAGELDenoiseStepRunner(unittest.TestCase):
                 latent_tokens=torch.zeros(1, 3),
                 timestep=torch.tensor([0.5]),
             )
+
+
+class FakeOfficialConfig:
+    def __init__(self):
+        self.num_hidden_layers = 4
+
+    @classmethod
+    def from_json_file(cls, path):
+        config = cls()
+        config.loaded_from = path
+        return config
+
+
+class FakeOfficialEmbeddings:
+    def __init__(self):
+        self.convert_calls = []
+
+    def convert_conv2d_to_linear(self, config, *, meta):
+        self.convert_calls.append((config, meta))
+
+
+class FakeOfficialVisionModel:
+    def __init__(self, config):
+        self.config = config
+        self.vision_model = SimpleNamespace(embeddings=FakeOfficialEmbeddings())
+
+
+class FakeOfficialBagel:
+    def __init__(self, language_model, vit_model, config):
+        self.language_model = language_model
+        self.vit_model = vit_model
+        self.config = config
+        self.eval_called = False
+
+    def eval(self):
+        self.eval_called = True
+        return self
+
+
+class FakeOfficialTokenizer:
+    @classmethod
+    def from_pretrained(cls, path):
+        tokenizer = cls()
+        tokenizer.loaded_from = path
+        return tokenizer
+
+
+class FakeOfficialImageTransform:
+    def __init__(self, *args):
+        self.args = args
+
+
+class FakeOfficialInterleaveInferencer:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class FakeInitEmptyWeights:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+
+def _fake_bagel_loader_symbols(records):
+    def load_ae(*, local_path):
+        records["load_ae_path"] = local_path
+        return "vae_model", "vae_config"
+
+    def infer_auto_device_map(model, *, max_memory, no_split_module_classes):
+        records["device_map_model"] = model
+        records["max_memory"] = max_memory
+        records["no_split_module_classes"] = no_split_module_classes
+        return {
+            "language_model.model.embed_tokens": "cuda:0",
+            "llm2vae": "cuda:1",
+        }
+
+    def load_checkpoint_and_dispatch(model, **kwargs):
+        records["dispatch_model"] = model
+        records["dispatch_kwargs"] = kwargs
+        return model
+
+    def add_special_tokens(tokenizer):
+        records["tokenizer"] = tokenizer
+        return tokenizer, {"eos_token_id": 42}, None
+
+    return {
+        "Qwen2Config": FakeOfficialConfig,
+        "SiglipVisionConfig": FakeOfficialConfig,
+        "load_ae": load_ae,
+        "BagelConfig": lambda **kwargs: SimpleNamespace(**kwargs),
+        "init_empty_weights": FakeInitEmptyWeights,
+        "Qwen2ForCausalLM": lambda config: SimpleNamespace(config=config),
+        "SiglipVisionModel": FakeOfficialVisionModel,
+        "Bagel": FakeOfficialBagel,
+        "Qwen2Tokenizer": FakeOfficialTokenizer,
+        "add_special_tokens": add_special_tokens,
+        "ImageTransform": FakeOfficialImageTransform,
+        "infer_auto_device_map": infer_auto_device_map,
+        "load_checkpoint_and_dispatch": load_checkpoint_and_dispatch,
+        "InterleaveInferencer": FakeOfficialInterleaveInferencer,
+    }
+
+
+class TestBAGELRealLoader(unittest.TestCase):
+    def test_build_official_inferencer_follows_bagel_app_loader_shape(self):
+        records = {}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_dir = Path(tmpdir)
+            _write_required_checkpoint_files(checkpoint_dir)
+            with patch(
+                "sglang.srt.ug.bagel.torch.cuda.device_count",
+                return_value=1,
+            ):
+                inferencer = _build_official_bagel_inferencer(
+                    checkpoint_dir,
+                    loader_symbols=_fake_bagel_loader_symbols(records),
+                )
+
+        self.assertIsInstance(inferencer, FakeOfficialInterleaveInferencer)
+        self.assertTrue(records["dispatch_model"].eval_called)
+        self.assertEqual(
+            records["load_ae_path"], str(checkpoint_dir / "ae.safetensors")
+        )
+        self.assertEqual(records["max_memory"], {0: "80GiB"})
+        self.assertEqual(
+            records["no_split_module_classes"],
+            ["Bagel", "Qwen2MoTDecoderLayer"],
+        )
+        dispatch_kwargs = records["dispatch_kwargs"]
+        self.assertEqual(
+            dispatch_kwargs["checkpoint"],
+            str(checkpoint_dir / "ema.safetensors"),
+        )
+        self.assertEqual(dispatch_kwargs["dtype"], torch.bfloat16)
+        self.assertTrue(dispatch_kwargs["force_hooks"])
+        self.assertEqual(dispatch_kwargs["device_map"]["llm2vae"], "cuda:0")
+        self.assertEqual(
+            dispatch_kwargs["device_map"]["vit_pos_embed"],
+            "cuda:0",
+        )
+        self.assertEqual(
+            inferencer.kwargs["new_token_ids"],
+            {"eos_token_id": 42},
+        )
+        self.assertEqual(inferencer.kwargs["vae_transform"].args, (1024, 512, 16))
+        self.assertEqual(inferencer.kwargs["vit_transform"].args, (980, 224, 14))
+
+    def test_build_official_inferencer_requires_cuda(self):
+        with patch("sglang.srt.ug.bagel.torch.cuda.device_count", return_value=0):
+            with self.assertRaisesRegex(
+                BAGELAdapterError, "requires at least one CUDA"
+            ):
+                _build_official_bagel_inferencer(
+                    Path("/tmp/fake-bagel"),
+                    loader_symbols=_fake_bagel_loader_symbols({}),
+                )
 
 
 class TestBAGELInterleaveContextBackend(unittest.TestCase):
