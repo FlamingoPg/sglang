@@ -1,0 +1,156 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+from PIL import Image
+
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.models.vision_utils import load_image
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.srt.ug.denoiser import UGDenoiserBridge
+
+
+class UGContextStage(PipelineStage):
+    def __init__(self, bridge: UGDenoiserBridge) -> None:
+        super().__init__()
+        self.bridge = bridge
+
+    @property
+    def role_affinity(self):
+        return RoleType.ENCODER
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        pipeline_config = server_args.pipeline_config
+        unsupported = pipeline_config.validate_runtime(
+            num_gpus=server_args.num_gpus,
+            enable_cfg_parallel=server_args.enable_cfg_parallel,
+            disagg_mode=server_args.disagg_mode,
+        )
+        if unsupported:
+            raise ValueError(f"Unsupported UGPipeline runtime settings: {unsupported}")
+
+        if batch.height is None:
+            batch.height = pipeline_config.default_height
+        if batch.width is None:
+            batch.width = pipeline_config.default_width
+
+        if batch.condition_image is None and batch.image_path is not None:
+            if isinstance(batch.image_path, list):
+                if len(batch.image_path) != 1:
+                    raise ValueError("UGPipeline MVP supports at most one input image")
+                batch.condition_image = load_image(batch.image_path[0])
+            else:
+                batch.condition_image = load_image(batch.image_path)
+
+        if batch.condition_image is not None and not isinstance(
+            batch.condition_image, Image.Image
+        ):
+            raise TypeError(
+                f"UGPipeline expects a PIL image input, got {type(batch.condition_image)}"
+            )
+
+        batch.extra["ug_contexts"] = self.bridge.build_contexts(
+            prompt=batch.prompt,
+            image=batch.condition_image,
+        )
+        return batch
+
+
+class UGLatentStage(PipelineStage):
+    @property
+    def role_affinity(self):
+        return RoleType.DENOISER
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        cfg = server_args.pipeline_config
+        height = int(batch.height)
+        width = int(batch.width)
+        latent_height = height // cfg.latent_downsample
+        latent_width = width // cfg.latent_downsample
+        if latent_height <= 0 or latent_width <= 0:
+            raise ValueError(
+                f"UG latent shape is empty for height={height}, width={width}, "
+                f"latent_downsample={cfg.latent_downsample}"
+            )
+
+        num_tokens = latent_height * latent_width
+        latent_dim = cfg.latent_channel * cfg.latent_patch_size * cfg.latent_patch_size
+        generator = torch.Generator(device="cpu").manual_seed(int(batch.seed))
+        batch.latents = torch.randn(
+            1,
+            num_tokens,
+            latent_dim,
+            generator=generator,
+            dtype=torch.float32,
+        )
+        batch.extra["ug_latent_position_ids"] = torch.arange(num_tokens)
+        batch.extra["ug_latent_shape"] = (latent_height, latent_width, latent_dim)
+        return batch
+
+
+class UGDenoiseStage(PipelineStage):
+    def __init__(self, bridge: UGDenoiserBridge) -> None:
+        super().__init__()
+        self.bridge = bridge
+
+    @property
+    def role_affinity(self):
+        return RoleType.DENOISER
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = batch.sampling_params
+        x_t = batch.latents
+        if x_t is None:
+            raise ValueError("UGDenoiseStage requires latents from UGLatentStage")
+        num_steps = int(params.num_inference_steps)
+        if num_steps <= 0:
+            raise ValueError(f"num_inference_steps must be positive, got {num_steps}")
+
+        timesteps = torch.linspace(1, 0, num_steps, dtype=x_t.dtype)
+        timesteps = params.timestep_shift * timesteps / (
+            1 + (params.timestep_shift - 1) * timesteps
+        )
+        dts = timesteps[:-1] - timesteps[1:]
+        trajectory_latents = []
+        trajectory_timesteps = []
+
+        for i, timestep in enumerate(timesteps[:-1]):
+            trajectory_latents.append(x_t)
+            trajectory_timesteps.append(timestep)
+            velocity = self.bridge.predict_velocity(
+                contexts=batch.extra["ug_contexts"],
+                latent_tokens=x_t,
+                timestep=timestep.reshape(1),
+                latent_position_ids=batch.extra["ug_latent_position_ids"],
+                sampling_params=params,
+            )
+            x_t = x_t - velocity.to(x_t) * dts[i].to(x_t)
+
+        batch.latents = x_t
+        if batch.return_trajectory_latents:
+            if trajectory_latents:
+                batch.trajectory_latents = torch.stack(trajectory_latents)
+                batch.trajectory_timesteps = torch.stack(trajectory_timesteps)
+            else:
+                batch.trajectory_latents = x_t[:0]
+                batch.trajectory_timesteps = timesteps[:0]
+        return batch
+
+
+class UGDecodeStage(PipelineStage):
+    @property
+    def role_affinity(self):
+        return RoleType.DECODER
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        value = int(batch.latents.mean().abs().item() * 255) % 255
+        batch.output = np.full(
+            (1, int(batch.height), int(batch.width), 3),
+            value,
+            dtype=np.uint8,
+        )
+        return batch

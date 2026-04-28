@@ -35,6 +35,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     HeliosMidConfig,
     HeliosT2VConfig,
     HunyuanConfig,
+    UGPipelineConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -122,6 +123,7 @@ from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
     Turbo_Wan2_2_I2V_A14B_SamplingParam,
@@ -621,6 +623,20 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
+    # UG / BAGEL-style unified generation models
+    register_configs(
+        sampling_param_cls=UGSamplingParams,
+        pipeline_config_cls=UGPipelineConfig,
+        hf_model_paths=[
+            "ByteDance-Seed/BAGEL-7B-MoT",
+            "sglang-internal/fake-ug",
+        ],
+        model_detectors=[
+            lambda hf_id: "bagel" in hf_id.lower(),
+            lambda hf_id: "fake-ug" in hf_id.lower(),
+        ],
+    )
+
     # LTX-2
     register_configs(
         sampling_param_cls=LTX2SamplingParams,

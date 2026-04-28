@@ -33,6 +33,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConf
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ug import UGPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     SelfForcingWanT2V480PConfig,
     WanI2V480PConfig,
@@ -66,4 +67,5 @@ __all__ = [
     "SelfForcingWanT2V480PConfig",
     "ZImagePipelineConfig",
     "LTX2PipelineConfig",
+    "UGPipelineConfig",
 ]
