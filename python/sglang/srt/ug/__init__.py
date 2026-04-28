@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from sglang.srt.ug.adapter import (
+    UGModelAdapterProtocol,
+    UGModelAppendImageResult,
+    UGModelPrefillResult,
+    UGModelRunnerAdapter,
+    UGModelSessionView,
+)
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle, UGSessionHandle
 from sglang.srt.ug.denoiser import (
     FakeUGDenoiserBridge,
@@ -25,6 +32,11 @@ __all__ = [
     "UGDecodeResult",
     "UGDenoiserBridge",
     "UGInterleavedMessage",
+    "UGModelAdapterProtocol",
+    "UGModelAppendImageResult",
+    "UGModelPrefillResult",
+    "UGModelRunnerAdapter",
+    "UGModelSessionView",
     "UGSegmentState",
     "UGSessionHandle",
     "UGSessionRuntime",

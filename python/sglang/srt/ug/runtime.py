@@ -101,7 +101,7 @@ class UGSessionRecord:
 
 class UGModelRunnerProtocol(Protocol):
     def prefill_interleaved(
-        self, *, session_id: str, messages: list[UGInterleavedMessage]
+        self, *, record: UGSessionRecord, messages: list[UGInterleavedMessage]
     ) -> int:
         ...
 
@@ -126,9 +126,9 @@ class FakeUGModelRunner:
     """Deterministic UG model shell used to prove session/KV ownership plumbing."""
 
     def prefill_interleaved(
-        self, *, session_id: str, messages: list[UGInterleavedMessage]
+        self, *, record: UGSessionRecord, messages: list[UGInterleavedMessage]
     ) -> int:
-        del session_id
+        del record
         token_count = 0
         for message in messages:
             if message.type == "text":
@@ -222,20 +222,20 @@ class UGSessionRuntime:
         else:
             record.state = UGSegmentState.U_PREFILL
 
-        added_tokens = self.model_runner.prefill_interleaved(
-            session_id=session_id, messages=messages
-        )
         next_context_version = record.context_version + 1
         next_anchor_request_id = f"{session_id}:u{next_context_version}"
+        record.anchor_request_id = next_anchor_request_id
         self._append_srt_session_request(
             record,
             messages,
             request_id=next_anchor_request_id,
         )
+        added_tokens = self.model_runner.prefill_interleaved(
+            record=record, messages=messages
+        )
         record.context_length += added_tokens
         record.context_version = next_context_version
         record.prefill_count += 1
-        record.anchor_request_id = next_anchor_request_id
         record.state = UGSegmentState.U_DECODE
         return record.handle()
 
@@ -289,20 +289,20 @@ class UGSessionRuntime:
                 f"for UG session {handle.session_id}"
             )
         record.state = UGSegmentState.APPEND_IMAGE
-        added_tokens = self.model_runner.append_generated_image(
-            record=record, image=image
-        )
         next_context_version = record.context_version + 1
         next_anchor_request_id = f"{record.session_id}:u{next_context_version}"
+        record.anchor_request_id = next_anchor_request_id
         self._append_srt_session_request(
             record,
             [UGInterleavedMessage(type="image", content=image)],
             request_id=next_anchor_request_id,
         )
+        added_tokens = self.model_runner.append_generated_image(
+            record=record, image=image
+        )
         record.context_length += added_tokens
         record.context_version = next_context_version
         record.append_image_count += 1
-        record.anchor_request_id = next_anchor_request_id
         record.state = UGSegmentState.U_DECODE
         return record.handle()
 
