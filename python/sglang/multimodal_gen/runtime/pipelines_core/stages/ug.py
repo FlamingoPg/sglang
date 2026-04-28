@@ -142,6 +142,10 @@ class UGDenoiseStage(PipelineStage):
 
 
 class UGDecodeStage(PipelineStage):
+    def __init__(self, bridge: UGDenoiserBridge) -> None:
+        super().__init__()
+        self.bridge = bridge
+
     @property
     def role_affinity(self):
         return RoleType.DECODER
@@ -153,4 +157,10 @@ class UGDecodeStage(PipelineStage):
             value,
             dtype=np.uint8,
         )
+        contexts = batch.extra.get("ug_contexts")
+        if contexts is not None:
+            self.bridge.append_generated_image(contexts=contexts, image=batch.output)
+            batch.extra["ug_post_image_segment"] = self.bridge.decode_next_segment(
+                contexts=contexts
+            )
         return batch

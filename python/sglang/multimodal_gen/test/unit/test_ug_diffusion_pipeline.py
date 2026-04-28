@@ -69,9 +69,24 @@ class TestUGDiffusionPipeline(unittest.TestCase):
 
         self.assertEqual(result.output.shape, (1, 32, 32, 3))
         self.assertEqual(result.latents.shape, (1, 4, 64))
-        self.assertEqual(result.extra["ug_contexts"].full.token_count, 5)
+        self.assertEqual(result.extra["ug_contexts"].full.token_count, 7)
+        self.assertIsNotNone(result.extra["ug_contexts"].full.session)
+        self.assertEqual(result.extra["ug_post_image_segment"].type, "text")
+        self.assertEqual(
+            result.extra["ug_post_image_segment"].text,
+            "generated_text_after_image",
+        )
         self.assertEqual(result.trajectory_latents.shape[0], 3)
         self.assertEqual(result.trajectory_timesteps.shape[0], 3)
+
+        counters = pipeline.get_module("ug_bridge").runtime.get_debug_counters(
+            result.extra["ug_contexts"].full.session
+        )
+        self.assertEqual(counters["prefill_count"], 1)
+        self.assertEqual(counters["velocity_count"], 3)
+        self.assertEqual(counters["append_image_count"], 1)
+        self.assertEqual(counters["decode_count"], 2)
+        self.assertEqual(counters["state"], "u_decode")
 
     def test_runtime_guard_rejects_cfg_parallel(self):
         server_args = _make_server_args()

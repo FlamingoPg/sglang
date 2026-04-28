@@ -12,13 +12,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
     UGLatentStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.srt.ug.denoiser import FakeUGDenoiserBridge, UGDenoiserBridge
+from sglang.srt.ug.denoiser import SRTBackedUGDenoiserBridge, UGDenoiserBridge
 
 
 def _load_ug_bridge(model_path: str) -> UGDenoiserBridge:
     model_path_lower = model_path.lower()
     if "fake-ug" in model_path_lower:
-        return FakeUGDenoiserBridge()
+        return SRTBackedUGDenoiserBridge()
     if "bagel" in model_path_lower:
         raise NotImplementedError(
             "BAGEL UG bridge is not wired yet. Use sglang-internal/fake-ug "
@@ -45,7 +45,7 @@ class UGPipeline(ComposedPipelineBase):
         self.add_stage(UGContextStage(bridge))
         self.add_stage(UGLatentStage())
         self.add_stage(UGDenoiseStage(bridge))
-        self.add_stage(UGDecodeStage())
+        self.add_stage(UGDecodeStage(bridge))
 
 
 EntryClass = UGPipeline
