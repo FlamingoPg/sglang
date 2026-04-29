@@ -163,6 +163,9 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     Req,
     ScheduleBatch,
+    get_ug_batch_compat_key,
+    get_ug_batch_compat_key_for_reqs,
+    is_ug_batch_compatible,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -2648,13 +2651,16 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            chunked_req = self.chunked_req
+            chunked_req.init_next_round_input()
+            self.chunked_req = adder.add_chunked_req(chunked_req)
             self._chunked_req_scheduled_last_iter = (
                 self.chunked_req in adder.can_run_list
             )
+            prefill_batch_compat_key = get_ug_batch_compat_key(chunked_req)
         else:
             self._chunked_req_scheduled_last_iter = False
+            prefill_batch_compat_key = None
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
@@ -2667,6 +2673,10 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            req_batch_compat_key = get_ug_batch_compat_key(req)
+            if not is_ug_batch_compatible(req, prefill_batch_compat_key):
+                continue
+
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -2702,6 +2712,9 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+            if added:
+                prefill_batch_compat_key = req_batch_compat_key
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -2719,7 +2732,6 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if (
                     not added
                     and req.mamba_pool_idx is not None
@@ -2801,6 +2813,8 @@ class Scheduler(
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            and get_ug_batch_compat_key_for_reqs(new_batch.reqs)
+            == get_ug_batch_compat_key_for_reqs(self.running_batch.reqs)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
