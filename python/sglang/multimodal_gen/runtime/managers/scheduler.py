@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
     ShutdownReq,
+    UGInterleavedGenerateReq,
     UnmergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
@@ -128,6 +129,8 @@ class Scheduler(SchedulerDisaggMixin):
             MergeLoraWeightsReq: self._handle_merge_lora,
             UnmergeLoraWeightsReq: self._handle_unmerge_lora,
             Req: self._handle_generation,
+            UGInterleavedGenerateReq: self._handle_ug_interleaved,
+            list: self._handle_list_request,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
             GetDisaggStatsReq: self._handle_get_disagg_stats,
@@ -245,6 +248,8 @@ class Scheduler(SchedulerDisaggMixin):
 
     def _dispatch_single_request(self, req_or_group: Any) -> OutputBatch:
         if isinstance(req_or_group, list):
+            if all(isinstance(req, UGInterleavedGenerateReq) for req in req_or_group):
+                return self._handle_ug_interleaved(req_or_group, return_list=True)
             if not all(isinstance(req, Req) for req in req_or_group):
                 return OutputBatch(
                     error=f"Unknown request group type: {type(req_or_group)}"
@@ -597,6 +602,36 @@ class Scheduler(SchedulerDisaggMixin):
         error_msg: str,
     ) -> List[OutputBatch]:
         return [OutputBatch(error=error_msg) for _ in reqs]
+
+    def _handle_ug_interleaved(
+        self,
+        reqs: list[UGInterleavedGenerateReq] | list[list[UGInterleavedGenerateReq]],
+        *,
+        return_list: bool = False,
+    ) -> OutputBatch:
+        if len(reqs) == 1 and isinstance(reqs[0], list):
+            reqs = reqs[0]
+        if not reqs:
+            return OutputBatch(error="UG interleaved request list is empty")
+        output_batch = self.worker.execute_ug_interleaved(reqs)
+        if (
+            return_list
+            and output_batch.error is None
+            and not isinstance(output_batch.output, list)
+        ):
+            output_batch.output = [output_batch.output]
+        return output_batch
+
+    def _handle_list_request(self, reqs: list[Any]) -> OutputBatch:
+        if len(reqs) == 1 and isinstance(reqs[0], list):
+            inner_reqs = reqs[0]
+        else:
+            inner_reqs = reqs
+        if inner_reqs and all(
+            isinstance(req, UGInterleavedGenerateReq) for req in inner_reqs
+        ):
+            return self._handle_ug_interleaved(inner_reqs, return_list=True)
+        return self._handle_generation(reqs)
 
     def return_result(
         self,
@@ -1001,6 +1036,8 @@ class Scheduler(SchedulerDisaggMixin):
             # Only multi-item list[Req] payloads represent a grouped multi-output request.
             if len(reqs) == 1:
                 return [(identity, reqs[0])]
+            return [(identity, reqs)]
+        if all(isinstance(req, UGInterleavedGenerateReq) for req in reqs):
             return [(identity, reqs)]
         return [(identity, req) for req in reqs]
 
