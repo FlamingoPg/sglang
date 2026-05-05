@@ -718,21 +718,50 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
             eps=config.rms_norm_eps,
         )
 
+    # U1 pixel-flow CFG is sensitive to bf16 residual rounding. Keep the U1
+    # layer order aligned with the reference Qwen3 implementation instead of
+    # using SGLang's fused split-residual fast path.
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if residual is not None:
+            hidden_states = hidden_states + residual
+        if post_residual_addition is not None:
+            hidden_states = hidden_states + post_residual_addition
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states, None
+
     def forward_gen(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm_mot_gen(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm_mot_gen(
-                hidden_states,
-                residual,
-            )
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if residual is not None:
+            hidden_states = hidden_states + residual
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm_mot_gen(hidden_states)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn.forward_gen(
@@ -741,12 +770,12 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
                 forward_batch=forward_batch,
             )
 
-        hidden_states, residual = self.post_attention_layernorm_mot_gen(
-            hidden_states,
-            residual,
-        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm_mot_gen(hidden_states)
         hidden_states = self.mlp_mot_gen(hidden_states)
-        return hidden_states, residual
+        hidden_states = residual + hidden_states
+        return hidden_states, None
 
 
 class NEOQwen3Model(Qwen2Model):
