@@ -37,6 +37,7 @@ class UGMiddleBridge(Protocol):
         image: Any | None,
         think: bool = False,
         think_max_new_tokens: int | None = None,
+        sampling_params: Any | None = None,
     ) -> UGContextBundle: ...
 
     def prepare_u_context_from_messages(
@@ -45,6 +46,7 @@ class UGMiddleBridge(Protocol):
         messages: list[UGInterleavedMessage | dict[str, Any]],
         think: bool = False,
         think_max_new_tokens: int | None = None,
+        sampling_params: Any | None = None,
     ) -> UGContextBundle: ...
 
     def run_g_segment(
@@ -126,12 +128,14 @@ class SRTBackedUGMiddleBridge:
         image: Any | None,
         think: bool = False,
         think_max_new_tokens: int | None = None,
+        sampling_params: Any | None = None,
     ) -> UGContextBundle:
         messages = self.runtime.normalize_messages(prompt=prompt, image=image)
         return self.prepare_u_context_from_messages(
             messages=messages,
             think=think,
             think_max_new_tokens=think_max_new_tokens,
+            sampling_params=sampling_params,
         )
 
     def prepare_u_context_from_messages(
@@ -140,7 +144,9 @@ class SRTBackedUGMiddleBridge:
         messages: list[UGInterleavedMessage | dict[str, Any]],
         think: bool = False,
         think_max_new_tokens: int | None = None,
+        sampling_params: Any | None = None,
     ) -> UGContextBundle:
+        del sampling_params
         messages = normalize_ug_interleaved_messages(messages)
         session = self.runtime.prefill_interleaved(messages)
         pre_image_segments: list[dict[str, Any]] = []

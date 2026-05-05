@@ -64,8 +64,11 @@ from sglang.srt.ug.runtime import (
 from sglang.srt.ug.u1 import (
     U1UGModelAdapter,
     U1VLMBackendResult,
+    U1_SYSTEM_MESSAGE_FOR_GEN,
+    U1_T2I_CFG_UNCONDITION_ROLE,
     build_u1_native_generated_image_commit_prepared_input,
     build_u1_t2i_prompt,
+    build_u1_t2i_uncondition_prompt,
     build_u1_vlm_prompt,
     load_u1_generated_image_for_commit,
 )
@@ -411,8 +414,15 @@ class TestU1UGBackendShell(unittest.TestCase):
     def test_u1_t2i_prompt_matches_official_image_marker_prefix(self):
         self.assertEqual(
             build_u1_t2i_prompt(prompt="draw a cup"),
+            f"<|im_start|>system\n{U1_SYSTEM_MESSAGE_FOR_GEN}<|im_end|>\n"
             "<|im_start|>user\ndraw a cup<|im_end|>\n"
             "<|im_start|>assistant\n<think>\n\n</think>\n\n<img>",
+        )
+
+    def test_u1_t2i_uncondition_prompt_matches_official_cfg_prompt(self):
+        self.assertEqual(
+            build_u1_t2i_uncondition_prompt(),
+            "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<img>",
         )
 
     def test_u1_native_tokenizer_builds_t2i_prefill_with_image_marker(self):
@@ -429,6 +439,24 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertIsNone(prepared[0].mm_inputs)
         self.assertEqual(
             prepared[0].adapter_metadata["u1"]["source"],
+            "native_t2i_prompt",
+        )
+
+    def test_u1_native_tokenizer_adds_t2i_cfg_sidecar_when_enabled(self):
+        adapter = U1UGModelAdapter(native_tokenizer=FakeU1Tokenizer())
+        adapter.include_t2i_cfg_uncondition = True
+
+        prepared = adapter.prepare_srt_u_interleaved_inputs(
+            session=None,
+            messages=[UGInterleavedMessage(type="text", content="draw a cup")],
+            state=UGSegmentState.U_PREFILL,
+        )
+
+        self.assertEqual(len(prepared), 2)
+        self.assertEqual(prepared[0].srt_sidecar_role, U1_T2I_CFG_UNCONDITION_ROLE)
+        self.assertEqual(prepared[0].input_ids[-1], 151670)
+        self.assertEqual(
+            prepared[1].adapter_metadata["u1"]["source"],
             "native_t2i_prompt",
         )
 
@@ -892,6 +920,35 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertTrue(result.metadata["native_srt_pixel_flow"])
         self.assertEqual(result.image.size, (8, 8))
         self.assertEqual(len(srt_executor.native_calls), 1)
+        self.assertIsNone(srt_executor.native_calls[0]["cfg_token_count"])
+
+    def test_u1_native_srt_pixel_flow_passes_text_cfg_sidecar_binding(self):
+        srt_executor = FakeNativePixelFlowSRTExecutor()
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(U1UGModelAdapter()),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=srt_executor,
+        )
+        bridge = _load_u1_bridge(runtime)
+        batch = Req(
+            sampling_params=_sampling(
+                height=8,
+                width=8,
+                num_inference_steps=2,
+                cfg_text_scale=4.0,
+            ),
+            seed=3,
+        )
+
+        U1PixelFlowGSegmentExecutor()(
+            bridge=bridge,
+            contexts=_make_contexts(),
+            batch=batch,
+            server_args=_make_ug_server_args(),
+        )
+
+        self.assertEqual(len(srt_executor.native_calls), 1)
+        self.assertEqual(srt_executor.native_calls[0]["cfg_token_count"], 4)
 
 
 class PixelFlowBridge:
@@ -915,8 +972,15 @@ class LoopInterleaveBridge:
             UGDecodeResult(type="done"),
         ]
 
-    def prepare_u_context_from_messages(self, *, messages, think, think_max_new_tokens):
-        del messages, think, think_max_new_tokens
+    def prepare_u_context_from_messages(
+        self,
+        *,
+        messages,
+        think,
+        think_max_new_tokens,
+        sampling_params=None,
+    ):
+        del messages, think, think_max_new_tokens, sampling_params
         return _make_contexts()
 
     def run_g_segment(self, *, contexts, executor):
@@ -1064,13 +1128,26 @@ class FakeNativePixelFlowExecutor:
     def __init__(self, owner):
         self.owner = owner
 
-    def generate(self, *, contexts, batch, server_args, srt_kv_token_binding):
+    def generate(
+        self,
+        *,
+        contexts,
+        batch,
+        server_args,
+        srt_kv_token_binding,
+        cfg_uncondition_srt_kv_token_binding=None,
+    ):
         del server_args
         self.owner.native_calls.append(
             {
                 "session_id": contexts.full.session.session_id,
                 "seed": batch.seed,
                 "token_count": srt_kv_token_binding.token_count,
+                "cfg_token_count": (
+                    cfg_uncondition_srt_kv_token_binding.token_count
+                    if cfg_uncondition_srt_kv_token_binding is not None
+                    else None
+                ),
             }
         )
         return UGGSegmentResult(

@@ -6,6 +6,7 @@ import math
 import os
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,8 +32,34 @@ U1_IMG_START_TOKEN = "<img>"
 U1_IMG_END_TOKEN = "</img>"
 U1_IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
 U1_IMAGE_PLACEHOLDER = "<image>"
+U1_T2I_CFG_UNCONDITION_ROLE = "u1_t2i_cfg_uncondition"
 U1_IMAGENET_MEAN = (0.485, 0.456, 0.406)
 U1_IMAGENET_STD = (0.229, 0.224, 0.225)
+U1_SYSTEM_MESSAGE_FOR_GEN = (
+    "You are an image generation and editing assistant that accurately understands "
+    "and executes user intent.\n\n"
+    "You support two modes:\n\n"
+    "1. Think Mode:\n"
+    "If the task requires reasoning, you MUST start with a <think></think> block. "
+    "Put all reasoning inside the block using plain text. DO NOT include any image "
+    "tags. Keep it reasonable and directly useful for producing the final image.\n\n"
+    "2. Non-Think Mode:\n"
+    "If no reasoning is needed, directly produce the final image.\n\n"
+    "Task Types:\n\n"
+    "A. Text-to-Image Generation:\n"
+    "- Generate a high-quality image based on the user's description.\n"
+    "- Ensure visual clarity, semantic consistency, and completeness.\n"
+    "- DO NOT introduce elements that contradict or override the user's intent.\n\n"
+    "B. Image Editing:\n"
+    "- Use the provided image(s) as input or reference for modification or "
+    "transformation.\n"
+    "- The result can be an edited image or a new image based on the reference(s).\n"
+    "- Preserve all unspecified attributes unless explicitly changed.\n\n"
+    "General Rules:\n"
+    "- For any visible text in the image, follow the language specified for the "
+    "rendered text in the user's description, not the language of the prompt. If no "
+    "language is specified, use the user's input language."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +210,7 @@ class U1UGModelAdapter:
         self._messages_by_session: dict[str, list[UGInterleavedMessage]] = {}
         self.vlm_backend = vlm_backend
         self.native_tokenizer = native_tokenizer
+        self.include_t2i_cfg_uncondition = False
 
     def prepare_srt_u_interleaved_inputs(
         self,
@@ -198,13 +226,22 @@ class U1UGModelAdapter:
         if not has_text:
             return None
         if not has_image:
-            return [
+            prepared = []
+            if self.include_t2i_cfg_uncondition:
+                prepared.append(
+                    build_u1_native_t2i_cfg_uncondition_prepared_input(
+                        tokenizer=self.native_tokenizer,
+                        session=session,
+                    )
+                )
+            prepared.append(
                 build_u1_native_t2i_prepared_input(
                     tokenizer=self.native_tokenizer,
                     messages=messages,
                     session=session,
                 )
-            ]
+            )
+            return prepared
         return [
             build_u1_native_vlm_prepared_input(
                 tokenizer=self.native_tokenizer,
@@ -569,13 +606,16 @@ class U1SRTBackedUGMiddleBridge:
         image: Any | None,
         think: bool = False,
         think_max_new_tokens: int | None = None,
+        sampling_params: Any | None = None,
     ) -> UGContextBundle:
-        return self._bridge.prepare_u_context(
-            prompt=prompt,
-            image=image,
-            think=think,
-            think_max_new_tokens=think_max_new_tokens,
-        )
+        with self._temporary_t2i_cfg_sidecar(sampling_params):
+            return self._bridge.prepare_u_context(
+                prompt=prompt,
+                image=image,
+                think=think,
+                think_max_new_tokens=think_max_new_tokens,
+                sampling_params=sampling_params,
+            )
 
     def prepare_u_context_from_messages(
         self,
@@ -583,12 +623,29 @@ class U1SRTBackedUGMiddleBridge:
         messages: list[UGInterleavedMessage | dict[str, Any]],
         think: bool = False,
         think_max_new_tokens: int | None = None,
+        sampling_params: Any | None = None,
     ) -> UGContextBundle:
-        return self._bridge.prepare_u_context_from_messages(
-            messages=messages,
-            think=think,
-            think_max_new_tokens=think_max_new_tokens,
-        )
+        with self._temporary_t2i_cfg_sidecar(sampling_params):
+            return self._bridge.prepare_u_context_from_messages(
+                messages=messages,
+                think=think,
+                think_max_new_tokens=think_max_new_tokens,
+                sampling_params=sampling_params,
+            )
+
+    @contextmanager
+    def _temporary_t2i_cfg_sidecar(self, sampling_params: Any | None):
+        adapter = getattr(self.runtime.model_runner, "adapter", None)
+        old_value = getattr(adapter, "include_t2i_cfg_uncondition", False)
+        if adapter is not None:
+            adapter.include_t2i_cfg_uncondition = _u1_needs_text_cfg(
+                sampling_params
+            )
+        try:
+            yield
+        finally:
+            if adapter is not None:
+                adapter.include_t2i_cfg_uncondition = old_value
 
     def run_g_segment(
         self,
@@ -626,12 +683,27 @@ class U1SRTBackedUGMiddleBridge:
                 "U1 native pixel-flow has no SRT KV token binding for session "
                 f"{contexts.full.session.session_id}"
             )
+        cfg_uncondition_binding = None
+        sampling_params = batch.sampling_params
+        cfg_text_scale = float(getattr(sampling_params, "cfg_text_scale", 1.0))
+        if cfg_text_scale > 1.0:
+            sidecar_session_id = (
+                f"{contexts.full.session.session_id}:"
+                f"{U1_T2I_CFG_UNCONDITION_ROLE}"
+            )
+            cfg_uncondition_binding = get_binding(sidecar_session_id)
+            if cfg_uncondition_binding is None:
+                raise RuntimeError(
+                    "U1 native pixel-flow CFG requires sidecar SRT KV token "
+                    f"binding for session {sidecar_session_id}"
+                )
         native_executor = create_executor()
         return native_executor.generate(
             contexts=contexts,
             batch=batch,
             server_args=server_args,
             srt_kv_token_binding=binding,
+            cfg_uncondition_srt_kv_token_binding=cfg_uncondition_binding,
         )
 
     def commit_generated_segment(
@@ -852,10 +924,55 @@ def build_u1_native_generated_image_commit_prepared_input(
     )
 
 
+def build_u1_native_t2i_cfg_uncondition_prepared_input(
+    *,
+    tokenizer: Any,
+    session: Any | None = None,
+) -> UGSRTPreparedInput:
+    prompt = build_u1_t2i_uncondition_prompt()
+    input_ids = _u1_tokenize_to_ids(
+        tokenizer,
+        prompt,
+        add_special_tokens=False,
+    )
+    if not input_ids:
+        raise RuntimeError("U1 native T2I CFG prompt produced no input ids")
+    img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
+    if input_ids[-1] != img_start_id:
+        raise RuntimeError("U1 native T2I CFG prompt must end with <img>")
+    session_id = getattr(getattr(session, "handle", None), "session_id", None)
+    return UGSRTPreparedInput(
+        input_ids=input_ids,
+        input_text=prompt,
+        messages=[UGInterleavedMessage(type="text", content="")],
+        srt_sidecar_role=U1_T2I_CFG_UNCONDITION_ROLE,
+        srt_sidecar_session_id=(
+            f"{session_id}:{U1_T2I_CFG_UNCONDITION_ROLE}"
+            if session_id is not None
+            else None
+        ),
+        adapter_metadata={
+            "u1": {
+                "segment_type": "t2i_cfg_uncondition",
+                "source": "native_t2i_cfg_uncondition_prompt",
+                "prompt_ends_with_image_marker": True,
+            }
+        },
+    )
+
+
 def build_u1_t2i_prompt(*, prompt: str) -> str:
     return (
+        f"<|im_start|>system\n{U1_SYSTEM_MESSAGE_FOR_GEN}<|im_end|>\n"
         f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
         "<think>\n\n</think>\n\n"
+        f"{U1_IMG_START_TOKEN}"
+    )
+
+
+def build_u1_t2i_uncondition_prompt() -> str:
+    return (
+        "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n"
         f"{U1_IMG_START_TOKEN}"
     )
 
@@ -914,6 +1031,7 @@ class U1NativeSRTPixelFlowExecutor:
         batch: Any,
         server_args: Any,
         srt_kv_token_binding: Any,
+        cfg_uncondition_srt_kv_token_binding: Any | None = None,
     ) -> UGGSegmentResult:
         del server_args
         import numpy as np
@@ -925,10 +1043,15 @@ class U1NativeSRTPixelFlowExecutor:
         sampling_params = batch.sampling_params
         cfg_text_scale = float(getattr(sampling_params, "cfg_text_scale", 1.0))
         cfg_img_scale = float(getattr(sampling_params, "cfg_img_scale", 1.0))
-        if cfg_text_scale > 1.0 or cfg_img_scale > 1.0:
+        if cfg_img_scale > 1.0:
             raise NotImplementedError(
-                "U1 native SRT pixel-flow currently supports CFG scale <= 1.0; "
-                "CFG side branches are a later parity step"
+                "U1 native SRT pixel-flow currently supports text CFG only; "
+                "image CFG is used by editing and is a later parity step"
+            )
+        if cfg_text_scale > 1.0 and cfg_uncondition_srt_kv_token_binding is None:
+            raise RuntimeError(
+                "U1 native SRT pixel-flow text CFG requires an uncondition "
+                "SRT KV token binding"
             )
 
         image_size = _u1_batch_image_size(batch)
@@ -976,6 +1099,16 @@ class U1NativeSRTPixelFlowExecutor:
             text_len=int(getattr(srt_kv_token_binding, "token_count")),
             device=device,
         )
+        indexes_image_uncondition = None
+        if cfg_uncondition_srt_kv_token_binding is not None:
+            indexes_image_uncondition = self.srt_model.build_t2i_image_indexes(
+                token_h=token_h,
+                token_w=token_w,
+                text_len=int(
+                    getattr(cfg_uncondition_srt_kv_token_binding, "token_count")
+                ),
+                device=device,
+            )
         generation_input = {
             "packed_seqlens": torch.tensor(
                 [token_h * token_w], dtype=torch.int32, device=device
@@ -986,10 +1119,30 @@ class U1NativeSRTPixelFlowExecutor:
             generation_input=generation_input,
             srt_kv_token_binding=srt_kv_token_binding,
         )
+        prepared_uncondition = None
+        if cfg_uncondition_srt_kv_token_binding is not None:
+            prepared_uncondition = SimpleNamespace(
+                generation_input={
+                    "packed_seqlens": generation_input["packed_seqlens"],
+                    "packed_position_ids": indexes_image_uncondition,
+                },
+                srt_kv_token_binding=cfg_uncondition_srt_kv_token_binding,
+            )
+        cfg_interval = list(getattr(sampling_params, "cfg_interval", [0.0, 1.0]))
+        if len(cfg_interval) != 2:
+            raise ValueError("U1 native pixel-flow cfg_interval must have two values")
+        cfg_start, cfg_end = float(cfg_interval[0]), float(cfg_interval[1])
+        cfg_renorm_type = str(getattr(sampling_params, "cfg_renorm_type", "none"))
 
         for step_i in range(steps):
             timestep = timesteps[step_i]
             next_timestep = timesteps[step_i + 1]
+            use_cfg = (
+                cfg_text_scale > 1.0
+                and prepared_uncondition is not None
+                and (float(timestep) >= cfg_start)
+                and (float(timestep) <= cfg_end)
+            )
             z = self.srt_model.patchify(image_prediction, patch_size * merge_size)
             image_input = self.srt_model.patchify(
                 image_prediction,
@@ -1015,29 +1168,33 @@ class U1NativeSRTPixelFlowExecutor:
                 ](noise_values).view(1, token_h * token_w, -1)
             image_embeds = image_embeds + timestep_embeddings
 
-            forward_batch_context = self.forward_batch_provider(
+            v_condition = self._predict_v(
                 prepared=prepared,
-                latent_tokens=image_embeds,
+                image_embeds=image_embeds,
+                indexes_image=indexes_image,
                 timestep=timestep,
+                z=z,
+                image_size=image_size,
             )
-            forward_batch = getattr(
-                forward_batch_context,
-                "forward_batch",
-                forward_batch_context,
-            )
-            try:
-                v_pred = self.srt_model.predict_u1_pixel_flow_from_srt(
+            if use_cfg:
+                v_uncondition = self._predict_v(
+                    prepared=prepared_uncondition,
                     image_embeds=image_embeds,
-                    indexes_image=indexes_image,
-                    forward_batch=forward_batch,
+                    indexes_image=indexes_image_uncondition,
                     timestep=timestep,
                     z=z,
                     image_size=image_size,
                 )
-            finally:
-                release = getattr(forward_batch_context, "release", None)
-                if callable(release):
-                    release()
+                v_pred = v_uncondition + cfg_text_scale * (
+                    v_condition - v_uncondition
+                )
+                v_pred = self._apply_cfg_renorm(
+                    v_condition=v_condition,
+                    v_pred=v_pred,
+                    cfg_renorm_type=cfg_renorm_type,
+                )
+            else:
+                v_pred = v_condition
 
             z = z + (next_timestep - timestep) * v_pred
             image_prediction = self.srt_model.unpatchify(
@@ -1069,8 +1226,68 @@ class U1NativeSRTPixelFlowExecutor:
                 "height": height,
                 "grid": (token_h, token_w),
                 "noise_scale": noise_scale,
+                "cfg_text_scale": cfg_text_scale,
+                "cfg_renorm_type": (
+                    cfg_renorm_type if cfg_text_scale > 1.0 else "none"
+                ),
             },
         )
+
+    def _predict_v(
+        self,
+        *,
+        prepared: Any,
+        image_embeds: Any,
+        indexes_image: Any,
+        timestep: Any,
+        z: Any,
+        image_size: tuple[int, int],
+    ) -> Any:
+        forward_batch_context = self.forward_batch_provider(
+            prepared=prepared,
+            latent_tokens=image_embeds,
+            timestep=timestep,
+        )
+        forward_batch = getattr(
+            forward_batch_context,
+            "forward_batch",
+            forward_batch_context,
+        )
+        try:
+            return self.srt_model.predict_u1_pixel_flow_from_srt(
+                image_embeds=image_embeds,
+                indexes_image=indexes_image,
+                forward_batch=forward_batch,
+                timestep=timestep,
+                z=z,
+                image_size=image_size,
+            )
+        finally:
+            release = getattr(forward_batch_context, "release", None)
+            if callable(release):
+                release()
+
+    @staticmethod
+    def _apply_cfg_renorm(
+        *,
+        v_condition: Any,
+        v_pred: Any,
+        cfg_renorm_type: str,
+    ) -> Any:
+        if cfg_renorm_type == "none":
+            return v_pred
+        if cfg_renorm_type == "global":
+            norm_v_condition = v_condition.norm(dim=(1, 2), keepdim=True)
+            norm_v_cfg = v_pred.norm(dim=(1, 2), keepdim=True)
+        elif cfg_renorm_type == "channel":
+            norm_v_condition = v_condition.norm(dim=-1, keepdim=True)
+            norm_v_cfg = v_pred.norm(dim=-1, keepdim=True)
+        else:
+            raise ValueError(
+                f"Unsupported U1 native pixel-flow CFG renorm type: {cfg_renorm_type}"
+            )
+        scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
+        return v_pred * scale
 
 
 def _u1_tokenize_to_ids(
@@ -1105,6 +1322,12 @@ def _u1_batch_image_size(batch: Any) -> tuple[int, int]:
         default=1024,
     )
     return width, height
+
+
+def _u1_needs_text_cfg(sampling_params: Any | None) -> bool:
+    if sampling_params is None:
+        return False
+    return float(getattr(sampling_params, "cfg_text_scale", 1.0)) > 1.0
 
 
 def _u1_first_int(*values, default: int) -> int:

@@ -29,6 +29,8 @@ class TestUGSamplingParams(unittest.TestCase):
             UGSamplingParams(cfg_interval=[0.1])
 
     def test_cfg_renorm_type_must_be_known(self):
+        self.assertEqual(UGSamplingParams(cfg_renorm_type="none").cfg_renorm_type, "none")
+
         with self.assertRaisesRegex(ValueError, "cfg_renorm_type"):
             UGSamplingParams(cfg_renorm_type="local")
 

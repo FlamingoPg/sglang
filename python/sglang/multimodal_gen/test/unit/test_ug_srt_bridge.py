@@ -321,10 +321,16 @@ class TestOnlyPixelFlowBridge:
         self.velocity_count = 0
 
     def prepare_u_context(
-        self, *, prompt, image, think=False, think_max_new_tokens=None
+        self,
+        *,
+        prompt,
+        image,
+        think=False,
+        think_max_new_tokens=None,
+        sampling_params=None,
     ):
         self.prepare_count += 1
-        del prompt, image, think, think_max_new_tokens
+        del prompt, image, think, think_max_new_tokens, sampling_params
         session = UGSessionHandle(
             session_id="pixel-flow-session",
             anchor_request_id="pixel-flow-session:u1",

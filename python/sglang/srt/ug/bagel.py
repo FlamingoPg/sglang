@@ -281,6 +281,8 @@ class BAGELNativeSRTDenoiseExecutor:
         else:
             v_t_ = v_t_text_
 
+        if cfg_renorm_type == "none":
+            return v_t_
         if cfg_renorm_type == "global":
             norm_v_t = torch.norm(v_t)
             norm_v_t_ = torch.norm(v_t_)

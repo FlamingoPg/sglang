@@ -76,6 +76,7 @@ class UGContextStage(PipelineStage):
                 messages=messages,
                 think=think,
                 think_max_new_tokens=think_max_new_tokens,
+                sampling_params=batch.sampling_params,
             )
             batch.extra["ug_pre_image_segments"] = batch.extra[
                 "ug_contexts"
@@ -102,6 +103,7 @@ class UGContextStage(PipelineStage):
             image=batch.condition_image,
             think=think,
             think_max_new_tokens=think_max_new_tokens,
+            sampling_params=batch.sampling_params,
         )
         batch.extra["ug_pre_image_segments"] = batch.extra[
             "ug_contexts"

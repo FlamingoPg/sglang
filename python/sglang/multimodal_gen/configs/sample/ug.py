@@ -41,9 +41,14 @@ class UGSamplingParams(SamplingParams):
             raise ValueError("cfg_interval must satisfy 0 <= start <= end <= 1")
         self.cfg_interval = [start, end]
 
-        if self.cfg_renorm_type not in {"global", "channel", "text_channel"}:
+        if self.cfg_renorm_type not in {
+            "none",
+            "global",
+            "channel",
+            "text_channel",
+        }:
             raise ValueError(
-                "cfg_renorm_type must be one of: global, channel, text_channel"
+                "cfg_renorm_type must be one of: none, global, channel, text_channel"
             )
 
         for name in (
