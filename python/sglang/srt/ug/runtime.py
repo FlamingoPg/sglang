@@ -47,9 +47,6 @@ class UGSRTPreparedInput:
     replace_embeds: list[list[float]] | None = None
     replace_positions: list[int] | None = None
     position_ids: list[Any] | None = None
-    non_causal_query_attention: bool = False
-    mot_text_token_indices: list[int] | None = None
-    mot_image_token_indices: list[int] | None = None
     mm_inputs: Any | None = None
     srt_sidecar_role: str | None = None
     srt_sidecar_session_id: str | None = None
@@ -872,21 +869,6 @@ class UGSessionRuntime:
                     int(position) for position in suffix_positions
                 ]
 
-        if prepared.non_causal_query_attention:
-            req.ug_non_causal_query_attention = True
-
-        if prepared.mot_text_token_indices is not None:
-            req.ug_mot_text_token_indices = [
-                prefix_len + index - stripped
-                for index in prepared.mot_text_token_indices
-                if index >= stripped
-            ]
-        if prepared.mot_image_token_indices is not None:
-            req.ug_mot_image_token_indices = [
-                prefix_len + index - stripped
-                for index in prepared.mot_image_token_indices
-                if index >= stripped
-            ]
         return adapter_metadata
 
     @staticmethod

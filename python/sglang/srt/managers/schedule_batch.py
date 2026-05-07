@@ -109,35 +109,6 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
 
-UG_BATCH_COMPAT_CAUSAL = "causal"
-UG_BATCH_COMPAT_NON_CAUSAL_QUERY = "ug_non_causal_query"
-
-
-def get_ug_batch_compat_key(req: "Req") -> str:
-    if getattr(req, "ug_non_causal_query_attention", False):
-        return UG_BATCH_COMPAT_NON_CAUSAL_QUERY
-    return UG_BATCH_COMPAT_CAUSAL
-
-
-def get_ug_batch_compat_key_for_reqs(reqs: List["Req"]) -> str:
-    batch_compat_keys = {get_ug_batch_compat_key(req) for req in reqs}
-    if len(batch_compat_keys) > 1:
-        raise ValueError(
-            "UG non-causal query attention requests cannot be mixed with "
-            "ordinary causal requests in the same SRT batch"
-        )
-    return next(iter(batch_compat_keys), UG_BATCH_COMPAT_CAUSAL)
-
-
-def is_ug_batch_compatible(req: "Req", batch_compat_key: Optional[str]) -> bool:
-    return batch_compat_key is None or get_ug_batch_compat_key(req) == batch_compat_key
-
-
-def check_ug_non_causal_batch_compat(reqs: List["Req"]) -> bool:
-    batch_compat_key = get_ug_batch_compat_key_for_reqs(reqs)
-    return batch_compat_key == UG_BATCH_COMPAT_NON_CAUSAL_QUERY
-
-
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
     if vocab_size > MM_PAD_SHIFT_VALUE:
@@ -1424,9 +1395,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     replace_positions: Optional[torch.Tensor] = None
     custom_position_ids: Optional[torch.Tensor] = None
     ug_decode_position_ids: Optional[torch.Tensor] = None
-    ug_non_causal_query_attention: bool = False
-    bagel_mot_text_token_indices: Optional[torch.Tensor] = None
-    bagel_mot_vae_token_indices: Optional[torch.Tensor] = None
     ne_token_table: torch.Tensor = None
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
@@ -1720,7 +1688,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
-        ug_non_causal_query_attention = check_ug_non_causal_batch_compat(reqs)
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
@@ -1780,8 +1747,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         has_custom_position_ids = any(
             getattr(req, "ug_position_ids", None) is not None for req in reqs
         )
-        bagel_mot_text_token_indices = []
-        bagel_mot_vae_token_indices = []
         input_id_pointer = 0
         input_id_lens = [len(input_id) for input_id in input_ids]
         extend_input_logprob_token_ids = []
@@ -1855,32 +1820,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     range(pre_len, pre_len + req.extend_input_len)
                 )
 
-            if getattr(req, "ug_non_causal_query_attention", False):
-                ug_non_causal_query_attention = True
-
-            local_bagel_text_indices = []
-            local_bagel_vae_indices = []
-            for index in getattr(req, "ug_mot_text_token_indices", []) or []:
-                extend_pos = index - pre_len
-                if 0 <= extend_pos < req.extend_input_len:
-                    local_bagel_text_indices.append(extend_pos)
-            for index in getattr(req, "ug_mot_image_token_indices", []) or []:
-                extend_pos = index - pre_len
-                if 0 <= extend_pos < req.extend_input_len:
-                    local_bagel_vae_indices.append(extend_pos)
-            if local_bagel_vae_indices:
-                routed = set(local_bagel_text_indices) | set(local_bagel_vae_indices)
-                local_bagel_text_indices.extend(
-                    index
-                    for index in range(req.extend_input_len)
-                    if index not in routed
-                )
-            bagel_mot_text_token_indices.extend(
-                input_id_pointer + index for index in local_bagel_text_indices
-            )
-            bagel_mot_vae_token_indices.extend(
-                input_id_pointer + index for index in local_bagel_vae_indices
-            )
             input_id_pointer += input_id_lens[i]
 
             multimodal_inputs.append(req.multimodal_inputs)
@@ -2010,25 +1949,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else None
         )
         self.ug_decode_position_ids = None
-        self.ug_non_causal_query_attention = ug_non_causal_query_attention
-        self.bagel_mot_text_token_indices = (
-            torch.tensor(
-                bagel_mot_text_token_indices,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            if bagel_mot_text_token_indices
-            else None
-        )
-        self.bagel_mot_vae_token_indices = (
-            torch.tensor(
-                bagel_mot_vae_token_indices,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            if bagel_mot_vae_token_indices
-            else None
-        )
         for mm_input in multimodal_inputs:
             if mm_input is None:
                 continue
@@ -2393,9 +2313,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_embeds = None
         self.custom_position_ids = None
         self.ug_decode_position_ids = None
-        self.ug_non_causal_query_attention = False
-        self.bagel_mot_text_token_indices = None
-        self.bagel_mot_vae_token_indices = None
         decode_position_ids = [
             getattr(req, "ug_decode_position_id", None) for req in self.reqs
         ]
@@ -2719,9 +2636,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             replace_positions=self.replace_positions,
             custom_position_ids=self.custom_position_ids,
             ug_decode_position_ids=self.ug_decode_position_ids,
-            ug_non_causal_query_attention=self.ug_non_causal_query_attention,
-            bagel_mot_text_token_indices=self.bagel_mot_text_token_indices,
-            bagel_mot_vae_token_indices=self.bagel_mot_vae_token_indices,
             ne_token_table=self.ne_token_table,
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
@@ -2923,9 +2837,6 @@ class ModelWorkerBatch:
     replace_positions: Optional[torch.Tensor] = None
     custom_position_ids: Optional[torch.Tensor] = None
     ug_decode_position_ids: Optional[torch.Tensor] = None
-    ug_non_causal_query_attention: bool = False
-    bagel_mot_text_token_indices: Optional[torch.Tensor] = None
-    bagel_mot_vae_token_indices: Optional[torch.Tensor] = None
 
     # token table for ngram embedding
     ne_token_table: Optional[torch.Tensor] = None

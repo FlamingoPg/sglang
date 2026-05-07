@@ -119,7 +119,7 @@ class TestU1UGBackend(unittest.TestCase):
             "model.language_model.diffusion_model.layers.0.self_attn.q_proj.weight",
         )
 
-    def test_u1_adapter_declares_pixel_flow_without_bagel_latent_api(self):
+    def test_u1_adapter_declares_pixel_flow_without_latent_flow_api(self):
         adapter = U1UGModelAdapter()
 
         self.assertEqual(adapter.g_kind, "pixel_flow")

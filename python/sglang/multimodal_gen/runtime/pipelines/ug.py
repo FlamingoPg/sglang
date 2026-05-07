@@ -16,17 +16,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
     UGGSegmentStage,
     _normalize_pipeline_interleaved_messages,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_bagel import (
-    BAGELLatentFlowGSegmentExecutor,
-    apply_bagel_official_sampling_defaults,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_u1 import (
     U1PixelFlowGSegmentExecutor,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.ug.adapter import UGModelRunnerAdapter
-from sglang.srt.ug.bagel import create_bagel_ug_model_adapter
-from sglang.srt.ug.denoiser import SRTBackedUGMiddleBridge, UGMiddleBridge
+from sglang.srt.ug.denoiser import UGMiddleBridge
 from sglang.srt.ug.interleaved import (
     DEFAULT_UG_TEXT_MAX_NEW_TOKENS,
     UGInterleavedRequest,
@@ -93,36 +88,6 @@ def _load_ug_bridge_and_g_executor(
     raise ValueError(f"Unsupported UG model path: {model_path}")
 
 
-def _build_bagel_bridge(
-    model_path: str,
-    scheduler,
-    srt_request_executor,
-    srt_u_decode_max_new_tokens: int | None,
-) -> UGMiddleBridge:
-    if srt_u_decode_max_new_tokens is None:
-        srt_u_decode_max_new_tokens = 1
-
-    native_srt_denoise_executor = (
-        srt_request_executor.create_bagel_native_srt_denoise_executor()
-    )
-
-    adapter = create_bagel_ug_model_adapter(
-        model_path,
-        native_srt_denoise_executor=native_srt_denoise_executor,
-        native_srt_u_context=True,
-    )
-    bridge = SRTBackedUGMiddleBridge(
-        _build_srt_owned_ug_runtime(
-            UGModelRunnerAdapter(adapter),
-            scheduler=scheduler,
-            srt_request_executor=srt_request_executor,
-            srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
-        )
-    )
-    bridge.apply_sampling_defaults = apply_bagel_official_sampling_defaults
-    return bridge
-
-
 def _build_u1_bridge(
     model_path: str,
     scheduler,
@@ -144,20 +109,13 @@ def _build_u1_bridge(
     )
 
 
-def _is_bagel_model_path(model_path: str) -> bool:
-    return "bagel" in str(model_path).lower()
-
-
 _UG_BACKENDS = (
-    (_is_bagel_model_path, _build_bagel_bridge, BAGELLatentFlowGSegmentExecutor),
     (is_sensenova_u1_ug_model, _build_u1_bridge, U1PixelFlowGSegmentExecutor),
 )
 
 
 def _build_ug_g_segment_executor(bridge: UGMiddleBridge):
     g_kind = getattr(bridge, "g_kind", None)
-    if g_kind == "latent_flow":
-        return BAGELLatentFlowGSegmentExecutor()
     if g_kind == "pixel_flow":
         return U1PixelFlowGSegmentExecutor()
     raise ValueError(f"Unsupported UG G kind: {g_kind!r}")

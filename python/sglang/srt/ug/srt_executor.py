@@ -126,22 +126,6 @@ class UGSRTSchedulerExecutor:
             position_count=self._request_position_count(req),
         )
 
-    def create_bagel_native_srt_denoise_executor(self):
-        """Create a BAGEL denoise executor backed by this scheduler's ModelRunner."""
-
-        from sglang.srt.ug.bagel import BAGELNativeSRTDenoiseExecutor
-
-        model_runner = self._require_model_runner()
-        srt_model = getattr(model_runner, "model", None)
-        if srt_model is None:
-            raise UGSRTSchedulerExecutorError(
-                "UG BAGEL native denoise requires model_runner.model"
-            )
-        return BAGELNativeSRTDenoiseExecutor(
-            srt_model,
-            forward_batch_provider=self.build_ug_g_forward_batch,
-        )
-
     def create_u1_native_srt_pixel_flow_executor(self):
         """Create a SenseNova U1 pixel-flow executor backed by ModelRunner."""
 
@@ -182,11 +166,11 @@ class UGSRTSchedulerExecutor:
         latent_tokens: torch.Tensor,
         timestep: torch.Tensor,
     ) -> UGSRTTemporaryForwardBatch:
-        """Build a temporary extend batch for one BAGEL G denoise timestep.
+        """Build a temporary extend batch for one UG G generation step.
 
         The batch reuses the U session's committed KV indices as prefix context, but
         allocates fresh request/query KV slots for this timestep and releases them as
-        soon as the native BAGEL velocity forward returns.
+        soon as the native G forward returns.
         """
 
         del latent_tokens, timestep

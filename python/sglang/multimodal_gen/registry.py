@@ -623,16 +623,12 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
-    # UG / BAGEL-style unified generation models.
+    # UG unified generation models.
     register_configs(
         sampling_param_cls=UGSamplingParams,
         pipeline_config_cls=UGPipelineConfig,
-        hf_model_paths=[
-            "ByteDance-Seed/BAGEL-7B-MoT",
-            "sensenova/SenseNova-U1-8B-MoT",
-        ],
+        hf_model_paths=["sensenova/SenseNova-U1-8B-MoT"],
         model_detectors=[
-            lambda hf_id: "bagel" in hf_id.lower(),
             lambda hf_id: "sensenova-u1" in hf_id.lower(),
             lambda hf_id: "sensenova_u1" in hf_id.lower(),
         ],

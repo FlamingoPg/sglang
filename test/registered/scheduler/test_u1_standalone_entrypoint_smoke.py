@@ -85,11 +85,11 @@ def run_u1_standalone_entrypoint_from_env(env) -> Path:
                 default_height=height,
                 default_width=width,
             ),
-            ug_srt_u_decode_max_new_tokens=decode_chunk,
-            ug_srt_attention_backend=attention_backend,
         )
         setattr(server_args, "ug_srt_scheduler", handle.scheduler)
         setattr(server_args, "ug_srt_scheduler_handle", handle)
+        setattr(server_args, "ug_srt_u_decode_max_new_tokens", decode_chunk)
+        setattr(server_args, "ug_srt_attention_backend", attention_backend)
         set_global_server_args(server_args)
 
         pipeline = UGPipeline(model_path, server_args, executor=SimpleNamespace())

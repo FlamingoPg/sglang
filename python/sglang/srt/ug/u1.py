@@ -87,8 +87,8 @@ def is_sensenova_u1_ug_model(
 class U1UGModelAdapter:
     """SenseNova U1 UG adapter shell for the UG middle protocol.
 
-    U1 uses pixel-flow G mechanics, so it intentionally does not expose BAGEL
-    latent-flow methods such as velocity prediction or latent decode.
+    U1 uses pixel-flow G mechanics, so it intentionally does not expose latent-flow
+    methods such as velocity prediction or latent decode.
     """
 
     g_kind: UGGKind = "pixel_flow"
@@ -1466,7 +1466,6 @@ def build_u1_native_generated_image_commit_prepared_input(
         messages=[message],
         position_ids=position_ids,
         mm_inputs=mm_inputs,
-        mot_image_token_indices=list(range(context_start, context_end + 1)),
         adapter_metadata=metadata,
     )
 
