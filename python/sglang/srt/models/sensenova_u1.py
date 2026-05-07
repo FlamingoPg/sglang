@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.sensenova_u1 import SenseNovaU1Config
@@ -16,6 +15,7 @@ from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
@@ -185,96 +185,6 @@ class U1TimestepEmbedder(nn.Module):
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         return self.mlp(t_freq.to(dtype=self.mlp[0].weight.dtype))
-
-
-class U1Qwen3RMSNorm(nn.Module):
-    """Qwen3 RMSNorm with the same cast order as SenseNova-U1 reference."""
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-        post_residual_addition: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is not None:
-            hidden_states = hidden_states + residual
-            if post_residual_addition is not None:
-                hidden_states = hidden_states + post_residual_addition
-            residual = hidden_states
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        hidden_states = self.weight * hidden_states.to(input_dtype)
-        if residual is not None:
-            return hidden_states, residual
-        return hidden_states
-
-
-class U1Qwen3RotaryEmbedding(nn.Module):
-    """U1 Qwen3 RoPE computed with the reference forward-time semantics."""
-
-    def __init__(
-        self,
-        rotary_dim: int,
-        *,
-        max_position_embeddings: int,
-        base: float,
-    ) -> None:
-        super().__init__()
-        self.rotary_dim = int(rotary_dim)
-        self.max_position_embeddings = int(max_position_embeddings)
-        self.base = float(base)
-        inv_freq = 1.0 / (
-            self.base
-            ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
-                / self.rotary_dim
-            )
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    @torch.no_grad()
-    def forward(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if position_ids.ndim == 1:
-            position_ids = position_ids.unsqueeze(0)
-        inv_freq = self.inv_freq[None, :, None].float().to(x.device)
-        position_ids = position_ids[:, None, :].float().to(x.device)
-        device_type = x.device.type if x.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq @ position_ids).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-
-def _u1_rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_u1_qwen3_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.squeeze(0).unsqueeze(1)
-    sin = sin.squeeze(0).unsqueeze(1)
-    q_embed = (q * cos) + (_u1_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_u1_rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 class U1ConvDecoder(nn.Module):
@@ -612,27 +522,25 @@ class NEOQwen3Attention(Qwen3Attention):
             prefix=add_prefix("o_proj_mot_gen", prefix),
         )
 
-        self.q_norm = U1Qwen3RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
-        self.k_norm = U1Qwen3RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
-        self.q_norm_hw = U1Qwen3RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
-        self.k_norm_hw = U1Qwen3RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
-        self.q_norm_mot_gen = U1Qwen3RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
-        self.k_norm_mot_gen = U1Qwen3RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
-        self.q_norm_hw_mot_gen = U1Qwen3RMSNorm(
-            self.hw_head_dim, eps=config.rms_norm_eps
-        )
-        self.k_norm_hw_mot_gen = U1Qwen3RMSNorm(
-            self.hw_head_dim, eps=config.rms_norm_eps
-        )
+        self.q_norm = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
+        self.q_norm_hw = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
+        self.k_norm_hw = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
+        self.q_norm_mot_gen = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
+        self.k_norm_mot_gen = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
+        self.q_norm_hw_mot_gen = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
+        self.k_norm_hw_mot_gen = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
 
-        self.rotary_emb = U1Qwen3RotaryEmbedding(
+        self.rotary_emb = get_rope(
             self.t_head_dim,
-            max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
+            rotary_dim=self.t_head_dim,
+            max_position=getattr(config, "max_position_embeddings", 32768),
             base=getattr(config, "rope_theta", 1000000),
         )
-        self.rotary_emb_hw = U1Qwen3RotaryEmbedding(
+        self.rotary_emb_hw = get_rope(
             self.spatial_head_dim,
-            max_position_embeddings=getattr(config, "max_position_embeddings_hw", 4096),
+            rotary_dim=self.spatial_head_dim,
+            max_position=getattr(config, "max_position_embeddings_hw", 4096),
             base=getattr(config, "rope_theta_hw", 10000.0),
         )
         self.use_fused_qk_norm_mrope = False
@@ -646,26 +554,17 @@ class NEOQwen3Attention(Qwen3Attention):
         if positions.ndim != 2 or positions.shape[0] != 3:
             positions = _u1_text_only_thw_positions(positions)
 
-        projected_qkv = self._reference_u_qkv(hidden_states, forward_batch)
-        qkv = None
-        if projected_qkv is None:
-            qkv, _ = self.qkv_proj(hidden_states)
-        output_proj = self.o_proj
-        q_norm = self.q_norm
-        k_norm = self.k_norm
-        q_norm_hw = self.q_norm_hw
-        k_norm_hw = self.k_norm_hw
+        qkv, _ = self.qkv_proj(hidden_states)
         return self._forward_from_qkv(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             qkv=qkv,
-            projected_qkv=projected_qkv,
-            output_proj=output_proj,
-            q_norm=q_norm,
-            k_norm=k_norm,
-            q_norm_hw=q_norm_hw,
-            k_norm_hw=k_norm_hw,
+            output_proj=self.o_proj,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            q_norm_hw=self.q_norm_hw,
+            k_norm_hw=self.k_norm_hw,
         )
 
     def forward_gen(
@@ -697,18 +596,14 @@ class NEOQwen3Attention(Qwen3Attention):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         qkv: torch.Tensor | None,
-        projected_qkv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         output_proj: RowParallelLinear,
         q_norm: RMSNorm,
         k_norm: RMSNorm,
         q_norm_hw: RMSNorm,
         k_norm_hw: RMSNorm,
     ) -> torch.Tensor:
-        if projected_qkv is None:
-            assert qkv is not None
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        else:
-            q, k, v = projected_qkv
+        assert qkv is not None
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q = self._split_u1_heads(q, self.num_heads, q_norm, q_norm_hw)
         k = self._split_u1_heads(k, self.num_kv_heads, k_norm, k_norm_hw)
@@ -761,21 +656,16 @@ class NEOQwen3Attention(Qwen3Attention):
 
     def _apply_rotary(
         self,
-        rotary_emb: U1Qwen3RotaryEmbedding,
+        rotary_emb,
         positions: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = q.shape[0]
-        q = q.view(num_tokens, self.num_heads, head_dim)
-        k = k.view(num_tokens, self.num_kv_heads, head_dim)
-        cos, sin = rotary_emb(q, positions.unsqueeze(0))
-        q, k = _apply_u1_qwen3_rotary_pos_emb(q, k, cos, sin)
-        return (
-            q.reshape(num_tokens, self.num_heads * head_dim),
-            k.reshape(num_tokens, self.num_kv_heads * head_dim),
-        )
+        q = q.view(num_tokens, self.num_heads * head_dim)
+        k = k.view(num_tokens, self.num_kv_heads * head_dim)
+        return rotary_emb(positions, q, k)
 
     def _split_u1_heads(
         self,
@@ -795,75 +685,6 @@ class NEOQwen3Attention(Qwen3Attention):
             x_h.reshape(num_tokens, num_heads * self.spatial_head_dim),
             x_w.reshape(num_tokens, num_heads * self.spatial_head_dim),
         )
-
-    def _reference_u_qkv(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        metadata = getattr(forward_batch, "ug_u_forward_metadata", None)
-        if not metadata:
-            return None
-        has_u1_metadata = any(
-            isinstance(item, dict)
-            and isinstance(item.get("adapter_metadata"), dict)
-            and "u1" in item["adapter_metadata"]
-            for item in metadata
-        )
-        if not has_u1_metadata:
-            return None
-
-        qkv_proj = self.qkv_proj
-        qkv_weight = getattr(qkv_proj, "weight", None)
-        if qkv_weight is None or getattr(qkv_proj, "tp_size", 1) != 1:
-            return None
-        q_weight, k_weight, v_weight = qkv_weight.split(
-            [self.q_size, self.kv_size, self.kv_size],
-            dim=0,
-        )
-        qkv_bias = getattr(qkv_proj, "bias", None)
-        q_bias = k_bias = v_bias = None
-        if qkv_bias is not None:
-            q_bias, k_bias, v_bias = qkv_bias.split(
-                [self.q_size, self.kv_size, self.kv_size],
-                dim=0,
-            )
-        return (
-            F.linear(hidden_states, q_weight, q_bias),
-            F.linear(hidden_states, k_weight, k_bias),
-            F.linear(hidden_states, v_weight, v_bias),
-        )
-
-
-def _forward_reference_qwen3_mlp(
-    mlp: Qwen3MLP,
-    hidden_states: torch.Tensor,
-) -> torch.Tensor:
-    gate_up_proj = mlp.gate_up_proj
-    gate_up_weight = getattr(gate_up_proj, "weight", None)
-    if gate_up_weight is None:
-        return mlp(hidden_states)
-    if getattr(gate_up_proj, "tp_size", 1) != 1:
-        return mlp(hidden_states)
-
-    split_size = gate_up_weight.shape[0] // 2
-    gate_weight, up_weight = gate_up_weight.split([split_size, split_size], dim=0)
-    gate_up_bias = getattr(gate_up_proj, "bias", None)
-    gate_bias = up_bias = None
-    if gate_up_bias is not None:
-        gate_bias, up_bias = gate_up_bias.split([split_size, split_size], dim=0)
-
-    gate = F.linear(hidden_states, gate_weight, gate_bias)
-    up = F.linear(hidden_states, up_weight, up_bias)
-    hidden_states = F.silu(gate) * up
-
-    down_proj = mlp.down_proj
-    down_weight = getattr(down_proj, "weight", None)
-    if down_weight is None or getattr(down_proj, "tp_size", 1) != 1:
-        hidden_states, _ = down_proj(hidden_states)
-        return hidden_states
-    down_bias = getattr(down_proj, "bias", None)
-    return F.linear(hidden_states, down_weight, down_bias)
 
 
 class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
@@ -895,73 +716,14 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
             quant_config=quant_config,
             prefix=add_prefix("mlp_mot_gen", prefix),
         )
-        self.input_layernorm_mot_gen = U1Qwen3RMSNorm(
+        self.input_layernorm_mot_gen = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )
-        self.post_attention_layernorm_mot_gen = U1Qwen3RMSNorm(
+        self.post_attention_layernorm_mot_gen = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )
-        self.input_layernorm = U1Qwen3RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-        )
-        self.post_attention_layernorm = U1Qwen3RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-        )
-
-    # U1 pixel-flow CFG is sensitive to bf16 residual rounding. Keep the U1
-    # layer order aligned with the reference Qwen3 implementation instead of
-    # using SGLang's fused split-residual fast path.
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        post_residual_addition: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if residual is not None:
-            hidden_states = hidden_states + residual
-        if post_residual_addition is not None:
-            hidden_states = hidden_states + post_residual_addition
-
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
-
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        if self._use_reference_u_mlp_path(forward_batch):
-            hidden_states = self._forward_reference_u_mlp(
-                hidden_states,
-                forward_batch=forward_batch,
-            )
-        else:
-            hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states, None
-
-    @staticmethod
-    def _use_reference_u_mlp_path(forward_batch: ForwardBatch) -> bool:
-        return getattr(forward_batch, "ug_u_forward_metadata", None) is not None
-
-    def _forward_reference_u_mlp(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        del forward_batch
-        return _forward_reference_qwen3_mlp(self.mlp, hidden_states)
 
     def forward_gen(
         self,
@@ -986,21 +748,9 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm_mot_gen(hidden_states)
-        hidden_states = self._forward_reference_g_mlp(
-            hidden_states,
-            forward_batch=forward_batch,
-        )
+        hidden_states = self.mlp_mot_gen(hidden_states, forward_batch=forward_batch)
         hidden_states = residual + hidden_states
         return hidden_states, None
-
-    def _forward_reference_g_mlp(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        del forward_batch
-        return _forward_reference_qwen3_mlp(self.mlp_mot_gen, hidden_states)
 
 
 class NEOQwen3Model(Qwen2Model):
@@ -1019,11 +769,7 @@ class NEOQwen3Model(Qwen2Model):
             alt_stream=alt_stream,
         )
         if self.pp_group.is_last_rank:
-            self.norm = U1Qwen3RMSNorm(
-                config.hidden_size,
-                eps=config.rms_norm_eps,
-            )
-            self.norm_mot_gen = U1Qwen3RMSNorm(
+            self.norm_mot_gen = RMSNorm(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
             )
@@ -1302,154 +1048,6 @@ class NEOChatModel(nn.Module):
             ),
             grid_hw=grid_hw.to(device=vision_model.device, dtype=torch.long),
         ).last_hidden_state
-
-    def patchify(
-        self,
-        images: torch.Tensor,
-        patch_size: int,
-        *,
-        channel_first: bool = False,
-    ) -> torch.Tensor:
-        h, w = images.shape[2] // patch_size, images.shape[3] // patch_size
-        x = images.reshape(images.shape[0], 3, h, patch_size, w, patch_size)
-        if channel_first:
-            x = torch.einsum("nchpwq->nhwcpq", x)
-        else:
-            x = torch.einsum("nchpwq->nhwpqc", x)
-        return x.reshape(images.shape[0], h * w, patch_size**2 * 3)
-
-    def unpatchify(
-        self,
-        x: torch.Tensor,
-        patch_size: int,
-        h: int | None = None,
-        w: int | None = None,
-    ) -> torch.Tensor:
-        if h is None or w is None:
-            h = w = int(x.shape[1] ** 0.5)
-        else:
-            h = h // patch_size
-            w = w // patch_size
-        x = x.reshape(x.shape[0], h, w, patch_size, patch_size, 3)
-        x = torch.einsum("nhwpqc->nchpwq", x)
-        return x.reshape(x.shape[0], 3, h * patch_size, w * patch_size)
-
-    def build_t2i_image_indexes(
-        self,
-        *,
-        token_h: int,
-        token_w: int,
-        text_len: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        t_image = torch.full(
-            (token_h * token_w,),
-            int(text_len),
-            dtype=torch.long,
-            device=device,
-        )
-        idx = torch.arange(token_h * token_w, device=device, dtype=torch.long)
-        h_image = idx // token_w
-        w_image = idx % token_w
-        return torch.stack([t_image, h_image, w_image], dim=0)
-
-    def apply_time_schedule(
-        self,
-        timesteps: torch.Tensor,
-        *,
-        image_seq_len: int,
-        timestep_shift: float,
-    ) -> torch.Tensor:
-        sigma = 1 - timesteps
-        schedule = self.time_schedule
-        if timestep_shift != 1:
-            schedule = "standard"
-        if schedule == "standard":
-            shift = float(timestep_shift)
-            sigma = shift * sigma / (1 + (shift - 1) * sigma)
-        elif schedule == "dynamic":
-            mu = self._calculate_dynamic_mu(image_seq_len)
-            mu_t = timesteps.new_tensor(mu)
-            if self.time_shift_type == "exponential":
-                shift = torch.exp(mu_t)
-                sigma = shift * sigma / (1 + (shift - 1) * sigma)
-            elif self.time_shift_type == "linear":
-                sigma = mu_t / (mu_t + (1 / sigma - 1))
-            else:
-                raise ValueError(
-                    f"Unsupported U1 time_shift_type: {self.time_shift_type}"
-                )
-        else:
-            raise ValueError(f"Unsupported U1 time_schedule: {schedule}")
-        return 1 - sigma
-
-    def noise_scale_for_image(self, *, grid_h: int, grid_w: int) -> float:
-        merge_size = _merge_size_from_downsample_ratio(float(self.downsample_ratio))
-        noise_scale = float(self.noise_scale)
-        if self.noise_scale_mode in {"resolution", "dynamic", "dynamic_sqrt"}:
-            base = float(self.noise_scale_base_image_seq_len)
-            scale = math.sqrt((grid_h * grid_w) / (merge_size**2) / base)
-            noise_scale = scale * float(self.noise_scale)
-            if self.noise_scale_mode == "dynamic_sqrt":
-                noise_scale = math.sqrt(noise_scale)
-        return min(noise_scale, float(self.noise_scale_max_value))
-
-    def predict_u1_pixel_flow_from_srt(
-        self,
-        *,
-        image_embeds: torch.Tensor,
-        indexes_image: torch.Tensor,
-        forward_batch: ForwardBatch,
-        timestep: torch.Tensor,
-        z: torch.Tensor,
-        image_size: tuple[int, int],
-    ) -> torch.Tensor:
-        batch_size, image_token_num = image_embeds.shape[:2]
-        hidden_states = self.language_model.forward_u1_gen_embeds(
-            input_embeds=image_embeds.reshape(-1, image_embeds.shape[-1]),
-            positions=indexes_image,
-            forward_batch=forward_batch,
-        ).view(batch_size, image_token_num, -1)
-
-        if self.use_pixel_head:
-            merge_size = _merge_size_from_downsample_ratio(float(self.downsample_ratio))
-            token_h = image_size[1] // (self.patch_size * merge_size)
-            token_w = image_size[0] // (self.patch_size * merge_size)
-            img_2d = hidden_states.view(batch_size, token_h, token_w, -1)
-            img_2d = torch.einsum("b h w c -> b c h w", img_2d).contiguous()
-            x_pred_2d = self.fm_modules["fm_head"](img_2d)
-            x_pred = (
-                x_pred_2d.view(
-                    batch_size,
-                    3,
-                    token_h,
-                    self.patch_size * merge_size,
-                    token_w,
-                    self.patch_size * merge_size,
-                )
-                .permute(0, 2, 4, 3, 5, 1)
-                .contiguous()
-                .view(batch_size, image_token_num, -1)
-            )
-        else:
-            x_pred = self.fm_modules["fm_head"](hidden_states).view(
-                batch_size,
-                image_token_num,
-                -1,
-            )
-
-        t = timestep.to(device=z.device, dtype=z.dtype)
-        return (x_pred - z) / (1 - t).clamp_min(
-            float(getattr(self.config, "t_eps", 0.02))
-        )
-
-    def _calculate_dynamic_mu(self, image_seq_len: int) -> float:
-        denom = self.max_image_seq_len - self.base_image_seq_len
-        if denom == 0:
-            return float(self.base_shift)
-        slope = (self.max_shift - self.base_shift) / denom
-        bias = self.base_shift - slope * self.base_image_seq_len
-        return float(image_seq_len) * slope + bias
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()

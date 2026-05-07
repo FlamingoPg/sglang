@@ -288,7 +288,7 @@ class _SenseNovaU1NativePixelFlowRunner:
             device=device,
         )
         noise_scale = float(
-            self.srt_model.noise_scale_for_image(grid_h=grid_h, grid_w=grid_w)
+            _u1_noise_scale_for_image(self.srt_model, grid_h=grid_h, grid_w=grid_w)
         )
         image_prediction = noise_scale * torch.randn(
             (1, 3, height, width),
@@ -298,13 +298,14 @@ class _SenseNovaU1NativePixelFlowRunner:
         )
         gen_grid_hw = torch.tensor([[grid_h, grid_w]], device=device, dtype=torch.long)
         timesteps = torch.linspace(0.0, 1.0, steps + 1, device=device)
-        timesteps = self.srt_model.apply_time_schedule(
+        timesteps = _u1_apply_time_schedule(
+            self.srt_model,
             timesteps,
             image_seq_len=token_h * token_w,
             timestep_shift=float(getattr(sampling_params, "timestep_shift", 1.0)),
         )
         g_position_start = int(srt_context.position_count)
-        indexes_image = self.srt_model.build_t2i_image_indexes(
+        indexes_image = _u1_build_t2i_image_indexes(
             token_h=token_h,
             token_w=token_w,
             text_len=g_position_start,
@@ -316,7 +317,7 @@ class _SenseNovaU1NativePixelFlowRunner:
             cfg_img_condition_position_count = int(
                 cfg_img_condition_srt_context.position_count
             )
-            indexes_image_img_condition = self.srt_model.build_t2i_image_indexes(
+            indexes_image_img_condition = _u1_build_t2i_image_indexes(
                 token_h=token_h,
                 token_w=token_w,
                 text_len=cfg_img_condition_position_count,
@@ -328,7 +329,7 @@ class _SenseNovaU1NativePixelFlowRunner:
             cfg_uncondition_position_count = int(
                 cfg_uncondition_srt_context.position_count
             )
-            indexes_image_uncondition = self.srt_model.build_t2i_image_indexes(
+            indexes_image_uncondition = _u1_build_t2i_image_indexes(
                 token_h=token_h,
                 token_w=token_w,
                 text_len=cfg_uncondition_position_count,
@@ -379,8 +380,8 @@ class _SenseNovaU1NativePixelFlowRunner:
             use_cfg = (float(timestep) > cfg_start and float(timestep) < cfg_end) or (
                 cfg_start == 0.0
             )
-            z = self.srt_model.patchify(image_prediction, patch_size * merge_size)
-            image_input = self.srt_model.patchify(
+            z = _u1_patchify(image_prediction, patch_size * merge_size)
+            image_input = _u1_patchify(
                 image_prediction,
                 patch_size,
                 channel_first=True,
@@ -466,7 +467,7 @@ class _SenseNovaU1NativePixelFlowRunner:
                 )
 
             z = z + (next_timestep - timestep) * v_pred
-            image_prediction = self.srt_model.unpatchify(
+            image_prediction = _u1_unpatchify(
                 z,
                 patch_size * merge_size,
                 height,
@@ -532,7 +533,8 @@ class _SenseNovaU1NativePixelFlowRunner:
             forward_batch_context,
         )
         try:
-            return self.srt_model.predict_u1_pixel_flow_from_srt(
+            return _predict_u1_pixel_flow_from_srt(
+                self.srt_model,
                 image_embeds=image_embeds,
                 indexes_image=indexes_image,
                 forward_batch=forward_batch,
@@ -614,6 +616,163 @@ def _require_sidecar_srt_context(
         message,
         sidecar_role=role,
     )
+
+
+def _u1_patchify(images: Any, patch_size: int, *, channel_first: bool = False) -> Any:
+    import torch
+
+    h, w = images.shape[2] // patch_size, images.shape[3] // patch_size
+    x = images.reshape(images.shape[0], 3, h, patch_size, w, patch_size)
+    if channel_first:
+        x = torch.einsum("nchpwq->nhwcpq", x)
+    else:
+        x = torch.einsum("nchpwq->nhwpqc", x)
+    return x.reshape(images.shape[0], h * w, patch_size**2 * 3)
+
+
+def _u1_unpatchify(
+    x: Any,
+    patch_size: int,
+    h: int | None = None,
+    w: int | None = None,
+) -> Any:
+    import torch
+
+    if h is None or w is None:
+        h = w = int(x.shape[1] ** 0.5)
+    else:
+        h = h // patch_size
+        w = w // patch_size
+    x = x.reshape(x.shape[0], h, w, patch_size, patch_size, 3)
+    x = torch.einsum("nhwpqc->nchpwq", x)
+    return x.reshape(x.shape[0], 3, h * patch_size, w * patch_size)
+
+
+def _u1_build_t2i_image_indexes(
+    *,
+    token_h: int,
+    token_w: int,
+    text_len: int,
+    device: Any,
+) -> Any:
+    import torch
+
+    t_image = torch.full(
+        (token_h * token_w,),
+        int(text_len),
+        dtype=torch.long,
+        device=device,
+    )
+    idx = torch.arange(token_h * token_w, device=device, dtype=torch.long)
+    h_image = idx // token_w
+    w_image = idx % token_w
+    return torch.stack([t_image, h_image, w_image], dim=0)
+
+
+def _u1_apply_time_schedule(
+    model: Any,
+    timesteps: Any,
+    *,
+    image_seq_len: int,
+    timestep_shift: float,
+) -> Any:
+    import torch
+
+    sigma = 1 - timesteps
+    schedule = model.time_schedule
+    if timestep_shift != 1:
+        schedule = "standard"
+    if schedule == "standard":
+        shift = float(timestep_shift)
+        sigma = shift * sigma / (1 + (shift - 1) * sigma)
+    elif schedule == "dynamic":
+        mu = _u1_calculate_dynamic_mu(model, image_seq_len)
+        mu_t = timesteps.new_tensor(mu)
+        if model.time_shift_type == "exponential":
+            shift = torch.exp(mu_t)
+            sigma = shift * sigma / (1 + (shift - 1) * sigma)
+        elif model.time_shift_type == "linear":
+            sigma = mu_t / (mu_t + (1 / sigma - 1))
+        else:
+            raise ValueError(
+                f"Unsupported SenseNova U1 time_shift_type: {model.time_shift_type}"
+            )
+    else:
+        raise ValueError(f"Unsupported SenseNova U1 time_schedule: {schedule}")
+    return 1 - sigma
+
+
+def _u1_noise_scale_for_image(model: Any, *, grid_h: int, grid_w: int) -> float:
+    import math
+
+    merge_size = int(1 / float(model.downsample_ratio))
+    noise_scale = float(model.noise_scale)
+    if model.noise_scale_mode in {"resolution", "dynamic", "dynamic_sqrt"}:
+        base = float(model.noise_scale_base_image_seq_len)
+        scale = math.sqrt((grid_h * grid_w) / (merge_size**2) / base)
+        noise_scale = scale * float(model.noise_scale)
+        if model.noise_scale_mode == "dynamic_sqrt":
+            noise_scale = math.sqrt(noise_scale)
+    return min(noise_scale, float(model.noise_scale_max_value))
+
+
+def _u1_calculate_dynamic_mu(model: Any, image_seq_len: int) -> float:
+    denom = model.max_image_seq_len - model.base_image_seq_len
+    if denom == 0:
+        return float(model.base_shift)
+    slope = (model.max_shift - model.base_shift) / denom
+    bias = model.base_shift - slope * model.base_image_seq_len
+    return float(image_seq_len) * slope + bias
+
+
+def _predict_u1_pixel_flow_from_srt(
+    model: Any,
+    *,
+    image_embeds: Any,
+    indexes_image: Any,
+    forward_batch: Any,
+    timestep: Any,
+    z: Any,
+    image_size: tuple[int, int],
+) -> Any:
+    import torch
+
+    batch_size, image_token_num = image_embeds.shape[:2]
+    hidden_states = model.language_model.forward_u1_gen_embeds(
+        input_embeds=image_embeds.reshape(-1, image_embeds.shape[-1]),
+        positions=indexes_image,
+        forward_batch=forward_batch,
+    ).view(batch_size, image_token_num, -1)
+
+    if model.use_pixel_head:
+        merge_size = int(1 / float(model.downsample_ratio))
+        token_h = image_size[1] // (model.patch_size * merge_size)
+        token_w = image_size[0] // (model.patch_size * merge_size)
+        img_2d = hidden_states.view(batch_size, token_h, token_w, -1)
+        img_2d = torch.einsum("b h w c -> b c h w", img_2d).contiguous()
+        x_pred_2d = model.fm_modules["fm_head"](img_2d)
+        x_pred = (
+            x_pred_2d.view(
+                batch_size,
+                3,
+                token_h,
+                model.patch_size * merge_size,
+                token_w,
+                model.patch_size * merge_size,
+            )
+            .permute(0, 2, 4, 3, 5, 1)
+            .contiguous()
+            .view(batch_size, image_token_num, -1)
+        )
+    else:
+        x_pred = model.fm_modules["fm_head"](hidden_states).view(
+            batch_size,
+            image_token_num,
+            -1,
+        )
+
+    t = timestep.to(device=z.device, dtype=z.dtype)
+    return (x_pred - z) / (1 - t).clamp_min(float(getattr(model.config, "t_eps", 0.02)))
 
 
 def _session_torch_generator(
