@@ -434,14 +434,13 @@ class Qwen3Model(Qwen2Model):
         config: Qwen3Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        decoder_layer_type: type[nn.Module] = Qwen3DecoderLayer,
     ) -> None:
         alt_stream = torch.cuda.Stream() if _is_cuda else None
         super().__init__(
             config=config,
             quant_config=quant_config,
             prefix=prefix,
-            decoder_layer_type=decoder_layer_type,
+            decoder_layer_type=Qwen3DecoderLayer,
             alt_stream=alt_stream,
         )
 
@@ -465,7 +464,6 @@ class Qwen3ForCausalLM(nn.Module):
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
-    model_cls = Qwen3Model
 
     def __init__(
         self,
@@ -477,7 +475,7 @@ class Qwen3ForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = self.model_cls(
+        self.model = Qwen3Model(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
