@@ -13,7 +13,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 
 
 @dataclass
-class U1SamplingParams(SamplingParams):
+class SenseNovaU1SamplingParams(SamplingParams):
     data_type: DataType = DataType.IMAGE
     num_frames: int = 1
     height: int | None = 1024
@@ -31,9 +31,9 @@ class U1SamplingParams(SamplingParams):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self._validate_u1_fields()
+        self._validate_sensenova_u1_fields()
 
-    def _validate_u1_fields(self) -> None:
+    def _validate_sensenova_u1_fields(self) -> None:
         if len(self.cfg_interval) != 2:
             raise ValueError("cfg_interval must contain [start, end]")
         start, end = [float(x) for x in self.cfg_interval]
@@ -79,25 +79,27 @@ class U1SamplingParams(SamplingParams):
                 )
 
 
-def get_u1_explicit_sampling_fields(params: Any | None) -> set[str]:
+def get_sensenova_u1_explicit_sampling_fields(params: Any | None) -> set[str]:
     if params is None:
         return set()
     return set(getattr(params, "_explicit_fields", set()) or set())
 
 
-def mark_u1_explicit_sampling_fields(
-    params: U1SamplingParams,
+def mark_sensenova_u1_explicit_sampling_fields(
+    params: SenseNovaU1SamplingParams,
     explicit_fields: set[str],
-) -> U1SamplingParams:
-    params._explicit_fields = get_u1_explicit_sampling_fields(params) | set(
+) -> SenseNovaU1SamplingParams:
+    params._explicit_fields = get_sensenova_u1_explicit_sampling_fields(params) | set(
         explicit_fields
     )
     return params
 
 
-def build_u1_sampling_params(values: dict[str, Any] | None = None) -> U1SamplingParams:
+def build_sensenova_u1_sampling_params(
+    values: dict[str, Any] | None = None,
+) -> SenseNovaU1SamplingParams:
     values = dict(values or {})
-    return mark_u1_explicit_sampling_fields(
-        U1SamplingParams(**values),
+    return mark_sensenova_u1_explicit_sampling_fields(
+        SenseNovaU1SamplingParams(**values),
         set(values.keys()),
     )

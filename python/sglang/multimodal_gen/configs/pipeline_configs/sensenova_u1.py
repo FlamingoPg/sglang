@@ -11,7 +11,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 
 
 @dataclass
-class U1PipelineConfig(PipelineConfig):
+class SenseNovaU1PipelineConfig(PipelineConfig):
     task_type: ModelTaskType = ModelTaskType.TI2I
     enable_autocast: bool = True
     vae_tiling: bool = False
