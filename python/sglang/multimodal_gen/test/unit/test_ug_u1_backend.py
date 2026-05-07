@@ -62,15 +62,25 @@ from sglang.srt.ug.runtime import (
     UGSessionRuntime,
 )
 from sglang.srt.ug.u1 import (
+    U1_EDIT_IMG_CONDITION_ROLE,
+    U1_EDIT_UNCONDITION_ROLE,
+    U1_INTERLEAVE_SYSTEM_MESSAGE,
+    U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
     U1UGModelAdapter,
     U1VLMBackendResult,
     U1_SYSTEM_MESSAGE_FOR_GEN,
     U1_T2I_CFG_UNCONDITION_ROLE,
+    build_u1_native_edit_img_condition_prepared_input,
+    build_u1_native_edit_uncondition_prepared_input,
     build_u1_native_generated_image_commit_prepared_input,
+    build_u1_native_interleave_prepared_input,
+    build_u1_native_interleave_text_uncondition_marker_prepared_input,
+    build_u1_t2i_plain_query,
     build_u1_t2i_prompt,
     build_u1_t2i_uncondition_prompt,
     build_u1_vlm_prompt,
     load_u1_generated_image_for_commit,
+    _u1_session_torch_generator,
 )
 
 
@@ -101,6 +111,26 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertEqual(config.llm_config.rope_theta_hw, 10000.0)
         self.assertIs(config.get_text_config(), config.llm_config)
         self.assertEqual(config.hidden_size, 32)
+
+    def test_neo_chat_config_preserves_u1_text_rope_theta(self):
+        config = NEOChatConfig(
+            vision_config={"architectures": ["NEOVisionModel"]},
+            llm_config={
+                "architectures": ["Qwen3ForCausalLM"],
+                "hidden_size": 32,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 1,
+                "vocab_size": 128,
+                "rope_parameters": {
+                    "rope_type": "default",
+                    "rope_theta": 5000000.0,
+                },
+                "rope_theta_hw": 10000.0,
+            },
+        )
+
+        self.assertEqual(config.llm_config.rope_theta, 5000000.0)
 
     def test_auto_config_can_build_neo_chat_without_remote_code(self):
         config = AutoConfig.for_model(
@@ -173,7 +203,9 @@ class TestU1UGBackendShell(unittest.TestCase):
         pixel_values = torch.arange(8 * 3 * 2 * 2, dtype=torch.float32).view(8, -1)
         grid_hw = torch.tensor([[2, 2], [2, 2]], dtype=torch.long)
 
-        image_embeds = vision_model(pixel_values=pixel_values, grid_hw=grid_hw).last_hidden_state
+        image_embeds = vision_model(
+            pixel_values=pixel_values, grid_hw=grid_hw
+        ).last_hidden_state
 
         self.assertEqual(tuple(image_embeds.shape), (2, 16))
 
@@ -227,6 +259,29 @@ class TestU1UGBackendShell(unittest.TestCase):
 
         self.assertEqual(positions.tolist(), [[4], [0], [0]])
 
+    def test_neo_chat_decode_prefers_explicit_u1_logical_position(self):
+        model = _tiny_neo_chat_model_without_language_model()
+        mm_inputs = MultimodalInputs(mm_items=[])
+        mm_inputs.mrope_positions = torch.tensor(
+            [[0, 1, 1, 2], [0, 0, 0, 0], [0, 0, 1, 0]],
+            dtype=torch.long,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: True),
+            mm_inputs=[mm_inputs],
+            seq_lens_cpu=torch.tensor([260], dtype=torch.long),
+            ug_decode_position_ids=torch.tensor([37], dtype=torch.long),
+            mrope_positions=None,
+        )
+
+        positions = model._resolve_u1_thw_positions(
+            input_ids=torch.tensor([2001], dtype=torch.long),
+            positions=torch.tensor([259], dtype=torch.long),
+            forward_batch=forward_batch,
+        )
+
+        self.assertEqual(positions.tolist(), [[37], [0], [0]])
+
     def test_u1_block_causal_mask_matches_same_t_bidirectional_rows(self):
         mask = build_u1_block_causal_allowed_mask(
             torch.tensor([0, 1, 2, 2, 2, 2, 3], dtype=torch.long)
@@ -236,6 +291,43 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertTrue(mask[5, 2])
         self.assertFalse(mask[1, 2])
         self.assertTrue(mask[6, 5])
+
+    def test_neo_chat_prepare_forward_batch_installs_u1_block_causal_mask(self):
+        model = _tiny_neo_chat_model_without_language_model()
+        mm_inputs = MultimodalInputs(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=torch.zeros(1, 12),
+                    offsets=[(1, 3)],
+                )
+            ]
+        )
+        mm_inputs.mrope_positions = torch.tensor(
+            [[0, 1, 1, 2], [0, 0, 0, 0], [0, 0, 1, 0]],
+            dtype=torch.long,
+        )
+        forward_batch = SimpleNamespace(
+            input_ids=torch.tensor([151670, 151669, 151669, 151671], dtype=torch.long),
+            positions=torch.arange(4, dtype=torch.long),
+            forward_mode=SimpleNamespace(is_decode=lambda: False),
+            mm_inputs=[mm_inputs],
+            extend_seq_lens_cpu=[4],
+            extend_prefix_lens_cpu=[0],
+            cross_attention_custom_mask=None,
+            ug_g_non_causal_query_attention=False,
+            contains_mm_inputs=lambda: True,
+        )
+
+        model.prepare_forward_batch(forward_batch)
+
+        self.assertIsNotNone(forward_batch.cross_attention_custom_mask)
+        self.assertTrue(forward_batch.ug_g_non_causal_query_attention)
+        mask = forward_batch.cross_attention_custom_mask.view(4, 4)
+        self.assertTrue(mask[1, 2])
+        self.assertTrue(mask[2, 1])
+        self.assertFalse(mask[0, 1])
+        self.assertTrue(mask[3, 2])
 
     def test_neo_chat_accepts_extend_local_thw_position_rows(self):
         model = _tiny_neo_chat_model_without_language_model()
@@ -281,8 +373,12 @@ class TestU1UGBackendShell(unittest.TestCase):
             ),
             "model.layers.0.self_attn.q_proj_mot_gen.weight",
         )
-        self.assertIsNone(map_u1_language_model_weight_name("vision_model.patch.weight"))
-        self.assertIsNone(map_u1_language_model_weight_name("fm_modules.fm_head.weight"))
+        self.assertIsNone(
+            map_u1_language_model_weight_name("vision_model.patch.weight")
+        )
+        self.assertIsNone(
+            map_u1_language_model_weight_name("fm_modules.fm_head.weight")
+        )
 
     def test_u1_adapter_declares_pixel_flow_kind(self):
         adapter = U1UGModelAdapter()
@@ -424,6 +520,10 @@ class TestU1UGBackendShell(unittest.TestCase):
             build_u1_t2i_uncondition_prompt(),
             "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<img>",
         )
+        self.assertEqual(
+            build_u1_t2i_plain_query(prompt="<image>", append_text="<img>"),
+            "<|im_start|>user\n<image><|im_end|>\n" "<|im_start|>assistant\n<img>",
+        )
 
     def test_u1_native_tokenizer_builds_t2i_prefill_with_image_marker(self):
         adapter = U1UGModelAdapter(native_tokenizer=FakeU1Tokenizer())
@@ -442,6 +542,92 @@ class TestU1UGBackendShell(unittest.TestCase):
             "native_t2i_prompt",
         )
 
+    def test_u1_native_tokenizer_builds_edit_prefill_with_image_context(self):
+        adapter = U1UGModelAdapter(native_tokenizer=FakeU1Tokenizer())
+        adapter.native_generation_mode = "edit"
+
+        prepared = adapter.prepare_srt_u_interleaved_inputs(
+            session=None,
+            messages=[
+                UGInterleavedMessage(
+                    type="image",
+                    content={
+                        "pixel_values": torch.zeros(4, 12),
+                        "grid_hw": torch.tensor([[4, 4]], dtype=torch.long),
+                    },
+                ),
+                UGInterleavedMessage(type="text", content="make it yellow"),
+            ],
+            state=UGSegmentState.U_PREFILL,
+        )
+
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(prepared[0].input_ids[-1], 151670)
+        self.assertIsNotNone(prepared[0].mm_inputs)
+        self.assertEqual(prepared[0].mm_inputs.mm_items[0].offsets, [(1, 4)])
+        self.assertEqual(
+            prepared[0].adapter_metadata["u1"]["source"],
+            "native_edit_prompt",
+        )
+        self.assertEqual(prepared[0].adapter_metadata["u1"]["g_position_start"], 4)
+
+    def test_u1_native_tokenizer_builds_edit_cfg_sidecars_when_enabled(self):
+        adapter = U1UGModelAdapter(native_tokenizer=FakeU1Tokenizer())
+        adapter.native_generation_mode = "edit"
+        adapter.include_edit_img_condition = True
+        adapter.include_edit_uncondition = True
+
+        prepared = adapter.prepare_srt_u_interleaved_inputs(
+            session=SimpleNamespace(handle=SimpleNamespace(session_id="s1")),
+            messages=[
+                UGInterleavedMessage(
+                    type="image",
+                    content={
+                        "pixel_values": torch.zeros(4, 12),
+                        "grid_hw": torch.tensor([[4, 4]], dtype=torch.long),
+                    },
+                ),
+                UGInterleavedMessage(type="text", content="make it yellow"),
+            ],
+            state=UGSegmentState.U_PREFILL,
+        )
+
+        self.assertEqual(len(prepared), 3)
+        self.assertEqual(prepared[0].srt_sidecar_role, U1_EDIT_IMG_CONDITION_ROLE)
+        self.assertEqual(
+            prepared[0].srt_sidecar_session_id,
+            "s1:u1_edit_img_condition",
+        )
+        self.assertIsNotNone(prepared[0].mm_inputs)
+        self.assertEqual(prepared[1].srt_sidecar_role, U1_EDIT_UNCONDITION_ROLE)
+        self.assertEqual(prepared[1].input_ids[-1], 151670)
+        self.assertEqual(
+            prepared[2].adapter_metadata["u1"]["source"],
+            "native_edit_prompt",
+        )
+
+    def test_u1_edit_cfg_builders_match_official_sidecar_shapes(self):
+        image = {
+            "pixel_values": torch.zeros(4, 12),
+            "grid_hw": torch.tensor([[4, 4]], dtype=torch.long),
+        }
+        messages = [UGInterleavedMessage(type="image", content=image)]
+
+        img_condition = build_u1_native_edit_img_condition_prepared_input(
+            tokenizer=FakeU1Tokenizer(),
+            messages=messages,
+            session=SimpleNamespace(handle=SimpleNamespace(session_id="s1")),
+        )
+        uncondition = build_u1_native_edit_uncondition_prepared_input(
+            tokenizer=FakeU1Tokenizer(),
+            session=SimpleNamespace(handle=SimpleNamespace(session_id="s1")),
+        )
+
+        self.assertEqual(img_condition.input_ids[-1], 151670)
+        self.assertEqual(img_condition.mm_inputs.mm_items[0].offsets, [(1, 4)])
+        self.assertEqual(uncondition.input_ids, [151670])
+        self.assertEqual(uncondition.srt_sidecar_role, U1_EDIT_UNCONDITION_ROLE)
+
     def test_u1_native_tokenizer_adds_t2i_cfg_sidecar_when_enabled(self):
         adapter = U1UGModelAdapter(native_tokenizer=FakeU1Tokenizer())
         adapter.include_t2i_cfg_uncondition = True
@@ -458,6 +644,203 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertEqual(
             prepared[1].adapter_metadata["u1"]["source"],
             "native_t2i_prompt",
+        )
+
+    def test_u1_native_interleave_prompt_waits_for_u_image_marker(self):
+        prepared = build_u1_native_interleave_prepared_input(
+            tokenizer=FakeInterleaveTokenizer(),
+            messages=[UGInterleavedMessage(type="text", content="draw a cup")],
+            session=SimpleNamespace(handle=SimpleNamespace(session_id="s1")),
+            think_mode=False,
+        )
+
+        self.assertIn(U1_INTERLEAVE_SYSTEM_MESSAGE, prepared.input_text)
+        self.assertIn("<think>\n\n</think>\n\n", prepared.input_text)
+        self.assertFalse(prepared.input_text.endswith("<img>"))
+        self.assertNotEqual(prepared.input_ids[-1], 151670)
+        self.assertEqual(
+            prepared.adapter_metadata["u1"]["source"],
+            "native_interleave_prompt",
+        )
+        self.assertTrue(
+            prepared.adapter_metadata["ug_model_state_updates"]["u1"][
+                "native_interleave_prompt"
+            ]
+        )
+
+    def test_u1_native_interleave_decode_returns_text_then_marker(self):
+        executor = SequentialFakeSRTDecodeExecutor([[2001], [151670]])
+        adapter = U1UGModelAdapter(native_tokenizer=FakeInterleaveTokenizer())
+        adapter.native_generation_mode = "interleave"
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+            tokenizer=FakeTokenizer(),
+            srt_u_decode_max_new_tokens=1,
+        )
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a cup")],
+            session_id="u1-native-interleave-decode",
+        )
+
+        text_segment = runtime.decode_next_segment(handle)
+        marker_segment = runtime.decode_next_segment(
+            runtime.get_debug_counters(handle)["session_id"]
+        )
+
+        counters = runtime.get_debug_counters(handle)
+        self.assertEqual(text_segment.type, "text")
+        self.assertEqual(text_segment.text, "piece-2001")
+        self.assertEqual(marker_segment.type, "image_marker")
+        self.assertEqual(counters["state"], "g_denoise")
+        self.assertEqual(counters["srt_u_decode_request_count"], 3)
+        self.assertTrue(counters["ug_model_state"]["u1"]["open_image_marker"])
+        self.assertGreater(counters["ug_model_state"]["u1"]["g_position_start"], 0)
+        self.assertEqual(len(executor.decode_position_ids), 2)
+        self.assertEqual(
+            executor.decode_position_ids[1],
+            executor.decode_position_ids[0] + 1,
+        )
+        decode_request_positions = executor.ug_position_ids_by_request[-3:-1]
+        for positions, decode_position in zip(
+            decode_request_positions, executor.decode_position_ids
+        ):
+            self.assertIsNotNone(positions)
+            self.assertEqual(positions[-1], decode_position)
+        committed_marker_positions = executor.ug_position_ids_by_request[-1]
+        self.assertIsNotNone(committed_marker_positions)
+        self.assertEqual(
+            committed_marker_positions[-1],
+            executor.decode_position_ids[-1],
+        )
+        self.assertEqual(
+            counters["ug_model_state"]["u1"]["g_position_start"],
+            executor.decode_position_ids[-1] + 1,
+        )
+
+    def test_u1_native_interleave_post_commit_decode_uses_logical_position(self):
+        executor = SequentialFakeSRTDecodeExecutor([[151670], [2002]])
+        adapter = U1UGModelAdapter(native_tokenizer=FakeInterleaveTokenizer())
+        adapter.native_generation_mode = "interleave"
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+            tokenizer=FakeTokenizer(),
+            srt_u_decode_max_new_tokens=1,
+        )
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a cup")],
+            session_id="u1-native-interleave-post-commit-decode",
+        )
+        marker = runtime.decode_next_segment(handle)
+        self.assertEqual(marker.type, "image_marker")
+        updated = runtime.append_generated_image(
+            runtime.get_debug_counters(handle)["session_id"],
+            image=Image.new("RGB", (32, 32), (12, 34, 56)),
+        )
+        position_after_commit = runtime.get_debug_counters(updated)["ug_model_state"][
+            "u1"
+        ]["g_position_start"]
+
+        text = runtime.decode_next_segment(updated)
+
+        counters = runtime.get_debug_counters(updated)
+        self.assertEqual(text.type, "text")
+        self.assertEqual(text.text, "piece-2002")
+        self.assertEqual(executor.decode_position_ids[-1], position_after_commit)
+        self.assertEqual(
+            executor.ug_position_ids_by_request[-1][-1],
+            position_after_commit,
+        )
+        self.assertEqual(
+            counters["ug_model_state"]["u1"]["g_position_start"],
+            position_after_commit + 1,
+        )
+
+    def test_u1_interleave_cfg_uses_text_uncondition_sidecar_role(self):
+        adapter = U1UGModelAdapter(native_tokenizer=FakeInterleaveTokenizer())
+        adapter.native_generation_mode = "interleave"
+        adapter.include_interleave_text_uncondition = True
+
+        prepared = adapter.prepare_srt_u_interleaved_inputs(
+            session=SimpleNamespace(handle=SimpleNamespace(session_id="s1")),
+            messages=[UGInterleavedMessage(type="text", content="draw a cup")],
+            state=UGSegmentState.U_PREFILL,
+        )
+
+        self.assertEqual(len(prepared), 2)
+        self.assertEqual(
+            prepared[0].srt_sidecar_role,
+            U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
+        )
+        self.assertEqual(
+            prepared[0].srt_sidecar_session_id,
+            "s1:u1_interleave_text_uncondition",
+        )
+        self.assertEqual(
+            prepared[1].adapter_metadata["u1"]["source"],
+            "native_interleave_prompt",
+        )
+        self.assertEqual(
+            prepared[0].adapter_metadata["ug_model_state_updates"]["u1"][
+                "g_position_start"
+            ],
+            prepared[0].adapter_metadata["u1"]["g_position_start"],
+        )
+
+    def test_u1_interleave_text_uncondition_marker_advances_sidecar_position(self):
+        prepared = build_u1_native_interleave_text_uncondition_marker_prepared_input(
+            tokenizer=FakeInterleaveTokenizer(),
+            session=SimpleNamespace(handle=SimpleNamespace(session_id="s1")),
+            logical_position=17,
+        )
+
+        self.assertEqual(prepared.input_ids, [151670])
+        self.assertEqual(prepared.position_ids, [[17, 0, 0]])
+        self.assertEqual(
+            prepared.srt_sidecar_session_id,
+            "s1:u1_interleave_text_uncondition",
+        )
+        self.assertEqual(prepared.adapter_metadata["u1"]["g_position_start"], 18)
+        self.assertTrue(
+            prepared.adapter_metadata["ug_model_state_updates"]["u1"][
+                "open_image_marker"
+            ]
+        )
+
+    def test_u1_native_interleave_decode_syncs_text_uncondition_marker(self):
+        executor = SequentialFakeSRTDecodeExecutor([[151670]])
+        adapter = U1UGModelAdapter(native_tokenizer=FakeInterleaveTokenizer())
+        adapter.native_generation_mode = "interleave"
+        adapter.include_interleave_text_uncondition = True
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+            tokenizer=FakeTokenizer(),
+            srt_u_decode_max_new_tokens=1,
+        )
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a cup")],
+            session_id="u1-native-interleave-sidecar-marker",
+        )
+
+        segment = runtime.decode_next_segment(handle)
+
+        counters = runtime.get_debug_counters(handle)
+        sidecar_id = (
+            f"u1-native-interleave-sidecar-marker:"
+            f"{U1_INTERLEAVE_TEXT_UNCONDITION_ROLE}"
+        )
+        sidecar_state = counters["srt_sidecar_ug_model_state"][sidecar_id]["u1"]
+        self.assertEqual(segment.type, "image_marker")
+        self.assertEqual(counters["srt_sidecar_request_count"], 2)
+        self.assertTrue(sidecar_state["open_image_marker"])
+        self.assertEqual(
+            sidecar_state["last_source"],
+            "native_interleave_text_uncondition_image_marker",
         )
 
     def test_u1_bridge_native_vlm_prefill_uses_model_pad_once(self):
@@ -576,6 +959,71 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertTrue(metadata["native_generated_image_commit"])
         self.assertTrue(metadata["omit_image_start"])
 
+    def test_u1_native_generated_image_commit_uses_logical_position_state(self):
+        session = SimpleNamespace(
+            handle=SimpleNamespace(
+                session_id="u1-native-logical-commit",
+                context_length=999,
+            ),
+            metadata={
+                "ug_model_state": {
+                    "u1": {
+                        "open_image_marker": True,
+                        "g_position_start": 236,
+                        "segments": [],
+                    }
+                }
+            },
+        )
+
+        prepared = build_u1_native_generated_image_commit_prepared_input(
+            tokenizer=FakeU1Tokenizer(),
+            image=Image.new("RGB", (32, 32), (12, 34, 56)),
+            session=session,
+            patch_size=16,
+            downsample_ratio=0.5,
+        )
+
+        self.assertEqual(prepared.input_ids, [151669, 151671])
+        self.assertEqual(prepared.position_ids, [[236, 0, 0], [237, 0, 0]])
+        self.assertEqual(
+            prepared.adapter_metadata["ug_model_state_updates"]["u1"][
+                "g_position_start"
+            ],
+            238,
+        )
+
+    def test_u1_native_generated_image_commit_accepts_precomputed_embeddings(self):
+        embeddings = torch.arange(8, dtype=torch.float32).view(1, 8)
+
+        prepared = build_u1_native_generated_image_commit_prepared_input(
+            tokenizer=FakeU1Tokenizer(),
+            image={
+                "precomputed_embeddings": embeddings,
+                "grid_hw": [[2, 2]],
+            },
+            patch_size=16,
+            downsample_ratio=0.5,
+        )
+
+        item = prepared.mm_inputs.mm_items[0]
+        self.assertIsNone(item.feature)
+        self.assertEqual(item.offsets, [(1, 1)])
+        torch.testing.assert_close(item.precomputed_embeddings, embeddings)
+        self.assertEqual(prepared.input_ids, [151670, 151669, 151671])
+
+    def test_u1_native_generated_image_commit_rejects_bad_precomputed_length(self):
+        with self.assertRaisesRegex(ValueError, "precomputed embedding length"):
+            build_u1_native_generated_image_commit_prepared_input(
+                tokenizer=FakeU1Tokenizer(),
+                image={
+                    "precomputed_embeddings": torch.zeros(2, 8),
+                    "grid_hw": [[2, 2]],
+                },
+                patch_size=16,
+                downsample_ratio=0.5,
+            )
+
     def test_u1_generated_image_commit_tensor_preprocesses_without_resize(self):
         tensor = torch.zeros(1, 3, 32, 32)
 
@@ -586,6 +1034,63 @@ class TestU1UGBackendShell(unittest.TestCase):
 
         self.assertEqual(tuple(pixel_values.shape), (4, 768))
         self.assertEqual(grid_hw.tolist(), [[2, 2]])
+
+    def test_u1_generated_image_commit_marks_raw_prediction_range(self):
+        tensor = torch.zeros(1, 3, 32, 32)
+
+        pixel_values, grid_hw = load_u1_generated_image_for_commit(
+            {"pixel_values": tensor, "value_range": "minus_one_to_one"},
+            patch_size=16,
+        )
+        plain_pixel_values, _ = load_u1_generated_image_for_commit(
+            tensor,
+            patch_size=16,
+        )
+
+        self.assertEqual(tuple(pixel_values.shape), (4, 768))
+        self.assertEqual(grid_hw.tolist(), [[2, 2]])
+        self.assertGreater(float(pixel_values[0, 0]), 0.0)
+        self.assertLess(float(plain_pixel_values[0, 0]), 0.0)
+
+    def test_u1_generated_image_commit_tensor_matches_official_bf16_preprocess(self):
+        tensor = torch.linspace(-0.75, 0.75, steps=3 * 16 * 16).view(1, 3, 16, 16)
+
+        pixel_values, grid_hw = load_u1_generated_image_for_commit(
+            {"pixel_values": tensor, "value_range": "minus_one_to_one"},
+            patch_size=16,
+        )
+
+        pred_img = tensor[0].unsqueeze(0).to(torch.bfloat16)
+        raw_img = pred_img * 0.5 + 0.5
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=raw_img.dtype).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=raw_img.dtype).view(1, 3, 1, 1)
+        und_img = (raw_img - mean) / std
+        expected = (
+            und_img[0]
+            .view(3, 1, 16, 1, 16)
+            .permute(1, 3, 0, 2, 4)
+            .reshape(1, 3 * 16**2)
+            .to(torch.float32)
+        )
+
+        self.assertEqual(grid_hw.tolist(), [[1, 1]])
+        torch.testing.assert_close(pixel_values, expected, rtol=0, atol=0)
+
+    def test_u1_interleave_reuses_session_rng_across_images(self):
+        metadata = {}
+        device = torch.device("cpu")
+
+        generator = _u1_session_torch_generator(metadata, seed=42, device=device)
+        first = torch.randn((4,), generator=generator)
+        reused = _u1_session_torch_generator(metadata, seed=42, device=device)
+        second = torch.randn((4,), generator=reused)
+
+        official_like = torch.Generator(device=device).manual_seed(42)
+        expected_first = torch.randn((4,), generator=official_like)
+        expected_second = torch.randn((4,), generator=official_like)
+        self.assertIs(generator, reused)
+        self.assertTrue(torch.equal(first, expected_first))
+        self.assertTrue(torch.equal(second, expected_second))
 
     def test_u1_runtime_prefill_records_u_context_state_without_kv_details(self):
         adapter = U1UGModelAdapter()
@@ -666,6 +1171,64 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertEqual(u1_state["last_source"], "native_generated_image_commit")
         self.assertTrue(u1_state["native_generated_image_commit"])
         self.assertIsNotNone(executor.mrope_positions_by_request[-1])
+
+    def test_u1_interleave_commit_syncs_text_uncondition_sidecar(self):
+        executor = SequentialFakeSRTDecodeExecutor([[151670]])
+        adapter = U1UGModelAdapter(native_tokenizer=FakeInterleaveTokenizer())
+        adapter.native_generation_mode = "interleave"
+        adapter.include_interleave_text_uncondition = True
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+            tokenizer=FakeTokenizer(),
+            srt_u_decode_max_new_tokens=1,
+        )
+        bridge = _load_u1_bridge(runtime)
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a cup")],
+            session_id="u1-native-interleave-sidecar-commit",
+        )
+        runtime.decode_next_segment(handle)
+
+        raw_commit_image = {
+            "pixel_values": torch.zeros(1, 3, 32, 32),
+            "value_range": "minus_one_to_one",
+        }
+        captured_commit_images = []
+        original_commit_builder = build_u1_native_generated_image_commit_prepared_input
+
+        def capture_commit_image(**kwargs):
+            captured_commit_images.append(kwargs["image"])
+            return original_commit_builder(**kwargs)
+
+        with patch(
+            "sglang.srt.ug.u1." "build_u1_native_generated_image_commit_prepared_input",
+            side_effect=capture_commit_image,
+        ):
+            bridge.commit_generated_segment(
+                contexts=_make_contexts(session=handle),
+                segment=UGGSegmentResult(
+                    type="image",
+                    image=Image.new("RGB", (32, 32), (12, 34, 56)),
+                    commit_image=raw_commit_image,
+                ),
+            )
+
+        counters = runtime.get_debug_counters("u1-native-interleave-sidecar-commit")
+        sidecar_id = (
+            f"u1-native-interleave-sidecar-commit:"
+            f"{U1_INTERLEAVE_TEXT_UNCONDITION_ROLE}"
+        )
+        sidecar_state = counters["srt_sidecar_ug_model_state"][sidecar_id]["u1"]
+        self.assertEqual(counters["append_image_count"], 1)
+        self.assertEqual(counters["srt_sidecar_request_count"], 3)
+        self.assertFalse(sidecar_state["open_image_marker"])
+        self.assertEqual(sidecar_state["last_source"], "native_generated_image_commit")
+        self.assertTrue(sidecar_state["native_generated_image_commit"])
+        self.assertGreaterEqual(len(captured_commit_images), 2)
+        self.assertIs(captured_commit_images[0], raw_commit_image)
+        self.assertIs(captured_commit_images[-1], raw_commit_image)
 
     def test_u1_post_image_decode_uses_srt_after_native_commit(self):
         executor = FakePadAndDecodeExecutor([910])
@@ -920,7 +1483,8 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertTrue(result.metadata["native_srt_pixel_flow"])
         self.assertEqual(result.image.size, (8, 8))
         self.assertEqual(len(srt_executor.native_calls), 1)
-        self.assertIsNone(srt_executor.native_calls[0]["cfg_token_count"])
+        self.assertIsNone(srt_executor.native_calls[0]["cfg_img_condition_token_count"])
+        self.assertIsNone(srt_executor.native_calls[0]["cfg_uncondition_token_count"])
 
     def test_u1_native_srt_pixel_flow_passes_text_cfg_sidecar_binding(self):
         srt_executor = FakeNativePixelFlowSRTExecutor()
@@ -948,7 +1512,43 @@ class TestU1UGBackendShell(unittest.TestCase):
         )
 
         self.assertEqual(len(srt_executor.native_calls), 1)
-        self.assertEqual(srt_executor.native_calls[0]["cfg_token_count"], 4)
+        self.assertEqual(
+            srt_executor.native_calls[0]["cfg_img_condition_token_count"], 4
+        )
+        self.assertIsNone(srt_executor.native_calls[0]["cfg_uncondition_token_count"])
+
+    def test_u1_native_srt_interleave_uses_interleave_cfg_sidecar_binding(self):
+        srt_executor = FakeNativePixelFlowSRTExecutor()
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(U1UGModelAdapter()),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=srt_executor,
+        )
+        bridge = _load_u1_bridge(runtime)
+        sampling_params = _sampling(
+            height=8,
+            width=8,
+            num_inference_steps=2,
+            cfg_text_scale=4.0,
+        )
+        setattr(sampling_params, "ug_generation_mode", "interleave")
+        batch = Req(sampling_params=sampling_params, seed=3)
+
+        U1PixelFlowGSegmentExecutor()(
+            bridge=bridge,
+            contexts=_make_contexts(),
+            batch=batch,
+            server_args=_make_ug_server_args(),
+        )
+
+        self.assertIn(
+            f"u1-test-session:{U1_INTERLEAVE_TEXT_UNCONDITION_ROLE}",
+            srt_executor.requested_session_ids,
+        )
+        self.assertNotIn(
+            f"u1-test-session:{U1_T2I_CFG_UNCONDITION_ROLE}",
+            srt_executor.requested_session_ids,
+        )
 
 
 class PixelFlowBridge:
@@ -1028,12 +1628,41 @@ class FakeSRTDecodeExecutor:
     def __init__(self, output_ids):
         self.output_ids = list(output_ids)
         self.requests = []
+        self.decode_position_ids = []
+        self.ug_position_ids_by_request = []
 
     def execute_ug_request(self, *, record, req, state):
         del record, state
         self.requests.append(req.rid)
+        self.ug_position_ids_by_request.append(
+            list(req.ug_position_ids) if hasattr(req, "ug_position_ids") else None
+        )
+        if hasattr(req, "ug_decode_position_id"):
+            self.decode_position_ids.append(req.ug_decode_position_id)
         if req.sampling_params.max_new_tokens > 0:
             req.output_ids = self.output_ids[: req.sampling_params.max_new_tokens]
+
+
+class SequentialFakeSRTDecodeExecutor(FakeSRTDecodeExecutor):
+    def __init__(self, output_id_batches):
+        super().__init__([])
+        self.output_id_batches = [list(batch) for batch in output_id_batches]
+
+    def execute_ug_request(self, *, record, req, state):
+        del record, state
+        self.requests.append(req.rid)
+        self.ug_position_ids_by_request.append(
+            list(req.ug_position_ids) if hasattr(req, "ug_position_ids") else None
+        )
+        if hasattr(req, "ug_decode_position_id"):
+            self.decode_position_ids.append(req.ug_decode_position_id)
+        if req.sampling_params.max_new_tokens > 0:
+            if not self.output_id_batches:
+                req.output_ids = []
+            else:
+                req.output_ids = self.output_id_batches.pop(0)[
+                    : req.sampling_params.max_new_tokens
+                ]
 
 
 class FakePadAndDecodeExecutor(FakeSRTDecodeExecutor):
@@ -1092,6 +1721,26 @@ class FakeU1Tokenizer:
         return {"input_ids": torch.tensor([ids], dtype=torch.long)}
 
 
+class FakeInterleaveTokenizer(FakeU1Tokenizer):
+    eos_token_id = 151672
+
+    def __call__(self, text, return_tensors=None, add_special_tokens=None):
+        tokenized = super().__call__(text, return_tensors=return_tensors)
+        ids = tokenized["input_ids"][0].tolist()
+        if not ids:
+            ids = [2000 + (index % 11) for index, char in enumerate(text) if char]
+        return {"input_ids": torch.tensor([ids], dtype=torch.long)}
+
+    def convert_tokens_to_ids(self, token):
+        if token == "<|im_end|>":
+            return self.eos_token_id
+        return super().convert_tokens_to_ids(token)
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        del skip_special_tokens
+        return " ".join(f"piece-{int(token_id)}" for token_id in token_ids)
+
+
 class FakeScheduler:
     def __init__(self):
         self.session_controller = SessionController(FakeTreeCache())
@@ -1111,11 +1760,13 @@ class FakeModelConfig:
 class FakeNativePixelFlowSRTExecutor:
     def __init__(self):
         self.native_calls = []
+        self.requested_session_ids = []
 
     def create_u1_native_srt_pixel_flow_executor(self):
         return FakeNativePixelFlowExecutor(self)
 
     def get_latest_ug_session_token_binding(self, session_id):
+        self.requested_session_ids.append(session_id)
         return SimpleNamespace(
             session_id=session_id,
             request_id=f"{session_id}:u1",
@@ -1135,6 +1786,7 @@ class FakeNativePixelFlowExecutor:
         batch,
         server_args,
         srt_kv_token_binding,
+        cfg_img_condition_srt_kv_token_binding=None,
         cfg_uncondition_srt_kv_token_binding=None,
     ):
         del server_args
@@ -1143,7 +1795,12 @@ class FakeNativePixelFlowExecutor:
                 "session_id": contexts.full.session.session_id,
                 "seed": batch.seed,
                 "token_count": srt_kv_token_binding.token_count,
-                "cfg_token_count": (
+                "cfg_img_condition_token_count": (
+                    cfg_img_condition_srt_kv_token_binding.token_count
+                    if cfg_img_condition_srt_kv_token_binding is not None
+                    else None
+                ),
+                "cfg_uncondition_token_count": (
                     cfg_uncondition_srt_kv_token_binding.token_count
                     if cfg_uncondition_srt_kv_token_binding is not None
                     else None

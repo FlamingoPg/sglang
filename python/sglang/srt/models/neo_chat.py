@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.neo_chat import NEOChatConfig
@@ -18,7 +19,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
@@ -53,9 +53,7 @@ def precompute_rope_freqs_sincos(
     base: float = 10000.0,
     device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    inv_freq = 1.0 / (
-        base ** (torch.arange(0, dim, 2, device=device).float() / dim)
-    )
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
     positions = torch.arange(max_position, device=device).type_as(inv_freq)
     freqs = torch.outer(positions, inv_freq)
     return torch.cos(freqs), torch.sin(freqs)
@@ -185,6 +183,96 @@ class U1TimestepEmbedder(nn.Module):
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         return self.mlp(t_freq.to(dtype=self.mlp[0].weight.dtype))
+
+
+class U1Qwen3RMSNorm(nn.Module):
+    """Qwen3 RMSNorm with the same cast order as SenseNova-U1 reference."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is not None:
+            hidden_states = hidden_states + residual
+            if post_residual_addition is not None:
+                hidden_states = hidden_states + post_residual_addition
+            residual = hidden_states
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
+        if residual is not None:
+            return hidden_states, residual
+        return hidden_states
+
+
+class U1Qwen3RotaryEmbedding(nn.Module):
+    """U1 Qwen3 RoPE computed with the reference forward-time semantics."""
+
+    def __init__(
+        self,
+        rotary_dim: int,
+        *,
+        max_position_embeddings: int,
+        base: float,
+    ) -> None:
+        super().__init__()
+        self.rotary_dim = int(rotary_dim)
+        self.max_position_embeddings = int(max_position_embeddings)
+        self.base = float(base)
+        inv_freq = 1.0 / (
+            self.base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
+                / self.rotary_dim
+            )
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if position_ids.ndim == 1:
+            position_ids = position_ids.unsqueeze(0)
+        inv_freq = self.inv_freq[None, :, None].float().to(x.device)
+        position_ids = position_ids[:, None, :].float().to(x.device)
+        device_type = x.device.type if x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq @ position_ids).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+def _u1_rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_u1_qwen3_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.squeeze(0).unsqueeze(1)
+    sin = sin.squeeze(0).unsqueeze(1)
+    q_embed = (q * cos) + (_u1_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_u1_rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 class U1ConvDecoder(nn.Module):
@@ -354,7 +442,9 @@ class NEOVisionEmbeddings(nn.Module):
     def device(self) -> torch.device:
         return self.patch_embedding.weight.device
 
-    def forward(self, pixel_values: torch.Tensor, grid_hw: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pixel_values: torch.Tensor, grid_hw: torch.Tensor
+    ) -> torch.Tensor:
         if pixel_values.ndim != 2:
             raise ValueError(
                 "U1 native vision expects flattened patch pixels with shape "
@@ -470,9 +560,10 @@ class NEOQwen3Attention(nn.Module):
         self.hidden_size = int(config.hidden_size)
         self.total_num_heads = int(config.num_attention_heads)
         self.total_num_kv_heads = int(config.num_key_value_heads)
-        self.head_dim = int(getattr(config, "head_dim", None) or (
-            self.hidden_size // self.total_num_heads
-        ))
+        self.head_dim = int(
+            getattr(config, "head_dim", None)
+            or (self.hidden_size // self.total_num_heads)
+        )
         if self.head_dim % 4 != 0:
             raise ValueError(f"U1 head_dim must be divisible by 4, got {self.head_dim}")
         self.t_head_dim = self.head_dim // 2
@@ -533,28 +624,28 @@ class NEOQwen3Attention(nn.Module):
             prefix=add_prefix("o_proj_mot_gen", prefix),
         )
 
-        self.q_norm = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
-        self.q_norm_hw = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
-        self.k_norm_hw = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
-        self.q_norm_mot_gen = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
-        self.k_norm_mot_gen = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
-        self.q_norm_hw_mot_gen = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
-        self.k_norm_hw_mot_gen = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
-
-        self.rotary_emb = get_rope(
-            self.t_head_dim,
-            rotary_dim=self.t_head_dim,
-            max_position=getattr(config, "max_position_embeddings", 32768),
-            base=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+        self.q_norm = U1Qwen3RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
+        self.k_norm = U1Qwen3RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
+        self.q_norm_hw = U1Qwen3RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
+        self.k_norm_hw = U1Qwen3RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
+        self.q_norm_mot_gen = U1Qwen3RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
+        self.k_norm_mot_gen = U1Qwen3RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
+        self.q_norm_hw_mot_gen = U1Qwen3RMSNorm(
+            self.hw_head_dim, eps=config.rms_norm_eps
         )
-        self.rotary_emb_hw = get_rope(
+        self.k_norm_hw_mot_gen = U1Qwen3RMSNorm(
+            self.hw_head_dim, eps=config.rms_norm_eps
+        )
+
+        self.rotary_emb = U1Qwen3RotaryEmbedding(
+            self.t_head_dim,
+            max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
+            base=getattr(config, "rope_theta", 1000000),
+        )
+        self.rotary_emb_hw = U1Qwen3RotaryEmbedding(
             self.spatial_head_dim,
-            rotary_dim=self.spatial_head_dim,
-            max_position=getattr(config, "max_position_embeddings_hw", 4096),
+            max_position_embeddings=getattr(config, "max_position_embeddings_hw", 4096),
             base=getattr(config, "rope_theta_hw", 10000.0),
-            rope_scaling=None,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -574,7 +665,10 @@ class NEOQwen3Attention(nn.Module):
         if positions.ndim != 2 or positions.shape[0] != 3:
             positions = _u1_text_only_thw_positions(positions)
 
-        qkv, _ = self.qkv_proj(hidden_states)
+        projected_qkv = self._reference_u_qkv(hidden_states, forward_batch)
+        qkv = None
+        if projected_qkv is None:
+            qkv, _ = self.qkv_proj(hidden_states)
         output_proj = self.o_proj
         q_norm = self.q_norm
         k_norm = self.k_norm
@@ -585,6 +679,7 @@ class NEOQwen3Attention(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             qkv=qkv,
+            projected_qkv=projected_qkv,
             output_proj=output_proj,
             q_norm=q_norm,
             k_norm=k_norm,
@@ -620,23 +715,76 @@ class NEOQwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        qkv: torch.Tensor,
+        qkv: torch.Tensor | None,
+        projected_qkv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         output_proj: RowParallelLinear,
         q_norm: RMSNorm,
         k_norm: RMSNorm,
         q_norm_hw: RMSNorm,
         k_norm_hw: RMSNorm,
     ) -> torch.Tensor:
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if projected_qkv is None:
+            assert qkv is not None
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            q, k, v = projected_qkv
+        _record_u1_u_sublayer_state(forward_batch, "attn_q_proj", q)
+        _record_u1_u_sublayer_state(forward_batch, "attn_k_proj", k)
+        _record_u1_u_sublayer_state(forward_batch, "attn_v_proj", v)
+        _record_u1_g_sublayer_state(forward_batch, "attn_q_proj", q)
+        _record_u1_g_sublayer_state(forward_batch, "attn_k_proj", k)
+        _record_u1_g_sublayer_state(forward_batch, "attn_v_proj", v)
 
         q = self._split_u1_heads(q, self.num_heads, q_norm, q_norm_hw)
         k = self._split_u1_heads(k, self.num_kv_heads, k_norm, k_norm_hw)
         q_t, q_h, q_w = q
         k_t, k_h, k_w = k
+        _record_u1_u_sublayer_state(forward_batch, "attn_q_norm_t", q_t)
+        _record_u1_u_sublayer_state(forward_batch, "attn_q_norm_h", q_h)
+        _record_u1_u_sublayer_state(forward_batch, "attn_q_norm_w", q_w)
+        _record_u1_u_sublayer_state(forward_batch, "attn_k_norm_t", k_t)
+        _record_u1_u_sublayer_state(forward_batch, "attn_k_norm_h", k_h)
+        _record_u1_u_sublayer_state(forward_batch, "attn_k_norm_w", k_w)
+        _record_u1_g_sublayer_state(forward_batch, "attn_q_norm_t", q_t)
+        _record_u1_g_sublayer_state(forward_batch, "attn_q_norm_h", q_h)
+        _record_u1_g_sublayer_state(forward_batch, "attn_q_norm_w", q_w)
+        _record_u1_g_sublayer_state(forward_batch, "attn_k_norm_t", k_t)
+        _record_u1_g_sublayer_state(forward_batch, "attn_k_norm_h", k_h)
+        _record_u1_g_sublayer_state(forward_batch, "attn_k_norm_w", k_w)
 
-        q_t, k_t = self.rotary_emb(positions[0], q_t, k_t)
-        q_h, k_h = self.rotary_emb_hw(positions[1], q_h, k_h)
-        q_w, k_w = self.rotary_emb_hw(positions[2], q_w, k_w)
+        q_t, k_t = self._apply_rotary(
+            self.rotary_emb,
+            positions[0],
+            q_t,
+            k_t,
+            self.t_head_dim,
+        )
+        q_h, k_h = self._apply_rotary(
+            self.rotary_emb_hw,
+            positions[1],
+            q_h,
+            k_h,
+            self.spatial_head_dim,
+        )
+        q_w, k_w = self._apply_rotary(
+            self.rotary_emb_hw,
+            positions[2],
+            q_w,
+            k_w,
+            self.spatial_head_dim,
+        )
+        _record_u1_u_sublayer_state(forward_batch, "attn_q_rope_t", q_t)
+        _record_u1_u_sublayer_state(forward_batch, "attn_q_rope_h", q_h)
+        _record_u1_u_sublayer_state(forward_batch, "attn_q_rope_w", q_w)
+        _record_u1_u_sublayer_state(forward_batch, "attn_k_rope_t", k_t)
+        _record_u1_u_sublayer_state(forward_batch, "attn_k_rope_h", k_h)
+        _record_u1_u_sublayer_state(forward_batch, "attn_k_rope_w", k_w)
+        _record_u1_g_sublayer_state(forward_batch, "attn_q_rope_t", q_t)
+        _record_u1_g_sublayer_state(forward_batch, "attn_q_rope_h", q_h)
+        _record_u1_g_sublayer_state(forward_batch, "attn_q_rope_w", q_w)
+        _record_u1_g_sublayer_state(forward_batch, "attn_k_rope_t", k_t)
+        _record_u1_g_sublayer_state(forward_batch, "attn_k_rope_h", k_h)
+        _record_u1_g_sublayer_state(forward_batch, "attn_k_rope_w", k_w)
 
         num_tokens = hidden_states.shape[0]
         q = torch.cat(
@@ -655,10 +803,38 @@ class NEOQwen3Attention(nn.Module):
             ],
             dim=-1,
         ).reshape(num_tokens, self.kv_size)
+        _record_u1_u_sublayer_state(forward_batch, "attn_q_ready", q)
+        _record_u1_u_sublayer_state(forward_batch, "attn_k_ready", k)
+        _record_u1_u_sublayer_state(forward_batch, "attn_v_ready", v)
+        _record_u1_g_sublayer_state(forward_batch, "attn_q_ready", q)
+        _record_u1_g_sublayer_state(forward_batch, "attn_k_ready", k)
+        _record_u1_g_sublayer_state(forward_batch, "attn_v_ready", v)
 
         attn_output = self.attn(q, k, v, forward_batch)
+        _record_u1_u_sublayer_state(forward_batch, "attn_context", attn_output)
+        _record_u1_g_sublayer_state(forward_batch, "attn_context", attn_output)
         output, _ = output_proj(attn_output)
+        _record_u1_u_sublayer_state(forward_batch, "attn_o_proj_out", output)
+        _record_u1_g_sublayer_state(forward_batch, "attn_o_proj_out", output)
         return output
+
+    def _apply_rotary(
+        self,
+        rotary_emb: U1Qwen3RotaryEmbedding,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = q.shape[0]
+        q = q.view(num_tokens, self.num_heads, head_dim)
+        k = k.view(num_tokens, self.num_kv_heads, head_dim)
+        cos, sin = rotary_emb(q, positions.unsqueeze(0))
+        q, k = _apply_u1_qwen3_rotary_pos_emb(q, k, cos, sin)
+        return (
+            q.reshape(num_tokens, self.num_heads * head_dim),
+            k.reshape(num_tokens, self.num_kv_heads * head_dim),
+        )
 
     def _split_u1_heads(
         self,
@@ -678,6 +854,100 @@ class NEOQwen3Attention(nn.Module):
             x_h.reshape(num_tokens, num_heads * self.spatial_head_dim),
             x_w.reshape(num_tokens, num_heads * self.spatial_head_dim),
         )
+
+    def _reference_u_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        metadata = getattr(forward_batch, "ug_u_forward_metadata", None)
+        if not metadata:
+            return None
+        has_u1_metadata = any(
+            isinstance(item, dict)
+            and isinstance(item.get("adapter_metadata"), dict)
+            and "u1" in item["adapter_metadata"]
+            for item in metadata
+        )
+        if not has_u1_metadata:
+            return None
+
+        qkv_proj = self.qkv_proj
+        qkv_weight = getattr(qkv_proj, "weight", None)
+        if qkv_weight is None or getattr(qkv_proj, "tp_size", 1) != 1:
+            return None
+        q_weight, k_weight, v_weight = qkv_weight.split(
+            [self.q_size, self.kv_size, self.kv_size],
+            dim=0,
+        )
+        qkv_bias = getattr(qkv_proj, "bias", None)
+        q_bias = k_bias = v_bias = None
+        if qkv_bias is not None:
+            q_bias, k_bias, v_bias = qkv_bias.split(
+                [self.q_size, self.kv_size, self.kv_size],
+                dim=0,
+            )
+        return (
+            F.linear(hidden_states, q_weight, q_bias),
+            F.linear(hidden_states, k_weight, k_bias),
+            F.linear(hidden_states, v_weight, v_bias),
+        )
+
+
+def _record_u1_g_sublayer_state(
+    forward_batch: ForwardBatch,
+    name: str,
+    hidden_states: torch.Tensor,
+) -> None:
+    if not _capture_u1_g_sublayer_state(forward_batch):
+        return
+    records = getattr(forward_batch, "ug_debug_g_sublayer_states", None)
+    if records is None:
+        return
+    layer_index = getattr(forward_batch, "ug_debug_current_g_layer", None)
+    records.append(
+        {
+            "layer": int(layer_index),
+            "name": name,
+            "hidden_states": hidden_states,
+        }
+    )
+
+
+def _capture_u1_g_sublayer_state(forward_batch: ForwardBatch) -> bool:
+    layer_index = getattr(forward_batch, "ug_debug_current_g_layer", None)
+    capture_layers = getattr(forward_batch, "ug_debug_capture_g_sublayers", ())
+    if layer_index is None or int(layer_index) not in capture_layers:
+        return False
+    return getattr(forward_batch, "ug_debug_g_sublayer_states", None) is not None
+
+
+def _record_u1_u_sublayer_state(
+    forward_batch: ForwardBatch,
+    name: str,
+    hidden_states: torch.Tensor,
+) -> None:
+    if not _capture_u1_u_sublayer_state(forward_batch):
+        return
+    records = getattr(forward_batch, "ug_debug_u_sublayer_states", None)
+    if records is None:
+        return
+    layer_index = getattr(forward_batch, "ug_debug_current_u_layer", None)
+    records.append(
+        {
+            "layer": int(layer_index),
+            "name": name,
+            "hidden_states": hidden_states,
+        }
+    )
+
+
+def _capture_u1_u_sublayer_state(forward_batch: ForwardBatch) -> bool:
+    layer_index = getattr(forward_batch, "ug_debug_current_u_layer", None)
+    capture_layers = getattr(forward_batch, "ug_debug_capture_u_sublayers", ())
+    if layer_index is None or int(layer_index) not in capture_layers:
+        return False
+    return getattr(forward_batch, "ug_debug_u_sublayer_states", None) is not None
 
 
 class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
@@ -709,11 +979,19 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
             quant_config=quant_config,
             prefix=add_prefix("mlp_mot_gen", prefix),
         )
-        self.input_layernorm_mot_gen = RMSNorm(
+        self.input_layernorm_mot_gen = U1Qwen3RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )
-        self.post_attention_layernorm_mot_gen = RMSNorm(
+        self.post_attention_layernorm_mot_gen = U1Qwen3RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        self.input_layernorm = U1Qwen3RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        self.post_attention_layernorm = U1Qwen3RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )
@@ -734,21 +1012,78 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
         if post_residual_addition is not None:
             hidden_states = hidden_states + post_residual_addition
 
+        _record_u1_u_sublayer_state(forward_batch, "layer_input", hidden_states)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        _record_u1_u_sublayer_state(forward_batch, "input_norm", hidden_states)
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            _record_u1_u_sublayer_state(forward_batch, "attn_out", hidden_states)
 
         hidden_states = residual + hidden_states
+        _record_u1_u_sublayer_state(
+            forward_batch,
+            "post_attn_residual",
+            hidden_states,
+        )
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        _record_u1_u_sublayer_state(forward_batch, "post_attn_norm", hidden_states)
+        if self._use_reference_u_mlp_path(forward_batch):
+            hidden_states = self._forward_reference_u_mlp(
+                hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
+        _record_u1_u_sublayer_state(forward_batch, "mlp_out", hidden_states)
         hidden_states = residual + hidden_states
+        _record_u1_u_sublayer_state(forward_batch, "layer_out", hidden_states)
         return hidden_states, None
+
+    @staticmethod
+    def _use_reference_u_mlp_path(forward_batch: ForwardBatch) -> bool:
+        return getattr(forward_batch, "ug_u_forward_metadata", None) is not None
+
+    def _forward_reference_u_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        gate_up_proj = self.mlp.gate_up_proj
+        gate_up_weight = getattr(gate_up_proj, "weight", None)
+        if gate_up_weight is None:
+            return self.mlp(hidden_states)
+        if getattr(gate_up_proj, "tp_size", 1) != 1:
+            return self.mlp(hidden_states)
+
+        split_size = gate_up_weight.shape[0] // 2
+        gate_weight, up_weight = gate_up_weight.split([split_size, split_size], dim=0)
+        gate_up_bias = getattr(gate_up_proj, "bias", None)
+        gate_bias = up_bias = None
+        if gate_up_bias is not None:
+            gate_bias, up_bias = gate_up_bias.split([split_size, split_size], dim=0)
+
+        gate = F.linear(hidden_states, gate_weight, gate_bias)
+        up = F.linear(hidden_states, up_weight, up_bias)
+        _record_u1_u_sublayer_state(forward_batch, "mlp_gate", gate)
+        _record_u1_u_sublayer_state(forward_batch, "mlp_up", up)
+        _record_u1_u_sublayer_state(forward_batch, "mlp_act", F.silu(gate))
+        hidden_states = F.silu(gate) * up
+        _record_u1_u_sublayer_state(forward_batch, "mlp_act_mul", hidden_states)
+
+        down_proj = self.mlp.down_proj
+        down_weight = getattr(down_proj, "weight", None)
+        if down_weight is None or getattr(down_proj, "tp_size", 1) != 1:
+            hidden_states, _ = down_proj(hidden_states)
+            return hidden_states
+        down_bias = getattr(down_proj, "bias", None)
+        return F.linear(hidden_states, down_weight, down_bias)
 
     def forward_gen(
         self,
@@ -757,11 +1092,13 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        _record_u1_g_sublayer_state(forward_batch, "layer_input", hidden_states)
         if residual is not None:
             hidden_states = hidden_states + residual
 
         residual = hidden_states
         hidden_states = self.input_layernorm_mot_gen(hidden_states)
+        _record_u1_g_sublayer_state(forward_batch, "input_norm", hidden_states)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn.forward_gen(
@@ -769,13 +1106,61 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            _record_u1_g_sublayer_state(forward_batch, "attn_out", hidden_states)
 
         hidden_states = residual + hidden_states
+        _record_u1_g_sublayer_state(
+            forward_batch,
+            "post_attn_residual",
+            hidden_states,
+        )
         residual = hidden_states
         hidden_states = self.post_attention_layernorm_mot_gen(hidden_states)
-        hidden_states = self.mlp_mot_gen(hidden_states)
+        _record_u1_g_sublayer_state(forward_batch, "post_attn_norm", hidden_states)
+        hidden_states = self._forward_reference_g_mlp(
+            hidden_states,
+            forward_batch=forward_batch,
+        )
+        _record_u1_g_sublayer_state(forward_batch, "mlp_out", hidden_states)
         hidden_states = residual + hidden_states
+        _record_u1_g_sublayer_state(forward_batch, "layer_out", hidden_states)
         return hidden_states, None
+
+    def _forward_reference_g_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        gate_up_proj = self.mlp_mot_gen.gate_up_proj
+        gate_up_weight = getattr(gate_up_proj, "weight", None)
+        if gate_up_weight is None:
+            return self.mlp_mot_gen(hidden_states)
+        if getattr(gate_up_proj, "tp_size", 1) != 1:
+            return self.mlp_mot_gen(hidden_states)
+
+        split_size = gate_up_weight.shape[0] // 2
+        gate_weight, up_weight = gate_up_weight.split([split_size, split_size], dim=0)
+        gate_up_bias = getattr(gate_up_proj, "bias", None)
+        gate_bias = up_bias = None
+        if gate_up_bias is not None:
+            gate_bias, up_bias = gate_up_bias.split([split_size, split_size], dim=0)
+
+        gate = F.linear(hidden_states, gate_weight, gate_bias)
+        up = F.linear(hidden_states, up_weight, up_bias)
+        _record_u1_g_sublayer_state(forward_batch, "mlp_gate", gate)
+        _record_u1_g_sublayer_state(forward_batch, "mlp_up", up)
+        _record_u1_g_sublayer_state(forward_batch, "mlp_act", F.silu(gate))
+        hidden_states = F.silu(gate) * up
+        _record_u1_g_sublayer_state(forward_batch, "mlp_act_mul", hidden_states)
+
+        down_proj = self.mlp_mot_gen.down_proj
+        down_weight = getattr(down_proj, "weight", None)
+        if down_weight is None or getattr(down_proj, "tp_size", 1) != 1:
+            hidden_states, _ = down_proj(hidden_states)
+            return hidden_states
+        down_bias = getattr(down_proj, "bias", None)
+        return F.linear(hidden_states, down_weight, down_bias)
 
 
 class NEOQwen3Model(Qwen2Model):
@@ -794,7 +1179,87 @@ class NEOQwen3Model(Qwen2Model):
             alt_stream=alt_stream,
         )
         if self.pp_group.is_last_rank:
-            self.norm_mot_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = U1Qwen3RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+            )
+            self.norm_mot_gen = U1Qwen3RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+            )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
+
+        capture_layer_hidden_states = bool(
+            getattr(forward_batch, "ug_debug_capture_u_layers", False)
+        )
+        layer_hidden_states = [] if capture_layer_hidden_states else None
+        self._last_u1_u_hidden_states = None
+        self._last_u1_u_layer_hidden_states = None
+        self._last_u1_u_sublayer_states = None
+        if capture_layer_hidden_states:
+            forward_batch.ug_debug_u_sublayer_states = []
+        aux_hidden_states = []
+        for i in range(self.start_layer, self.end_layer):
+            if capture_layer_hidden_states:
+                forward_batch.ug_debug_current_u_layer = int(i)
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+            )
+            if layer_hidden_states is not None:
+                layer_hidden_states.append((int(i), hidden_states))
+
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+
+        if hidden_states.shape[0] != 0:
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
+
+        if layer_hidden_states is not None:
+            self._last_u1_u_hidden_states = hidden_states
+            self._last_u1_u_layer_hidden_states = layer_hidden_states
+            self._last_u1_u_sublayer_states = getattr(
+                forward_batch,
+                "ug_debug_u_sublayer_states",
+                None,
+            )
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
     def forward_gen_embeds(
         self,
@@ -810,7 +1275,17 @@ class NEOQwen3Model(Qwen2Model):
 
         hidden_states = input_embeds
         residual = None
+        capture_layer_hidden_states = bool(
+            getattr(forward_batch, "ug_debug_capture_g_layers", False)
+        )
+        layer_hidden_states = [] if capture_layer_hidden_states else None
+        self._last_u1_gen_layer_hidden_states = None
+        self._last_u1_gen_sublayer_states = None
+        if capture_layer_hidden_states:
+            forward_batch.ug_debug_g_sublayer_states = []
         for i in range(self.start_layer, self.end_layer):
+            if capture_layer_hidden_states:
+                forward_batch.ug_debug_current_g_layer = int(i)
             layer = self.layers[i]
             hidden_states, residual = layer.forward_gen(
                 positions=positions,
@@ -818,12 +1293,21 @@ class NEOQwen3Model(Qwen2Model):
                 forward_batch=forward_batch,
                 residual=residual,
             )
+            if layer_hidden_states is not None:
+                layer_hidden_states.append((int(i), hidden_states))
 
         if hidden_states.shape[0] != 0:
             if residual is None:
                 hidden_states = self.norm_mot_gen(hidden_states)
             else:
                 hidden_states, _ = self.norm_mot_gen(hidden_states, residual)
+        if layer_hidden_states is not None:
+            self._last_u1_gen_layer_hidden_states = layer_hidden_states
+            self._last_u1_gen_sublayer_states = getattr(
+                forward_batch,
+                "ug_debug_g_sublayer_states",
+                None,
+            )
         return hidden_states
 
 
@@ -912,9 +1396,7 @@ class NEOChatModel(nn.Module):
         self.concat_time_token_num = int(config.concat_time_token_num)
         self.noise_scale = float(config.noise_scale)
         self.noise_scale_mode = str(config.noise_scale_mode)
-        self.noise_scale_base_image_seq_len = int(
-            config.noise_scale_base_image_seq_len
-        )
+        self.noise_scale_base_image_seq_len = int(config.noise_scale_base_image_seq_len)
         self.add_noise_scale_embedding = bool(config.add_noise_scale_embedding)
         self.noise_scale_max_value = float(config.noise_scale_max_value)
         self.time_schedule = str(config.time_schedule)
@@ -952,6 +1434,37 @@ class NEOChatModel(nn.Module):
         if bool(config.add_noise_scale_embedding):
             modules["noise_scale_embedder"] = U1TimestepEmbedder(hidden_size)
         return modules
+
+    @torch.no_grad()
+    def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        """Install U1 extend-stage block-causal mask before attention planning."""
+
+        if getattr(forward_batch.forward_mode, "is_decode", lambda: False)():
+            return
+        contains_mm_inputs = getattr(forward_batch, "contains_mm_inputs", None)
+        if callable(contains_mm_inputs):
+            if not contains_mm_inputs():
+                return
+        elif not getattr(forward_batch, "mm_inputs", None):
+            return
+        if getattr(forward_batch, "cross_attention_custom_mask", None) is not None:
+            return
+        input_ids = getattr(forward_batch, "input_ids", None)
+        positions = getattr(forward_batch, "positions", None)
+        if input_ids is None or positions is None:
+            return
+
+        positions = self._resolve_u1_thw_positions(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+        )
+        self._maybe_install_u1_block_causal_mask(
+            positions=positions,
+            forward_batch=forward_batch,
+        )
+        if getattr(forward_batch, "cross_attention_custom_mask", None) is not None:
+            forward_batch.ug_g_non_causal_query_attention = True
 
     @torch.no_grad()
     def forward(
@@ -1117,7 +1630,9 @@ class NEOChatModel(nn.Module):
             elif self.time_shift_type == "linear":
                 sigma = mu_t / (mu_t + (1 / sigma - 1))
             else:
-                raise ValueError(f"Unsupported U1 time_shift_type: {self.time_shift_type}")
+                raise ValueError(
+                    f"Unsupported U1 time_shift_type: {self.time_shift_type}"
+                )
         else:
             raise ValueError(f"Unsupported U1 time_schedule: {schedule}")
         return 1 - sigma
@@ -1177,8 +1692,31 @@ class NEOChatModel(nn.Module):
                 -1,
             )
 
+        debug_payload = {
+            "hidden_states": hidden_states,
+            "x_pred": x_pred,
+        }
+        layer_hidden_states = getattr(
+            self.language_model.model,
+            "_last_u1_gen_layer_hidden_states",
+            None,
+        )
+        if layer_hidden_states is not None:
+            debug_payload["layer_hidden_states"] = layer_hidden_states
+        sublayer_states = getattr(
+            self.language_model.model,
+            "_last_u1_gen_sublayer_states",
+            None,
+        )
+        if sublayer_states is not None:
+            debug_payload["sublayer_states"] = sublayer_states
+        self._last_u1_pixel_flow_debug = {
+            **debug_payload,
+        }
         t = timestep.to(device=z.device, dtype=z.dtype)
-        return (x_pred - z) / (1 - t).clamp_min(float(getattr(self.config, "t_eps", 0.02)))
+        return (x_pred - z) / (1 - t).clamp_min(
+            float(getattr(self.config, "t_eps", 0.02))
+        )
 
     def _calculate_dynamic_mu(self, image_seq_len: int) -> float:
         denom = self.max_image_seq_len - self.base_image_seq_len
@@ -1267,6 +1805,16 @@ class NEOChatModel(nn.Module):
                 .to(
                     dtype=torch.int64,
                     device=input_ids.device,
+                )
+            )
+
+        if (
+            getattr(forward_batch.forward_mode, "is_decode", lambda: False)()
+            and getattr(forward_batch, "ug_decode_position_ids", None) is not None
+        ):
+            return _u1_text_only_thw_positions(
+                forward_batch.ug_decode_position_ids.to(
+                    dtype=torch.int64, device=input_ids.device
                 )
             )
 
@@ -1461,7 +2009,9 @@ def _u1_item_grid_hw(item: MultimodalDataItem) -> torch.Tensor:
     if grid_hw.ndim == 1:
         grid_hw = grid_hw.view(1, 2)
     if grid_hw.ndim != 2 or grid_hw.shape[-1] != 2:
-        raise ValueError(f"U1 image grid_hw must have shape (B, 2), got {grid_hw.shape}")
+        raise ValueError(
+            f"U1 image grid_hw must have shape (B, 2), got {grid_hw.shape}"
+        )
     return grid_hw
 
 

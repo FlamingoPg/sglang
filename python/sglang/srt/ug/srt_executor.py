@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -86,6 +87,10 @@ class UGSRTSchedulerExecutor:
         self.sync_step_count = 0
         self.temp_g_forward_count = 0
         self.temp_g_allocated_token_count = 0
+        self.debug_tensor_dump_dir = None
+        self.debug_tensor_dump_max_g_calls = 32
+        self.debug_g_sublayer_layers = (0,)
+        self._debug_temp_g_prefix_kv_call_index = 0
 
     @property
     def session_controller(self):
@@ -136,6 +141,7 @@ class UGSRTSchedulerExecutor:
             request_id=req.rid,
             token_count=int(token_indices.numel()),
             token_indices=token_indices,
+            position_count=self._request_position_count(req),
         )
 
     def create_bagel_native_srt_denoise_executor(self):
@@ -272,6 +278,12 @@ class UGSRTSchedulerExecutor:
             dtype=torch.int64,
             non_blocking=True,
         )
+        self._dump_debug_temp_g_prefix_kv(
+            model_runner=model_runner,
+            binding=binding,
+            prefix_indices=prefix_indices,
+            prefix_len=prefix_len,
+        )
         seq_len = prefix_len + extend_num_tokens
         self._check_context_capacity(req_to_token_pool, seq_len)
 
@@ -310,6 +322,8 @@ class UGSRTSchedulerExecutor:
                 extend_num_tokens=extend_num_tokens,
                 binding=binding,
                 device=device,
+                capture_g_layers=self.debug_tensor_dump_dir is not None,
+                debug_g_sublayer_layers=self.debug_g_sublayer_layers,
             )
             context = UGSRTTemporaryForwardBatch(
                 forward_batch=forward_batch,
@@ -368,9 +382,11 @@ class UGSRTSchedulerExecutor:
         if hasattr(self.scheduler, "cur_batch"):
             self.scheduler.cur_batch = batch
         if batch:
+            batch_sessions = self._batch_sessions(batch)
             result = self.scheduler.run_batch(batch)
             self._capture_batch_token_bindings(batch)
             self.scheduler.process_batch_result(batch, result)
+            self._capture_session_token_bindings(batch_sessions)
             self.sync_step_count += 1
         elif hasattr(self.scheduler, "on_idle"):
             self.scheduler.on_idle()
@@ -591,6 +607,8 @@ class UGSRTSchedulerExecutor:
         extend_num_tokens: int,
         binding: UGSRTKVTokenBinding,
         device: torch.device,
+        capture_g_layers: bool = False,
+        debug_g_sublayer_layers: tuple[int, ...] = (0,),
     ) -> Any:
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -665,6 +683,11 @@ class UGSRTSchedulerExecutor:
             "attention_mode": "non_causal_query",
             "attention_mask_shape": (extend_num_tokens, seq_len),
         }
+        if capture_g_layers:
+            forward_batch.ug_debug_capture_g_layers = True
+            forward_batch.ug_debug_capture_g_sublayers = tuple(
+                int(layer_id) for layer_id in debug_g_sublayer_layers
+            )
         forward_batch.ug_g_non_causal_query_attention = True
         forward_batch.cross_attention_custom_mask = torch.ones(
             extend_num_tokens * seq_len,
@@ -672,6 +695,57 @@ class UGSRTSchedulerExecutor:
             device=device,
         )
         return forward_batch
+
+    def _dump_debug_temp_g_prefix_kv(
+        self,
+        *,
+        model_runner: Any,
+        binding: UGSRTKVTokenBinding,
+        prefix_indices: torch.Tensor,
+        prefix_len: int,
+    ) -> None:
+        dump_dir = getattr(self, "debug_tensor_dump_dir", None)
+        if not dump_dir:
+            return
+        call_index = int(self._debug_temp_g_prefix_kv_call_index)
+        self._debug_temp_g_prefix_kv_call_index = call_index + 1
+        if call_index >= int(getattr(self, "debug_tensor_dump_max_g_calls", 32)):
+            return
+        token_to_kv_pool = getattr(model_runner, "token_to_kv_pool", None)
+        if token_to_kv_pool is None:
+            return
+        def dump_layer_kv(layer_id: int) -> dict[str, torch.Tensor]:
+            key_buffer = token_to_kv_pool.get_key_buffer(layer_id)
+            value_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+            return {
+                f"layer{layer_id}_keys": key_buffer[prefix_indices]
+                .detach()
+                .float()
+                .cpu(),
+                f"layer{layer_id}_values": value_buffer[prefix_indices]
+                .detach()
+                .float()
+                .cpu(),
+            }
+
+        payload = {
+            "call_index": call_index,
+            "session_id": binding.session_id,
+            "request_id": binding.request_id,
+            "prefix_len": prefix_len,
+            "prefix_indices": prefix_indices.detach().cpu(),
+        }
+        for layer_id in (0, 1, 2):
+            try:
+                payload.update(dump_layer_kv(layer_id))
+            except Exception as exc:
+                payload[f"layer{layer_id}_kv_error"] = repr(exc)
+        path = Path(dump_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            payload,
+            path / f"candidate_prefix_kv_{call_index:04d}.pt",
+        )
 
     def _request_token_indices(self, record: Any, req: Any) -> torch.Tensor | None:
         tree_cache = getattr(self.scheduler, "tree_cache", None)
@@ -710,9 +784,61 @@ class UGSRTSchedulerExecutor:
                 request_id=req.rid,
                 token_count=int(token_indices.numel()),
                 token_indices=token_indices,
+                position_count=self._request_position_count(req),
             )
             self._request_token_bindings[req.rid] = binding
             self.token_bindings.append(binding)
+
+    def _batch_sessions(self, batch: Any) -> list[tuple[str, str, int | None]]:
+        sessions: list[tuple[str, str, int | None]] = []
+        for req in getattr(batch, "reqs", []) or []:
+            session = getattr(req, "session", None)
+            session_id = getattr(session, "session_id", None)
+            if session_id is None:
+                continue
+            sessions.append(
+                (
+                    str(session_id),
+                    str(getattr(req, "rid", "")),
+                    self._request_position_count(req),
+                )
+            )
+        return sessions
+
+    def _capture_session_token_bindings(
+        self, sessions: list[tuple[str, str, int | None]]
+    ) -> None:
+        for session_id, request_id, position_count in sessions:
+            token_indices = self._request_token_indices_for_session(session_id)
+            if token_indices is None:
+                continue
+            binding = UGSRTKVTokenBinding(
+                session_id=session_id,
+                request_id=request_id,
+                token_count=int(token_indices.numel()),
+                token_indices=token_indices,
+                position_count=position_count,
+            )
+            if request_id:
+                self._request_token_bindings[request_id] = binding
+            self.token_bindings.append(binding)
+
+    def _request_token_indices_for_session(
+        self, session_id: str
+    ) -> torch.Tensor | None:
+        tree_cache = getattr(self.scheduler, "tree_cache", None)
+        if tree_cache is None:
+            return None
+        req_to_token_pool = getattr(tree_cache, "req_to_token_pool", None)
+        req_to_token = getattr(req_to_token_pool, "req_to_token", None)
+        slot = self._streaming_session_slot(tree_cache, session_id)
+        if req_to_token is None or slot is None:
+            return None
+        pool_idx = getattr(slot, "req_pool_idx", None)
+        token_count = int(getattr(slot, "kv_committed_len", 0) or 0)
+        if pool_idx is None or token_count <= 0:
+            return None
+        return req_to_token[pool_idx, :token_count].to(dtype=torch.int64).clone()
 
     def _request_token_indices_for_active_req(self, req: Any) -> torch.Tensor | None:
         tree_cache = getattr(self.scheduler, "tree_cache", None)
@@ -722,9 +848,29 @@ class UGSRTSchedulerExecutor:
         req_to_token = getattr(req_to_token_pool, "req_to_token", None)
         pool_idx = getattr(req, "req_pool_idx", None)
         token_count = int(getattr(req, "kv_committed_len", 0) or 0)
+        if (pool_idx is None or token_count <= 0) and getattr(req, "session", None):
+            session_id = getattr(req.session, "session_id", None)
+            slot = self._streaming_session_slot(tree_cache, session_id)
+            if slot is not None:
+                pool_idx = getattr(slot, "req_pool_idx", None)
+                token_count = int(getattr(slot, "kv_committed_len", 0) or 0)
         if req_to_token is None or pool_idx is None or token_count <= 0:
             return None
         return req_to_token[pool_idx, :token_count].to(dtype=torch.int64).clone()
+
+    @staticmethod
+    def _request_position_count(req: Any) -> int | None:
+        metadata = getattr(req, "ug_u_forward_metadata", {}) or {}
+        adapter_metadata = metadata.get("adapter_metadata") or {}
+        u1_metadata = adapter_metadata.get("u1") or {}
+        g_position_start = u1_metadata.get("g_position_start")
+        if g_position_start is None:
+            model_state = adapter_metadata.get("ug_model_state") or {}
+            u1_state = model_state.get("u1") or {}
+            g_position_start = u1_state.get("g_position_start")
+        if g_position_start is None:
+            return None
+        return int(g_position_start)
 
     @staticmethod
     def _streaming_session_slot(tree_cache: Any, session_id: str) -> Any | None:

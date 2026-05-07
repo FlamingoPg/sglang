@@ -45,6 +45,7 @@ class UGSRTKVTokenBinding:
     request_id: str
     token_count: int
     token_indices: Any
+    position_count: int | None = None
 
 
 @dataclass(slots=True)

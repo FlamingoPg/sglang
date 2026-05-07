@@ -580,7 +580,11 @@ class BAGELInterleaveContextBackend:
             )
             state.decode_count += 1
             state.srt_last_u_decode_text = decoded.text
-            return UGDecodeResult(type="text", text=decoded.text)
+            return UGDecodeResult(
+                type="text",
+                text=decoded.text,
+                token_ids=tuple(int(token_id) for token_id in decoded.token_ids),
+            )
         return self.decode_next_segment(session=SimpleNamespace(handle=session))
 
     def decode_vlm_text(

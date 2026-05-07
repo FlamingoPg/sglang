@@ -285,9 +285,14 @@ class UGPipeline(ComposedPipelineBase):
             for _ in range(max_text_segments):
                 post_segment = bridge.continue_u_decode(contexts=contexts)
                 if post_segment.type == "text":
-                    output_segments.append(
-                        {"type": "text", "text": post_segment.text or ""}
-                    )
+                    segment = {"type": "text", "text": post_segment.text or ""}
+                    if post_segment.token_ids:
+                        segment["metadata"] = {
+                            "token_ids": [
+                                int(token_id) for token_id in post_segment.token_ids
+                            ]
+                        }
+                    output_segments.append(segment)
                     continue
                 if post_segment.type == "image_marker":
                     next_image_requested = True

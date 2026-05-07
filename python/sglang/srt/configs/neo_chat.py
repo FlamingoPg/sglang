@@ -21,7 +21,16 @@ class NEOLLMConfig(Qwen3Config):
         max_position_embeddings_hw: int = 10000,
         **kwargs,
     ) -> None:
+        rope_parameters = kwargs.get("rope_parameters")
+        rope_theta = kwargs.get("rope_theta")
         super().__init__(**kwargs)
+        rope_parameters = getattr(self, "rope_parameters", None) or rope_parameters
+        if getattr(self, "rope_theta", None) is None and isinstance(
+            rope_parameters, dict
+        ):
+            self.rope_theta = rope_parameters.get("rope_theta", rope_theta or 10000.0)
+        elif getattr(self, "rope_theta", None) is None and rope_theta is not None:
+            self.rope_theta = rope_theta
         self.rope_theta_hw = rope_theta_hw
         self.max_position_embeddings_hw = max_position_embeddings_hw
 

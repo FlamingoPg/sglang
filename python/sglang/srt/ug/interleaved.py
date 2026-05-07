@@ -144,6 +144,7 @@ class UGGSegmentResult:
     type: Literal["image"]
     image: Any
     metadata: dict[str, Any] = field(default_factory=dict)
+    commit_image: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)

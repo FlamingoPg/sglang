@@ -151,7 +151,7 @@ def create_u1_srt_scheduler(
     gpu_id: int = 0,
     dtype: str = "bfloat16",
     mem_fraction_static: float = 0.35,
-    chunked_prefill_size: int = 256,
+    chunked_prefill_size: int = -1,
     attention_backend: str | None = None,
     log_level: str = "error",
 ) -> UGSRTSchedulerHandle:
@@ -176,8 +176,15 @@ def create_u1_srt_scheduler(
         disable_piecewise_cuda_graph=True,
         disable_overlap_schedule=True,
         skip_server_warmup=True,
-        attention_backend=attention_backend,
+        # U1 official interleave uses SDPA-style attention. Triton is faster,
+        # but the small logits drift can flip near-tie U decode tokens and send
+        # the closed-loop image trajectory down a different branch.
+        attention_backend=attention_backend or "torch_native",
         mem_fraction_static=float(mem_fraction_static),
+        # U1 edit/VLM prefixes use block-causal image context where tokens with
+        # the same t index attend bidirectionally. Splitting that image block
+        # across chunked-prefill boundaries commits earlier KV before later
+        # same-t tokens exist, so keep U1 UG prefill unchunked for parity.
         chunked_prefill_size=int(chunked_prefill_size),
         log_level=log_level,
     )

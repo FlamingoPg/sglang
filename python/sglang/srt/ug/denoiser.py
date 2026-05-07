@@ -162,7 +162,13 @@ class SRTBackedUGMiddleBridge:
                         {
                             "type": "text",
                             "text": thinking.text,
-                            "metadata": {"role": "think"},
+                            "metadata": {
+                                "role": "think",
+                                "token_ids": [
+                                    int(token_id)
+                                    for token_id in thinking.output_ids
+                                ],
+                            },
                         }
                     )
             for _ in range(self.max_pre_image_decode_steps):
@@ -171,7 +177,16 @@ class SRTBackedUGMiddleBridge:
                     break
                 if segment.type == "text":
                     pre_image_segments.append(
-                        {"type": "text", "text": segment.text or ""}
+                        {
+                            "type": "text",
+                            "text": segment.text or "",
+                            "metadata": {
+                                "token_ids": [
+                                    int(token_id)
+                                    for token_id in segment.token_ids
+                                ]
+                            },
+                        }
                     )
                     continue
                 raise ValueError(
@@ -179,9 +194,16 @@ class SRTBackedUGMiddleBridge:
                     f"got {segment.type}"
                 )
             else:
+                decoded_preview = "".join(
+                    str(segment.get("text") or "")
+                    for segment in pre_image_segments
+                    if segment.get("type") == "text"
+                )
+                decoded_preview = decoded_preview[-240:]
                 raise ValueError(
                     "UG middle bridge did not receive an image marker within "
                     f"{self.max_pre_image_decode_steps} U decode steps"
+                    f"; decoded_text_preview={decoded_preview!r}"
                 )
         except Exception:
             self.runtime.close_session(session)
@@ -230,7 +252,10 @@ class SRTBackedUGMiddleBridge:
     ) -> None:
         if segment.type != "image":
             raise ValueError(f"UG commit expects image segment, got {segment.type}")
-        self._commit_generated_image(contexts=contexts, image=segment.image)
+        image_for_commit = segment.commit_image
+        if image_for_commit is None:
+            image_for_commit = segment.image
+        self._commit_generated_image(contexts=contexts, image=image_for_commit)
 
     def release(self, contexts: UGContextBundle) -> None:
         if contexts.full.session is not None:

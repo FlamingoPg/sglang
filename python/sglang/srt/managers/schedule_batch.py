@@ -1423,6 +1423,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
     custom_position_ids: Optional[torch.Tensor] = None
+    ug_decode_position_ids: Optional[torch.Tensor] = None
     ug_non_causal_query_attention: bool = False
     bagel_mot_text_token_indices: Optional[torch.Tensor] = None
     bagel_mot_vae_token_indices: Optional[torch.Tensor] = None
@@ -2008,6 +2009,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if has_custom_position_ids
             else None
         )
+        self.ug_decode_position_ids = None
         self.ug_non_causal_query_attention = ug_non_causal_query_attention
         self.bagel_mot_text_token_indices = (
             torch.tensor(
@@ -2390,9 +2392,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
         self.custom_position_ids = None
+        self.ug_decode_position_ids = None
         self.ug_non_causal_query_attention = False
         self.bagel_mot_text_token_indices = None
         self.bagel_mot_vae_token_indices = None
+        decode_position_ids = [
+            getattr(req, "ug_decode_position_id", None) for req in self.reqs
+        ]
+        if any(position is not None for position in decode_position_ids):
+            if self.seq_lens_cpu is not None:
+                fallback_positions = [int(seq_len) - 1 for seq_len in self.seq_lens_cpu]
+            else:
+                fallback_positions = [
+                    int(getattr(req, "seqlen", len(req.origin_input_ids))) - 1
+                    for req in self.reqs
+                ]
+            self.ug_decode_position_ids = torch.tensor(
+                [
+                    int(position) if position is not None else fallback_position
+                    for position, fallback_position in zip(
+                        decode_position_ids, fallback_positions
+                    )
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.custom_position_ids = self.ug_decode_position_ids
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -2693,6 +2718,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             replace_embeds=self.replace_embeds,
             replace_positions=self.replace_positions,
             custom_position_ids=self.custom_position_ids,
+            ug_decode_position_ids=self.ug_decode_position_ids,
             ug_non_causal_query_attention=self.ug_non_causal_query_attention,
             bagel_mot_text_token_indices=self.bagel_mot_text_token_indices,
             bagel_mot_vae_token_indices=self.bagel_mot_vae_token_indices,
@@ -2896,6 +2922,7 @@ class ModelWorkerBatch:
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
     custom_position_ids: Optional[torch.Tensor] = None
+    ug_decode_position_ids: Optional[torch.Tensor] = None
     ug_non_causal_query_attention: bool = False
     bagel_mot_text_token_indices: Optional[torch.Tensor] = None
     bagel_mot_vae_token_indices: Optional[torch.Tensor] = None

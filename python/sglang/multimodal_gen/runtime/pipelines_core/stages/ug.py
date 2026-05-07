@@ -69,6 +69,8 @@ class UGContextStage(PipelineStage):
         think_max_new_tokens = _resolve_ug_think_max_new_tokens(batch, request_metadata)
         batch.extra["ug_mode"] = mode
         batch.extra["ug_think"] = think
+        if batch.sampling_params is not None:
+            setattr(batch.sampling_params, "ug_generation_mode", mode)
         if interleaved_messages is not None:
             messages = _normalize_pipeline_interleaved_messages(interleaved_messages)
             batch.extra["ug_interleaved_messages"] = messages

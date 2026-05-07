@@ -324,6 +324,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Position information
     positions: torch.Tensor = None
+    ug_decode_position_ids: Optional[torch.Tensor] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -491,6 +492,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             replace_positions=batch.replace_positions,
             bagel_mot_text_token_indices=batch.bagel_mot_text_token_indices,
             bagel_mot_vae_token_indices=batch.bagel_mot_vae_token_indices,
+            ug_decode_position_ids=batch.ug_decode_position_ids,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,

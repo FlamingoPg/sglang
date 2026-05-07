@@ -97,6 +97,31 @@ class TestSRTBackedUGMiddleBridge(unittest.TestCase):
         self.assertEqual(counters["decode_count"], 2)
         self.assertEqual(counters["state"], "u_decode")
 
+    def test_commit_generated_segment_prefers_raw_commit_image(self):
+        runner = BridgeUGModelRunner()
+        bridge = SRTBackedUGMiddleBridge(UGSessionRuntime(model_runner=runner))
+        contexts = bridge.prepare_u_context(prompt="hello world", image=None)
+        bridge.predict_g_velocity(
+            contexts=contexts,
+            latent_tokens=torch.zeros(1, 2, 4),
+            timestep=torch.tensor([1.0]),
+            latent_position_ids=torch.arange(2),
+            sampling_params=None,
+        )
+        display_image = Image.new("RGB", (8, 8), color="black")
+        raw_commit_image = object()
+
+        bridge.commit_generated_segment(
+            contexts=contexts,
+            segment=UGGSegmentResult(
+                type="image",
+                image=display_image,
+                commit_image=raw_commit_image,
+            ),
+        )
+
+        self.assertIs(runner.appended_images[-1], raw_commit_image)
+
     def test_run_g_segment_wraps_model_specific_executor(self):
         bridge = _make_bridge()
         contexts = bridge.prepare_u_context(prompt="hello world", image=None)
@@ -257,6 +282,9 @@ class TextOnlyUGModelRunner:
 
 
 class BridgeUGModelRunner:
+    def __init__(self):
+        self.appended_images = []
+
     def prefill_interleaved(self, *, record, messages):
         del record
         token_count = 0
@@ -285,7 +313,8 @@ class BridgeUGModelRunner:
         return None
 
     def append_generated_image(self, *, record, image):
-        del record, image
+        del record
+        self.appended_images.append(image)
         return 2
 
     def decode_latents_to_image(self, *, request, record):
