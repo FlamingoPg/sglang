@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from types import SimpleNamespace
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -175,23 +176,6 @@ class U1TimestepEmbedder(nn.Module):
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         return self.mlp(t_freq.to(dtype=self.mlp[0].weight.dtype))
-
-
-class U1ConvDecoder(nn.Module):
-    """Optional U1 pixel head used by some checkpoints."""
-
-    def __init__(self, input_dim: int = 4096, hidden_dim: int = 1024) -> None:
-        super().__init__()
-        self.ps1 = nn.PixelShuffle(2)
-        self.conv1 = nn.Conv2d(input_dim // 4, hidden_dim, kernel_size=3, padding=1)
-        self.act1 = nn.GELU()
-        self.ps2 = nn.PixelShuffle(2)
-        self.conv2 = nn.Conv2d(hidden_dim // 4, 192, kernel_size=3, padding=1)
-        self.ps3 = nn.PixelShuffle(8)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.act1(self.conv1(self.ps1(x)))
-        return self.ps3(self.conv2(self.ps2(x)))
 
 
 def build_u1_vlm_thw_indexes(
@@ -397,16 +381,12 @@ class NEOVisionModel(nn.Module):
             if pixel_values is None or grid_hw is None:
                 raise ValueError("U1 vision forward requires pixel_values and grid_hw")
             hidden_states = self.embeddings(pixel_values, grid_hw=grid_hw)
-        return type(
-            "NEOVisionOutput",
-            (),
-            {
-                "last_hidden_state": hidden_states,
-                "pooler_output": None,
-                "hidden_states": None,
-                "attentions": None,
-            },
-        )()
+        return SimpleNamespace(
+            last_hidden_state=hidden_states,
+            pooler_output=None,
+            hidden_states=None,
+            attentions=None,
+        )
 
 
 class NEOQwen3Attention(Qwen3Attention):
@@ -822,8 +802,6 @@ class NEOChatModel(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.patch_size = config.vision_config.patch_size
-        self.downsample_ratio = config.downsample_ratio
         self.img_context_token_id = config.img_context_token_id
         self.img_start_token_id = config.img_start_token_id
         self.vision_model = NEOVisionModel(config.vision_config)
@@ -834,37 +812,25 @@ class NEOChatModel(nn.Module):
         )
         self.model = self.language_model.model
         self.fm_modules = self._build_fm_modules(config)
-        self.use_pixel_head = bool(config.use_pixel_head)
-        self.concat_time_token_num = int(config.concat_time_token_num)
-        self.noise_scale = float(config.noise_scale)
-        self.noise_scale_mode = str(config.noise_scale_mode)
-        self.noise_scale_base_image_seq_len = int(config.noise_scale_base_image_seq_len)
-        self.add_noise_scale_embedding = bool(config.add_noise_scale_embedding)
-        self.noise_scale_max_value = float(config.noise_scale_max_value)
-        self.time_schedule = str(config.time_schedule)
-        self.time_shift_type = str(config.time_shift_type)
-        self.base_shift = float(config.base_shift)
-        self.max_shift = float(config.max_shift)
-        self.base_image_seq_len = int(config.base_image_seq_len)
-        self.max_image_seq_len = int(config.max_image_seq_len)
 
     def _build_fm_modules(self, config: SenseNovaU1Config) -> nn.ModuleDict:
         merge_size = _merge_size_from_downsample_ratio(float(config.downsample_ratio))
         output_dim = 3 * (int(config.vision_config.patch_size) * merge_size) ** 2
         hidden_size = int(config.llm_config.hidden_size)
         if bool(config.use_pixel_head):
-            fm_head: nn.Module = U1ConvDecoder(hidden_size)
-        elif int(config.fm_head_layers) <= 2:
-            fm_head = nn.Sequential(
-                nn.Linear(hidden_size, 4096, bias=True),
-                nn.GELU(),
-                nn.Linear(4096, output_dim, bias=True),
+            raise NotImplementedError(
+                "SenseNova U1 native SRT supports the linear fm_head checkpoint path; "
+                "pixel-head checkpoints should add a model-specific diffusion backend."
             )
-        else:
+        if int(config.fm_head_layers) > 2:
             raise NotImplementedError(
                 "SenseNova U1 native SRT currently supports fm_head_layers <= 2 "
-                "or use_pixel_head checkpoints"
             )
+        fm_head = nn.Sequential(
+            nn.Linear(hidden_size, 4096, bias=True),
+            nn.GELU(),
+            nn.Linear(4096, output_dim, bias=True),
+        )
 
         modules = nn.ModuleDict(
             {
@@ -1019,7 +985,7 @@ class NEOChatModel(nn.Module):
             grid_hw=grid_hw,
             img_start_token_id=self.img_start_token_id,
             img_context_token_id=self.img_context_token_id,
-            downsample_ratio=self.downsample_ratio,
+            downsample_ratio=float(self.config.downsample_ratio),
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

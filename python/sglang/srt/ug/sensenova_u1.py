@@ -224,9 +224,7 @@ class U1UGModelAdapter:
         )
 
     def decode_next_segment(self, *, session: Any) -> Any:
-        if self._has_generated_image_commit(session):
-            return UGDecodeResult(type="text", text="u1_pixel_flow_text_after_image")
-        return UGDecodeResult(type="image_marker")
+        raise RuntimeError("SenseNova U1 decode requires the SRT-backed runtime path")
 
     def decode_next_segment_from_runtime(self, *, runtime: Any, session: Any) -> Any:
         session_view = self._runtime_session_view(runtime=runtime, session=session)
@@ -244,9 +242,9 @@ class U1UGModelAdapter:
         if not self._has_generated_image_commit(session_view):
             return UGDecodeResult(type="image_marker")
         if self.native_tokenizer is None or runtime is None:
-            return UGDecodeResult(type="text", text="u1_pixel_flow_text_after_image")
+            raise RuntimeError("SenseNova U1 decode requires a tokenizer and runtime")
         if getattr(runtime, "srt_request_executor", None) is None:
-            return UGDecodeResult(type="text", text="u1_pixel_flow_text_after_image")
+            raise RuntimeError("SenseNova U1 decode requires a SRT request executor")
         max_new_tokens = max(
             1,
             int(getattr(runtime, "srt_u_decode_max_new_tokens", 0) or 0),

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import inspect
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1178,21 +1177,7 @@ class UGSessionRuntime:
         if not callable(provider):
             return None
 
-        signature = inspect.signature(provider)
-        parameters = signature.parameters
-        accepts_kwargs = any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
-        )
-        kwargs = {
-            "record": record,
-            "state": state,
-        }
-        if "req" in parameters or accepts_kwargs:
-            kwargs["req"] = req
-        elif "request" in parameters:
-            kwargs["request"] = req
-        binding = provider(**kwargs)
+        binding = provider(record=record, req=req, state=state)
         if binding is None:
             return None
         if not isinstance(binding, UGSRTKVTokenBinding):

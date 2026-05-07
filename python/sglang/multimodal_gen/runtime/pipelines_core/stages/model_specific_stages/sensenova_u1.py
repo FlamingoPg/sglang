@@ -27,7 +27,6 @@ class SenseNovaU1PixelFlowGSegmentExecutor:
     """Run SenseNova U1 pixel-flow G through the model-specific diffusion stage."""
 
     required_g_kind: UGGKind = "pixel_flow"
-    patch_size: int = 16
 
     def __call__(
         self,
@@ -262,8 +261,8 @@ class _SenseNovaU1NativePixelFlowRunner:
 
         image_size = _batch_image_size(batch)
         width, height = image_size
-        patch_size = int(self.srt_model.patch_size)
-        merge_size = int(1 / float(self.srt_model.downsample_ratio))
+        patch_size = int(self.srt_model.config.vision_config.patch_size)
+        merge_size = int(1 / float(self.srt_model.config.downsample_ratio))
         divisor = patch_size * merge_size
         if width % divisor or height % divisor:
             raise ValueError(
@@ -395,10 +394,10 @@ class _SenseNovaU1NativePixelFlowRunner:
             timestep_embeddings = self.srt_model.fm_modules["timestep_embedder"](
                 timestep_values
             ).view(1, token_h * token_w, -1)
-            if getattr(self.srt_model, "add_noise_scale_embedding", False):
+            if getattr(self.srt_model.config, "add_noise_scale_embedding", False):
                 noise_values = torch.full_like(
                     timestep_values,
-                    noise_scale / float(self.srt_model.noise_scale_max_value),
+                    noise_scale / float(self.srt_model.config.noise_scale_max_value),
                 )
                 timestep_embeddings = timestep_embeddings + self.srt_model.fm_modules[
                     "noise_scale_embedder"
@@ -411,7 +410,6 @@ class _SenseNovaU1NativePixelFlowRunner:
                 indexes_image=indexes_image,
                 timestep=timestep,
                 z=z,
-                image_size=image_size,
             )
             if not use_cfg or not needs_cfg:
                 v_pred = v_condition
@@ -422,7 +420,6 @@ class _SenseNovaU1NativePixelFlowRunner:
                     indexes_image=indexes_image_img_condition,
                     timestep=timestep,
                     z=z,
-                    image_size=image_size,
                 )
                 v_pred = v_img_condition + cfg_text_scale * (
                     v_condition - v_img_condition
@@ -434,7 +431,6 @@ class _SenseNovaU1NativePixelFlowRunner:
                     indexes_image=indexes_image_uncondition,
                     timestep=timestep,
                     z=z,
-                    image_size=image_size,
                 )
                 v_pred = v_uncondition + cfg_text_scale * (v_condition - v_uncondition)
             else:
@@ -444,7 +440,6 @@ class _SenseNovaU1NativePixelFlowRunner:
                     indexes_image=indexes_image_img_condition,
                     timestep=timestep,
                     z=z,
-                    image_size=image_size,
                 )
                 v_uncondition = self._predict_v(
                     prepared=prepared_uncondition,
@@ -452,7 +447,6 @@ class _SenseNovaU1NativePixelFlowRunner:
                     indexes_image=indexes_image_uncondition,
                     timestep=timestep,
                     z=z,
-                    image_size=image_size,
                 )
                 v_pred = (
                     v_uncondition
@@ -520,7 +514,6 @@ class _SenseNovaU1NativePixelFlowRunner:
         indexes_image: Any,
         timestep: Any,
         z: Any,
-        image_size: tuple[int, int],
     ) -> Any:
         forward_batch_context = self.forward_batch_provider(
             prepared=prepared,
@@ -540,7 +533,6 @@ class _SenseNovaU1NativePixelFlowRunner:
                 forward_batch=forward_batch,
                 timestep=timestep,
                 z=z,
-                image_size=image_size,
             )
         finally:
             release = getattr(forward_batch_context, "release", None)
@@ -679,7 +671,8 @@ def _u1_apply_time_schedule(
     import torch
 
     sigma = 1 - timesteps
-    schedule = model.time_schedule
+    cfg = model.config
+    schedule = str(cfg.time_schedule)
     if timestep_shift != 1:
         schedule = "standard"
     if schedule == "standard":
@@ -688,14 +681,15 @@ def _u1_apply_time_schedule(
     elif schedule == "dynamic":
         mu = _u1_calculate_dynamic_mu(model, image_seq_len)
         mu_t = timesteps.new_tensor(mu)
-        if model.time_shift_type == "exponential":
+        time_shift_type = str(cfg.time_shift_type)
+        if time_shift_type == "exponential":
             shift = torch.exp(mu_t)
             sigma = shift * sigma / (1 + (shift - 1) * sigma)
-        elif model.time_shift_type == "linear":
+        elif time_shift_type == "linear":
             sigma = mu_t / (mu_t + (1 / sigma - 1))
         else:
             raise ValueError(
-                f"Unsupported SenseNova U1 time_shift_type: {model.time_shift_type}"
+                f"Unsupported SenseNova U1 time_shift_type: {time_shift_type}"
             )
     else:
         raise ValueError(f"Unsupported SenseNova U1 time_schedule: {schedule}")
@@ -705,23 +699,26 @@ def _u1_apply_time_schedule(
 def _u1_noise_scale_for_image(model: Any, *, grid_h: int, grid_w: int) -> float:
     import math
 
-    merge_size = int(1 / float(model.downsample_ratio))
-    noise_scale = float(model.noise_scale)
-    if model.noise_scale_mode in {"resolution", "dynamic", "dynamic_sqrt"}:
-        base = float(model.noise_scale_base_image_seq_len)
+    cfg = model.config
+    merge_size = int(1 / float(cfg.downsample_ratio))
+    noise_scale = float(cfg.noise_scale)
+    noise_scale_mode = str(cfg.noise_scale_mode)
+    if noise_scale_mode in {"resolution", "dynamic", "dynamic_sqrt"}:
+        base = float(cfg.noise_scale_base_image_seq_len)
         scale = math.sqrt((grid_h * grid_w) / (merge_size**2) / base)
-        noise_scale = scale * float(model.noise_scale)
-        if model.noise_scale_mode == "dynamic_sqrt":
+        noise_scale = scale * float(cfg.noise_scale)
+        if noise_scale_mode == "dynamic_sqrt":
             noise_scale = math.sqrt(noise_scale)
-    return min(noise_scale, float(model.noise_scale_max_value))
+    return min(noise_scale, float(cfg.noise_scale_max_value))
 
 
 def _u1_calculate_dynamic_mu(model: Any, image_seq_len: int) -> float:
-    denom = model.max_image_seq_len - model.base_image_seq_len
+    cfg = model.config
+    denom = int(cfg.max_image_seq_len) - int(cfg.base_image_seq_len)
     if denom == 0:
-        return float(model.base_shift)
-    slope = (model.max_shift - model.base_shift) / denom
-    bias = model.base_shift - slope * model.base_image_seq_len
+        return float(cfg.base_shift)
+    slope = (float(cfg.max_shift) - float(cfg.base_shift)) / denom
+    bias = float(cfg.base_shift) - slope * int(cfg.base_image_seq_len)
     return float(image_seq_len) * slope + bias
 
 
@@ -733,43 +730,18 @@ def _predict_u1_pixel_flow_from_srt(
     forward_batch: Any,
     timestep: Any,
     z: Any,
-    image_size: tuple[int, int],
 ) -> Any:
-    import torch
-
     batch_size, image_token_num = image_embeds.shape[:2]
     hidden_states = model.language_model.forward_u1_gen_embeds(
         input_embeds=image_embeds.reshape(-1, image_embeds.shape[-1]),
         positions=indexes_image,
         forward_batch=forward_batch,
     ).view(batch_size, image_token_num, -1)
-
-    if model.use_pixel_head:
-        merge_size = int(1 / float(model.downsample_ratio))
-        token_h = image_size[1] // (model.patch_size * merge_size)
-        token_w = image_size[0] // (model.patch_size * merge_size)
-        img_2d = hidden_states.view(batch_size, token_h, token_w, -1)
-        img_2d = torch.einsum("b h w c -> b c h w", img_2d).contiguous()
-        x_pred_2d = model.fm_modules["fm_head"](img_2d)
-        x_pred = (
-            x_pred_2d.view(
-                batch_size,
-                3,
-                token_h,
-                model.patch_size * merge_size,
-                token_w,
-                model.patch_size * merge_size,
-            )
-            .permute(0, 2, 4, 3, 5, 1)
-            .contiguous()
-            .view(batch_size, image_token_num, -1)
-        )
-    else:
-        x_pred = model.fm_modules["fm_head"](hidden_states).view(
-            batch_size,
-            image_token_num,
-            -1,
-        )
+    x_pred = model.fm_modules["fm_head"](hidden_states).view(
+        batch_size,
+        image_token_num,
+        -1,
+    )
 
     t = timestep.to(device=z.device, dtype=z.dtype)
     return (x_pred - z) / (1 - t).clamp_min(float(getattr(model.config, "t_eps", 0.02)))

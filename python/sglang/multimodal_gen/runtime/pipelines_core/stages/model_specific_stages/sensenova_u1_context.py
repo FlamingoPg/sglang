@@ -5,7 +5,6 @@ from typing import Any
 
 from sglang.srt.ug.runtime import (
     UGInterleavedMessage,
-    UGSegmentState,
     UGSRTPreparedInput,
 )
 
@@ -487,33 +486,12 @@ def build_u1_native_edit_uncondition_prepared_input(
     tokenizer: Any,
     session: Any | None = None,
 ) -> UGSRTPreparedInput:
-    prompt = build_u1_t2i_plain_query(prompt="", append_text=U1_IMG_START_TOKEN)
-    input_ids = _u1_tokenize_to_ids(
-        tokenizer,
-        prompt,
-        add_special_tokens=False,
-    )
-    if not input_ids:
-        raise RuntimeError("U1 native edit uncondition prompt produced no input ids")
-    img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
-    if input_ids[-1] != img_start_id:
-        raise RuntimeError("U1 native edit uncondition prompt must end with <img>")
-    return UGSRTPreparedInput(
-        input_ids=input_ids,
-        input_text=prompt,
-        messages=[UGInterleavedMessage(type="text", content="")],
-        srt_sidecar_role=U1_EDIT_UNCONDITION_ROLE,
-        srt_sidecar_session_id=_u1_sidecar_session_id(
-            session,
-            U1_EDIT_UNCONDITION_ROLE,
-        ),
-        adapter_metadata={
-            "u1": {
-                "segment_type": "edit_uncondition",
-                "source": "native_edit_uncondition_prompt",
-                "prompt_ends_with_image_marker": True,
-            }
-        },
+    return _build_u1_native_marker_sidecar_prepared_input(
+        tokenizer=tokenizer,
+        session=session,
+        role=U1_EDIT_UNCONDITION_ROLE,
+        source="native_edit_uncondition_prompt",
+        segment_type="edit_uncondition",
     )
 
 
@@ -697,6 +675,23 @@ def build_u1_native_t2i_cfg_uncondition_prepared_input(
     tokenizer: Any,
     session: Any | None = None,
 ) -> UGSRTPreparedInput:
+    return _build_u1_native_marker_sidecar_prepared_input(
+        tokenizer=tokenizer,
+        session=session,
+        role=U1_T2I_CFG_UNCONDITION_ROLE,
+        source="native_t2i_cfg_uncondition_prompt",
+        segment_type="t2i_cfg_uncondition",
+    )
+
+
+def _build_u1_native_marker_sidecar_prepared_input(
+    *,
+    tokenizer: Any,
+    session: Any | None,
+    role: str,
+    source: str,
+    segment_type: str,
+) -> UGSRTPreparedInput:
     prompt = build_u1_t2i_uncondition_prompt()
     input_ids = _u1_tokenize_to_ids(
         tokenizer,
@@ -704,23 +699,20 @@ def build_u1_native_t2i_cfg_uncondition_prepared_input(
         add_special_tokens=False,
     )
     if not input_ids:
-        raise RuntimeError("U1 native T2I CFG prompt produced no input ids")
+        raise RuntimeError(f"U1 native {segment_type} prompt produced no input ids")
     img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
     if input_ids[-1] != img_start_id:
-        raise RuntimeError("U1 native T2I CFG prompt must end with <img>")
+        raise RuntimeError(f"U1 native {segment_type} prompt must end with <img>")
     return UGSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
         messages=[UGInterleavedMessage(type="text", content="")],
-        srt_sidecar_role=U1_T2I_CFG_UNCONDITION_ROLE,
-        srt_sidecar_session_id=_u1_sidecar_session_id(
-            session,
-            U1_T2I_CFG_UNCONDITION_ROLE,
-        ),
+        srt_sidecar_role=role,
+        srt_sidecar_session_id=_u1_sidecar_session_id(session, role),
         adapter_metadata={
             "u1": {
-                "segment_type": "t2i_cfg_uncondition",
-                "source": "native_t2i_cfg_uncondition_prompt",
+                "segment_type": segment_type,
+                "source": source,
                 "prompt_ends_with_image_marker": True,
             }
         },
