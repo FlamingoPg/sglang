@@ -7,8 +7,8 @@ from pathlib import Path
 import torch
 from transformers import AutoConfig
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_u1 import (
-    U1PixelFlowGSegmentExecutor,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
+    SenseNovaU1PixelFlowGSegmentExecutor,
 )
 from sglang.srt.configs.model_config import is_multimodal_model
 from sglang.srt.configs.neo_chat import NEOChatConfig, NEOVisionConfig
@@ -130,7 +130,10 @@ class TestU1UGBackend(unittest.TestCase):
         self.assertIn("<image>", build_u1_vlm_prompt(question="what is here?"))
 
     def test_u1_pixel_flow_executor_declares_capability(self):
-        self.assertEqual(U1PixelFlowGSegmentExecutor.required_g_kind, "pixel_flow")
+        self.assertEqual(
+            SenseNovaU1PixelFlowGSegmentExecutor.required_g_kind,
+            "pixel_flow",
+        )
 
     def test_runtime_import_firewall_blocks_official_u1_imports(self):
         repo = Path(__file__).resolve().parents[5]

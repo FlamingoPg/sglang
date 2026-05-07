@@ -25,7 +25,7 @@ from sglang.srt.ug.context import UGContextBundle
 from sglang.srt.ug.runtime import UGInterleavedMessage
 
 
-class UGPipelineGSegmentExecutor(Protocol):
+class SenseNovaU1GSegmentExecutor(Protocol):
     required_g_kind: UGGKind | None
 
     def __call__(
@@ -38,7 +38,7 @@ class UGPipelineGSegmentExecutor(Protocol):
     ) -> UGGSegmentResult: ...
 
 
-class UGContextStage(PipelineStage):
+class SenseNovaU1ContextStage(PipelineStage):
     def __init__(self, bridge: UGMiddleBridge) -> None:
         super().__init__()
         self.bridge = bridge
@@ -55,7 +55,10 @@ class UGContextStage(PipelineStage):
             disagg_mode=server_args.disagg_mode,
         )
         if unsupported:
-            raise ValueError(f"Unsupported UGPipeline runtime settings: {unsupported}")
+            raise ValueError(
+                "Unsupported SenseNovaU1Pipeline runtime settings: "
+                f"{unsupported}"
+            )
 
         if batch.height is None:
             batch.height = pipeline_config.default_height
@@ -88,7 +91,9 @@ class UGContextStage(PipelineStage):
         if batch.condition_image is None and batch.image_path is not None:
             if isinstance(batch.image_path, list):
                 if len(batch.image_path) != 1:
-                    raise ValueError("UGPipeline MVP supports at most one input image")
+                    raise ValueError(
+                        "SenseNovaU1Pipeline MVP supports at most one input image"
+                    )
                 batch.condition_image = load_image(batch.image_path[0])
             else:
                 batch.condition_image = load_image(batch.image_path)
@@ -97,7 +102,8 @@ class UGContextStage(PipelineStage):
             batch.condition_image, Image.Image
         ):
             raise TypeError(
-                f"UGPipeline expects a PIL image input, got {type(batch.condition_image)}"
+                "SenseNovaU1Pipeline expects a PIL image input, got "
+                f"{type(batch.condition_image)}"
             )
 
         batch.extra["ug_contexts"] = self.bridge.prepare_u_context(
@@ -113,11 +119,11 @@ class UGContextStage(PipelineStage):
         return batch
 
 
-class UGGSegmentStage(PipelineStage):
+class SenseNovaU1GSegmentStage(PipelineStage):
     def __init__(
         self,
         bridge: UGMiddleBridge,
-        g_segment_executor: UGPipelineGSegmentExecutor,
+        g_segment_executor: SenseNovaU1GSegmentExecutor,
     ) -> None:
         super().__init__()
         self.bridge = bridge
@@ -148,7 +154,7 @@ class UGGSegmentStage(PipelineStage):
         return batch
 
 
-class UGDecodeStage(PipelineStage):
+class SenseNovaU1DecodeStage(PipelineStage):
     def __init__(self, bridge: UGMiddleBridge) -> None:
         super().__init__()
         self.bridge = bridge
@@ -162,7 +168,7 @@ class UGDecodeStage(PipelineStage):
         mode = normalize_ug_generation_mode(batch.extra.get("ug_mode"), default="t2i")
         generated_segment = batch.extra.get("ug_generated_segment")
         if generated_segment is None:
-            raise ValueError("UGDecodeStage requires a generated G segment")
+            raise ValueError("SenseNovaU1DecodeStage requires a generated G segment")
         else:
             image_for_append = generated_segment.image
         if contexts is not None and mode == "interleave":
@@ -191,7 +197,7 @@ class UGDecodeStage(PipelineStage):
 
 
 def _run_g_segment_executor(
-    executor: UGPipelineGSegmentExecutor,
+    executor: SenseNovaU1GSegmentExecutor,
     bridge: UGMiddleBridge,
     contexts: UGContextBundle,
     batch: Req,
@@ -207,7 +213,7 @@ def _run_g_segment_executor(
 
 def _validate_g_segment_capability(
     bridge: UGMiddleBridge,
-    executor: UGPipelineGSegmentExecutor,
+    executor: SenseNovaU1GSegmentExecutor,
 ) -> None:
     required_g_kind = getattr(executor, "required_g_kind", None)
     if required_g_kind is None:

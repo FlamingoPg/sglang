@@ -9,7 +9,7 @@ from sglang.srt.ug.middle import UGMiddleBridge
 from sglang.srt.ug.interleaved import UGGKind, UGGSegmentResult
 
 
-class U1PixelFlowGSegmentExecutor:
+class SenseNovaU1PixelFlowGSegmentExecutor:
     """SenseNova U1 pixel-flow G executor skeleton."""
 
     required_g_kind: UGGKind = "pixel_flow"

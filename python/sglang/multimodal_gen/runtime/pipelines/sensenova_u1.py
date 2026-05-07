@@ -10,14 +10,14 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
-    UGContextStage,
-    UGDecodeStage,
-    UGGSegmentStage,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.sensenova_u1 import (
+    SenseNovaU1ContextStage,
+    SenseNovaU1DecodeStage,
+    SenseNovaU1GSegmentStage,
     _normalize_pipeline_interleaved_messages,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_u1 import (
-    U1PixelFlowGSegmentExecutor,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
+    SenseNovaU1PixelFlowGSegmentExecutor,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.ug.adapter import UGModelRunnerAdapter
@@ -62,7 +62,7 @@ def _build_srt_owned_ug_runtime(
 def _build_srt_request_executor(scheduler=None):
     if scheduler is None:
         raise ValueError(
-            "UGPipeline requires an attached SRT scheduler so U owns the session/KV"
+            "SenseNovaU1Pipeline requires an attached SRT scheduler so U owns the session/KV"
         )
     return UGSRTSchedulerExecutor(scheduler)
 
@@ -110,19 +110,19 @@ def _build_u1_bridge(
 
 
 _UG_BACKENDS = (
-    (is_sensenova_u1_ug_model, _build_u1_bridge, U1PixelFlowGSegmentExecutor),
+    (is_sensenova_u1_ug_model, _build_u1_bridge, SenseNovaU1PixelFlowGSegmentExecutor),
 )
 
 
 def _build_ug_g_segment_executor(bridge: UGMiddleBridge):
     g_kind = getattr(bridge, "g_kind", None)
     if g_kind == "pixel_flow":
-        return U1PixelFlowGSegmentExecutor()
+        return SenseNovaU1PixelFlowGSegmentExecutor()
     raise ValueError(f"Unsupported UG G kind: {g_kind!r}")
 
 
-class UGPipeline(ComposedPipelineBase):
-    pipeline_name = "UGPipeline"
+class SenseNovaU1Pipeline(ComposedPipelineBase):
+    pipeline_name = "SenseNovaU1Pipeline"
     _required_config_modules: list[str] = []
 
     def load_modules(
@@ -152,9 +152,9 @@ class UGPipeline(ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs):
         bridge = self.get_module("ug_bridge")
         g_segment_executor = self.get_module("ug_g_segment_executor")
-        self.add_stage(UGContextStage(bridge))
-        self.add_stage(UGGSegmentStage(bridge, g_segment_executor))
-        self.add_stage(UGDecodeStage(bridge))
+        self.add_stage(SenseNovaU1ContextStage(bridge))
+        self.add_stage(SenseNovaU1GSegmentStage(bridge, g_segment_executor))
+        self.add_stage(SenseNovaU1DecodeStage(bridge))
 
     def forward(
         self,
@@ -171,7 +171,7 @@ class UGPipeline(ComposedPipelineBase):
         server_args: ServerArgs | None = None,
         **sampling_kwargs: Any,
     ) -> UGInterleavedResponse:
-        """Experimental UG interleaved API.
+        """Experimental SenseNova U1 interleaved API.
 
         This is intentionally Python-only and internal for now. It accepts a
         single interleaved request and returns ordered output segments without
@@ -230,8 +230,8 @@ class UGPipeline(ComposedPipelineBase):
     ) -> Req:
         bridge = self.get_module("ug_bridge")
         g_segment_executor = self.get_module("ug_g_segment_executor")
-        context_stage = UGContextStage(bridge)
-        g_stage = UGGSegmentStage(bridge, g_segment_executor)
+        context_stage = SenseNovaU1ContextStage(bridge)
+        g_stage = SenseNovaU1GSegmentStage(bridge, g_segment_executor)
 
         _apply_bridge_sampling_defaults(bridge, batch)
         batch = context_stage.forward(batch, server_args)
@@ -398,7 +398,7 @@ class UGPipeline(ComposedPipelineBase):
         ]
 
 
-EntryClass = UGPipeline
+EntryClass = SenseNovaU1Pipeline
 
 
 def _normalize_interleaved_request(
