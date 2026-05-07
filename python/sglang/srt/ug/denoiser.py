@@ -166,7 +166,7 @@ class SRTBackedUGMiddleBridge:
                                 "role": "think",
                                 "token_ids": [
                                     int(token_id)
-                                    for token_id in thinking.output_ids
+                                    for token_id in thinking.next_token_ids
                                 ],
                             },
                         }

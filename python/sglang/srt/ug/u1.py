@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
-import subprocess
-import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -96,103 +93,6 @@ class U1VLMBackend(Protocol):
         messages: list[UGInterleavedMessage],
         max_new_tokens: int,
     ) -> U1VLMBackendResult: ...
-
-
-class U1SubprocessVLMBackend:
-    """Opt-in external VLM runner for U1 parity.
-
-    This backend keeps the official/compatibility implementation out of the
-    SGLang runtime process. It is a parity bridge, not native SRT ModelRunner
-    execution.
-    """
-
-    def __init__(
-        self,
-        *,
-        python: str | Path,
-        repo: str | Path,
-        model_path: str | Path,
-        device: str = "cuda",
-        dtype: str = "bfloat16",
-        attn_backend: str = "sdpa",
-        timeout: int = 600,
-        cuda_visible_devices: str | None = None,
-        output_dir: str | Path | None = None,
-    ) -> None:
-        self.python = Path(python)
-        self.repo = Path(repo)
-        self.model_path = str(model_path)
-        self.device = device
-        self.dtype = dtype
-        self.attn_backend = attn_backend
-        self.timeout = int(timeout)
-        self.cuda_visible_devices = cuda_visible_devices
-        self.output_dir = Path(output_dir) if output_dir is not None else None
-
-    def generate_text(
-        self,
-        *,
-        messages: list[UGInterleavedMessage],
-        max_new_tokens: int,
-    ) -> U1VLMBackendResult:
-        image_path = _first_u1_image_path(messages)
-        question = _u1_question_text(messages)
-        output_dir = self._make_output_dir()
-        output_path = output_dir / "u1_vlm_candidate.txt"
-        cmd = [
-            str(self.python),
-            str(self.repo / "examples/vqa/inference.py"),
-            "--model_path",
-            self.model_path,
-            "--image",
-            str(image_path),
-            "--question",
-            question,
-            "--output",
-            str(output_path),
-            "--max_new_tokens",
-            str(int(max_new_tokens)),
-            "--device",
-            self.device,
-            "--dtype",
-            self.dtype,
-            "--attn_backend",
-            self.attn_backend,
-        ]
-        run_env = os.environ.copy()
-        if self.cuda_visible_devices is not None:
-            run_env["CUDA_VISIBLE_DEVICES"] = self.cuda_visible_devices
-        completed = subprocess.run(
-            cmd,
-            cwd=self.repo,
-            env=run_env,
-            text=True,
-            capture_output=True,
-            timeout=self.timeout,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(
-                "U1 VLM subprocess backend failed: "
-                f"returncode={completed.returncode}, stderr={_tail(completed.stderr)}"
-            )
-        if not output_path.exists():
-            raise RuntimeError("U1 VLM subprocess backend did not write output text")
-        return U1VLMBackendResult(
-            text=output_path.read_text(),
-            metadata={
-                "backend": "external_subprocess",
-                "native_srt_model_runner": False,
-                "command": cmd,
-                "stdout_tail": _tail(completed.stdout),
-                "stderr_tail": _tail(completed.stderr),
-            },
-        )
-
-    def _make_output_dir(self) -> Path:
-        if self.output_dir is not None:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            return self.output_dir
-        return Path(tempfile.mkdtemp(prefix="u1-vlm-backend-"))
 
 
 def is_sensenova_u1_ug_model(
@@ -1095,16 +995,6 @@ class U1SRTBackedUGMiddleBridge:
                     f"binding for session {sidecar_session_id}"
                 )
         native_executor = create_executor()
-        debug_dump_dir = getattr(self, "debug_tensor_dump_dir", None)
-        if debug_dump_dir is not None:
-            native_executor.debug_tensor_dump_dir = debug_dump_dir
-            native_executor.debug_tensor_dump_max_g_calls = int(
-                getattr(self, "debug_tensor_dump_max_g_calls", 32)
-            )
-            native_executor.debug_g_sublayer_layers = tuple(
-                int(layer_id)
-                for layer_id in getattr(self, "debug_g_sublayer_layers", (0,))
-            )
         return native_executor.generate(
             contexts=contexts,
             batch=batch,
@@ -2035,8 +1925,6 @@ class U1NativeSRTPixelFlowExecutor:
     ) -> None:
         self.srt_model = srt_model
         self.forward_batch_provider = forward_batch_provider
-        self.debug_tensor_dump_dir = None
-        self.debug_tensor_dump_max_g_calls = 32
 
     def generate(
         self,
@@ -2262,15 +2150,6 @@ class U1NativeSRTPixelFlowExecutor:
                 z=z,
                 image_size=image_size,
             )
-            self._dump_debug_g_call(
-                contexts=contexts,
-                branch="condition",
-                v=v_condition,
-                image_embeds=image_embeds,
-                indexes_image=indexes_image,
-                timestep=timestep,
-                z=z,
-            )
             if not use_cfg or not needs_cfg:
                 v_pred = v_condition
             elif cfg_img_scale == 1.0:
@@ -2281,15 +2160,6 @@ class U1NativeSRTPixelFlowExecutor:
                     timestep=timestep,
                     z=z,
                     image_size=image_size,
-                )
-                self._dump_debug_g_call(
-                    contexts=contexts,
-                    branch="text_uncondition",
-                    v=v_img_condition,
-                    image_embeds=image_embeds,
-                    indexes_image=indexes_image_img_condition,
-                    timestep=timestep,
-                    z=z,
                 )
                 v_pred = v_img_condition + cfg_text_scale * (
                     v_condition - v_img_condition
@@ -2303,15 +2173,6 @@ class U1NativeSRTPixelFlowExecutor:
                     z=z,
                     image_size=image_size,
                 )
-                self._dump_debug_g_call(
-                    contexts=contexts,
-                    branch="img_uncondition",
-                    v=v_uncondition,
-                    image_embeds=image_embeds,
-                    indexes_image=indexes_image_uncondition,
-                    timestep=timestep,
-                    z=z,
-                )
                 v_pred = v_uncondition + cfg_text_scale * (v_condition - v_uncondition)
             else:
                 v_img_condition = self._predict_v(
@@ -2322,15 +2183,6 @@ class U1NativeSRTPixelFlowExecutor:
                     z=z,
                     image_size=image_size,
                 )
-                self._dump_debug_g_call(
-                    contexts=contexts,
-                    branch="text_uncondition",
-                    v=v_img_condition,
-                    image_embeds=image_embeds,
-                    indexes_image=indexes_image_img_condition,
-                    timestep=timestep,
-                    z=z,
-                )
                 v_uncondition = self._predict_v(
                     prepared=prepared_uncondition,
                     image_embeds=image_embeds,
@@ -2338,15 +2190,6 @@ class U1NativeSRTPixelFlowExecutor:
                     timestep=timestep,
                     z=z,
                     image_size=image_size,
-                )
-                self._dump_debug_g_call(
-                    contexts=contexts,
-                    branch="img_uncondition",
-                    v=v_uncondition,
-                    image_embeds=image_embeds,
-                    indexes_image=indexes_image_uncondition,
-                    timestep=timestep,
-                    z=z,
                 )
                 v_pred = (
                     v_uncondition
@@ -2391,12 +2234,6 @@ class U1NativeSRTPixelFlowExecutor:
             "grid_hw": commit_grid_hw,
             "precomputed_embeddings": commit_embeddings,
         }
-        self._dump_debug_generated_image(
-            contexts=contexts,
-            image_prediction=image_prediction,
-            commit_embeddings=commit_embeddings,
-            commit_grid_hw=commit_grid_hw,
-        )
         return UGGSegmentResult(
             type="image",
             image=image,
@@ -2450,105 +2287,11 @@ class U1NativeSRTPixelFlowExecutor:
                 z=z,
                 image_size=image_size,
             )
-            self._last_predict_debug_payload = getattr(
-                self.srt_model,
-                "_last_u1_pixel_flow_debug",
-                None,
-            )
             return v
         finally:
             release = getattr(forward_batch_context, "release", None)
             if callable(release):
                 release()
-
-    def _dump_debug_g_call(
-        self,
-        *,
-        contexts: UGContextBundle,
-        branch: str,
-        v: Any,
-        image_embeds: Any,
-        indexes_image: Any,
-        timestep: Any,
-        z: Any,
-    ) -> None:
-        dump_dir = getattr(self, "debug_tensor_dump_dir", None)
-        if dump_dir is None:
-            return
-        metadata = contexts.full.metadata
-        call_index = int(metadata.get("_u1_debug_g_call_index", 0))
-        metadata["_u1_debug_g_call_index"] = call_index + 1
-        if call_index >= int(getattr(self, "debug_tensor_dump_max_g_calls", 32)):
-            return
-        import torch
-
-        dump_dir = Path(dump_dir)
-        dump_dir.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "call_index": call_index,
-            "branch": branch,
-            "input_embeds": image_embeds.detach().float().cpu(),
-            "v": v.detach().float().cpu(),
-            "indexes_image": indexes_image.detach().cpu(),
-            "timestep": float(timestep.detach().float().cpu().item()),
-            "z": z.detach().float().cpu(),
-        }
-        debug_payload = getattr(self, "_last_predict_debug_payload", None)
-        if isinstance(debug_payload, dict):
-            hidden_states = debug_payload.get("hidden_states")
-            if hidden_states is not None:
-                payload["hidden_states"] = hidden_states.detach().float().cpu()
-            x_pred = debug_payload.get("x_pred")
-            if x_pred is not None:
-                payload["x_pred"] = x_pred.detach().float().cpu()
-            layer_hidden_states = debug_payload.get("layer_hidden_states")
-            if layer_hidden_states is not None:
-                payload["layer_hidden_states"] = [
-                    {
-                        "layer": int(layer_index),
-                        "hidden_states": layer_hidden.detach().float().cpu(),
-                    }
-                    for layer_index, layer_hidden in layer_hidden_states
-                ]
-            sublayer_states = debug_payload.get("sublayer_states")
-            if sublayer_states is not None:
-                payload["sublayer_states"] = [
-                    {
-                        "layer": int(record["layer"]),
-                        "name": str(record["name"]),
-                        "hidden_states": record["hidden_states"].detach().float().cpu(),
-                    }
-                    for record in sublayer_states
-                ]
-        torch.save(payload, dump_dir / f"candidate_g_call_{call_index:04d}.pt")
-
-    def _dump_debug_generated_image(
-        self,
-        *,
-        contexts: UGContextBundle,
-        image_prediction: Any,
-        commit_embeddings: Any,
-        commit_grid_hw: Any,
-    ) -> None:
-        dump_dir = getattr(self, "debug_tensor_dump_dir", None)
-        if dump_dir is None:
-            return
-        metadata = contexts.full.metadata
-        image_index = int(metadata.get("_u1_debug_generated_image_index", 0))
-        metadata["_u1_debug_generated_image_index"] = image_index + 1
-        import torch
-
-        dump_dir = Path(dump_dir)
-        dump_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "image_index": image_index,
-                "image_prediction": image_prediction.detach().float().cpu(),
-                "commit_embeddings": commit_embeddings.detach().float().cpu(),
-                "commit_grid_hw": commit_grid_hw.detach().cpu(),
-            },
-            dump_dir / f"candidate_generated_image_{image_index:04d}.pt",
-        )
 
     @staticmethod
     def _apply_cfg_renorm(
@@ -3046,20 +2789,6 @@ def _not_wired() -> NotImplementedError:
     )
 
 
-def _first_u1_image_path(messages: list[UGInterleavedMessage]) -> Path:
-    content = _first_u1_image_content(messages)
-    if isinstance(content, (str, Path)):
-        return Path(content)
-    save = getattr(content, "save", None)
-    if callable(save):
-        path = Path(tempfile.mkdtemp(prefix="u1-vlm-image-")) / "image.png"
-        save(path)
-        return path
-    raise TypeError(
-        "U1 VLM image message must be a path or PIL image, " f"got {type(content)}"
-    )
-
-
 def _first_u1_image_content(messages: list[UGInterleavedMessage]) -> Any:
     for message in messages:
         if message.type != "image":
@@ -3074,13 +2803,3 @@ def _u1_question_text(messages: list[UGInterleavedMessage]) -> str:
     if not question:
         raise ValueError("U1 VLM text generation requires a text question")
     return question
-
-
-def _tail(text: str | bytes | None, *, limit: int = 2000) -> str | None:
-    if text is None:
-        return None
-    if isinstance(text, bytes):
-        text = text.decode("utf-8", errors="replace")
-    if len(text) <= limit:
-        return text
-    return text[-limit:]

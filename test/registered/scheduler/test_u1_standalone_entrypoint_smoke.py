@@ -67,9 +67,6 @@ def run_u1_standalone_entrypoint_from_env(env) -> Path:
         env.get("SGLANG_TEST_U1_STANDALONE_MEM_FRACTION_STATIC") or "0.25"
     )
     think = _parse_bool(env.get("SGLANG_TEST_U1_STANDALONE_THINK"), False)
-    dump_debug_tensors = _parse_bool(
-        env.get("SGLANG_TEST_U1_STANDALONE_DUMP_DEBUG_TENSORS"), False
-    )
 
     handle = create_u1_srt_scheduler(
         checkpoint_dir=model_path,
@@ -96,25 +93,6 @@ def run_u1_standalone_entrypoint_from_env(env) -> Path:
         set_global_server_args(server_args)
 
         pipeline = UGPipeline(model_path, server_args, executor=SimpleNamespace())
-        if dump_debug_tensors:
-            debug_dir = output_dir / "debug"
-            bridge = pipeline.get_module("ug_bridge")
-            setattr(bridge, "debug_tensor_dump_dir", str(debug_dir))
-            setattr(
-                bridge,
-                "debug_tensor_dump_max_g_calls",
-                int(env.get("SGLANG_TEST_U1_STANDALONE_DEBUG_MAX_G_CALLS") or "32"),
-            )
-            srt_executor = getattr(
-                getattr(bridge, "runtime", None), "srt_request_executor", None
-            )
-            if srt_executor is not None:
-                setattr(srt_executor, "debug_tensor_dump_dir", str(debug_dir))
-                setattr(
-                    srt_executor,
-                    "debug_tensor_dump_max_g_calls",
-                    int(env.get("SGLANG_TEST_U1_STANDALONE_DEBUG_MAX_G_CALLS") or "32"),
-                )
         sampling_params = UGSamplingParams(
             prompt=prompt,
             height=height,

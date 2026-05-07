@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -87,10 +86,6 @@ class UGSRTSchedulerExecutor:
         self.sync_step_count = 0
         self.temp_g_forward_count = 0
         self.temp_g_allocated_token_count = 0
-        self.debug_tensor_dump_dir = None
-        self.debug_tensor_dump_max_g_calls = 32
-        self.debug_g_sublayer_layers = (0,)
-        self._debug_temp_g_prefix_kv_call_index = 0
 
     @property
     def session_controller(self):
@@ -278,12 +273,6 @@ class UGSRTSchedulerExecutor:
             dtype=torch.int64,
             non_blocking=True,
         )
-        self._dump_debug_temp_g_prefix_kv(
-            model_runner=model_runner,
-            binding=binding,
-            prefix_indices=prefix_indices,
-            prefix_len=prefix_len,
-        )
         seq_len = prefix_len + extend_num_tokens
         self._check_context_capacity(req_to_token_pool, seq_len)
 
@@ -322,8 +311,6 @@ class UGSRTSchedulerExecutor:
                 extend_num_tokens=extend_num_tokens,
                 binding=binding,
                 device=device,
-                capture_g_layers=self.debug_tensor_dump_dir is not None,
-                debug_g_sublayer_layers=self.debug_g_sublayer_layers,
             )
             context = UGSRTTemporaryForwardBatch(
                 forward_batch=forward_batch,
@@ -607,8 +594,6 @@ class UGSRTSchedulerExecutor:
         extend_num_tokens: int,
         binding: UGSRTKVTokenBinding,
         device: torch.device,
-        capture_g_layers: bool = False,
-        debug_g_sublayer_layers: tuple[int, ...] = (0,),
     ) -> Any:
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -683,11 +668,6 @@ class UGSRTSchedulerExecutor:
             "attention_mode": "non_causal_query",
             "attention_mask_shape": (extend_num_tokens, seq_len),
         }
-        if capture_g_layers:
-            forward_batch.ug_debug_capture_g_layers = True
-            forward_batch.ug_debug_capture_g_sublayers = tuple(
-                int(layer_id) for layer_id in debug_g_sublayer_layers
-            )
         forward_batch.ug_g_non_causal_query_attention = True
         forward_batch.cross_attention_custom_mask = torch.ones(
             extend_num_tokens * seq_len,
@@ -695,57 +675,6 @@ class UGSRTSchedulerExecutor:
             device=device,
         )
         return forward_batch
-
-    def _dump_debug_temp_g_prefix_kv(
-        self,
-        *,
-        model_runner: Any,
-        binding: UGSRTKVTokenBinding,
-        prefix_indices: torch.Tensor,
-        prefix_len: int,
-    ) -> None:
-        dump_dir = getattr(self, "debug_tensor_dump_dir", None)
-        if not dump_dir:
-            return
-        call_index = int(self._debug_temp_g_prefix_kv_call_index)
-        self._debug_temp_g_prefix_kv_call_index = call_index + 1
-        if call_index >= int(getattr(self, "debug_tensor_dump_max_g_calls", 32)):
-            return
-        token_to_kv_pool = getattr(model_runner, "token_to_kv_pool", None)
-        if token_to_kv_pool is None:
-            return
-        def dump_layer_kv(layer_id: int) -> dict[str, torch.Tensor]:
-            key_buffer = token_to_kv_pool.get_key_buffer(layer_id)
-            value_buffer = token_to_kv_pool.get_value_buffer(layer_id)
-            return {
-                f"layer{layer_id}_keys": key_buffer[prefix_indices]
-                .detach()
-                .float()
-                .cpu(),
-                f"layer{layer_id}_values": value_buffer[prefix_indices]
-                .detach()
-                .float()
-                .cpu(),
-            }
-
-        payload = {
-            "call_index": call_index,
-            "session_id": binding.session_id,
-            "request_id": binding.request_id,
-            "prefix_len": prefix_len,
-            "prefix_indices": prefix_indices.detach().cpu(),
-        }
-        for layer_id in (0, 1, 2):
-            try:
-                payload.update(dump_layer_kv(layer_id))
-            except Exception as exc:
-                payload[f"layer{layer_id}_kv_error"] = repr(exc)
-        path = Path(dump_dir)
-        path.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            payload,
-            path / f"candidate_prefix_kv_{call_index:04d}.pt",
-        )
 
     def _request_token_indices(self, record: Any, req: Any) -> torch.Tensor | None:
         tree_cache = getattr(self.scheduler, "tree_cache", None)
