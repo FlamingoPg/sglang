@@ -11,10 +11,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
     SenseNovaU1PixelFlowGSegmentExecutor,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_context import (
-    U1SRTBackedUGMiddleBridge,
-    U1UGModelAdapter,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.sensenova_u1 import (
     SenseNovaU1ContextStage,
     SenseNovaU1DecodeStage,
@@ -22,7 +18,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.sensenova_u1 import (
     _normalize_pipeline_interleaved_messages,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.srt.ug.adapter import UGModelRunnerAdapter
 from sglang.srt.ug.interleaved import (
     DEFAULT_UG_TEXT_MAX_NEW_TOKENS,
     UGInterleavedRequest,
@@ -31,56 +26,7 @@ from sglang.srt.ug.interleaved import (
     normalize_ug_generation_mode,
 )
 from sglang.srt.ug.middle import UGMiddleBridge
-from sglang.srt.ug.runtime import UGSessionRuntime
-from sglang.srt.ug.srt_executor import UGSRTSchedulerExecutor
-
-
-def _build_srt_owned_session_runtime(
-    model_runner=None,
-    *,
-    scheduler=None,
-    srt_request_executor=None,
-    srt_u_decode_max_new_tokens: int = 0,
-) -> UGSessionRuntime:
-    if srt_request_executor is None:
-        srt_request_executor = _build_srt_request_executor(scheduler)
-    session_controller = srt_request_executor.session_controller
-    model_config = getattr(scheduler, "model_config", None)
-    return UGSessionRuntime(
-        model_runner=model_runner,
-        session_controller=session_controller,
-        srt_request_executor=srt_request_executor,
-        tokenizer=getattr(scheduler, "tokenizer", None),
-        vocab_size=getattr(model_config, "vocab_size", 32000),
-        srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
-    )
-
-
-def _build_srt_request_executor(scheduler=None):
-    if scheduler is None:
-        raise ValueError(
-            "SenseNovaU1Pipeline requires an attached SRT scheduler so U owns the session/KV"
-        )
-    return UGSRTSchedulerExecutor(scheduler)
-
-
-def _build_sensenova_u1_middle_bridge(
-    scheduler,
-    srt_request_executor,
-    srt_u_decode_max_new_tokens: int | None,
-) -> UGMiddleBridge:
-    if srt_u_decode_max_new_tokens is None:
-        srt_u_decode_max_new_tokens = 0
-    return U1SRTBackedUGMiddleBridge(
-        _build_srt_owned_session_runtime(
-            UGModelRunnerAdapter(
-                U1UGModelAdapter(native_tokenizer=getattr(scheduler, "tokenizer", None))
-            ),
-            scheduler=scheduler,
-            srt_request_executor=srt_request_executor,
-            srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
-        )
-    )
+from sglang.srt.ug.sensenova_u1 import build_sensenova_u1_middle_bridge
 
 
 def _build_sensenova_u1_g_segment_executor(bridge: UGMiddleBridge):
@@ -101,13 +47,11 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
     ) -> dict[str, Any]:
         modules = dict(loaded_modules or {})
         if "srt_middle_bridge" not in modules:
-            srt_request_executor = _build_srt_request_executor(
-                getattr(server_args, "ug_srt_scheduler", None)
-            )
-            modules["srt_middle_bridge"] = _build_sensenova_u1_middle_bridge(
-                getattr(server_args, "ug_srt_scheduler", None),
-                srt_request_executor,
-                getattr(server_args, "ug_srt_u_decode_max_new_tokens", None),
+            modules["srt_middle_bridge"] = build_sensenova_u1_middle_bridge(
+                scheduler=getattr(server_args, "ug_srt_scheduler", None),
+                srt_u_decode_max_new_tokens=getattr(
+                    server_args, "ug_srt_u_decode_max_new_tokens", None
+                ),
             )
         if "g_segment_executor" not in modules:
             modules["g_segment_executor"] = _build_sensenova_u1_g_segment_executor(
