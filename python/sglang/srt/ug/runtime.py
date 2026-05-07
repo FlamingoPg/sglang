@@ -17,30 +17,6 @@ from sglang.srt.ug.context import (
 )
 
 
-class _UGSimpleTokenizer:
-    bos_token_id = 1
-
-
-@dataclass(slots=True)
-class _UGSessionMMItem:
-    offsets: list[tuple[int, int]]
-    feature: Any | None = field(default_factory=object)
-
-
-@dataclass(slots=True)
-class _UGSessionMMInputs:
-    mm_items: list[_UGSessionMMItem]
-    release_count: int = 0
-
-    def merge(self, other: "_UGSessionMMInputs") -> None:
-        self.mm_items.extend(other.mm_items)
-
-    def release_features(self) -> None:
-        self.release_count += 1
-        for item in self.mm_items:
-            item.feature = None
-
-
 class UGSegmentState(str, Enum):
     U_PREFILL = "u_prefill"
     U_DECODE = "u_decode"
@@ -161,7 +137,7 @@ class UGSessionRecord:
     srt_last_u_decode_output_ids: list[int] = field(default_factory=list)
     srt_last_u_decode_text: str = ""
     srt_mm_offsets: list[tuple[int, int]] = field(default_factory=list)
-    srt_mm_inputs: _UGSessionMMInputs | None = None
+    srt_mm_inputs: Any | None = None
     srt_executed_request_count: int = 0
     srt_model_runner_forward_request_ids: set[str] = field(default_factory=set)
     srt_sidecar_session_ids: set[str] = field(default_factory=set)
@@ -246,18 +222,14 @@ class UGSessionRuntime:
         tokenizer: Any | None = None,
         vocab_size: int = 32000,
         srt_u_decode_max_new_tokens: int = 0,
-        srt_image_tokenization: Literal[
-            "multimodal", "text_placeholder"
-        ] = "multimodal",
     ) -> None:
         self.model_runner = model_runner
         self.session_controller = session_controller
         self.srt_request_executor = srt_request_executor
         self.capacity_of_str_len = capacity_of_str_len
-        self.tokenizer = tokenizer or _UGSimpleTokenizer()
+        self.tokenizer = tokenizer
         self.vocab_size = vocab_size
         self.srt_u_decode_max_new_tokens = srt_u_decode_max_new_tokens
-        self.srt_image_tokenization = srt_image_tokenization
         self._records: dict[str, UGSessionRecord] = {}
         register_observer = getattr(
             self.srt_request_executor,
@@ -822,60 +794,22 @@ class UGSessionRuntime:
 
         prepare_one = getattr(self.model_runner, "prepare_srt_u_message_inputs", None)
         if not callable(prepare_one):
-            input_ids, input_text, mm_inputs = self._tokenize_interleaved_messages(
-                messages
+            raise RuntimeError(
+                f"{self.model_runner.__class__.__name__} must provide explicit "
+                "UG SRT prepared inputs; runtime fallback tokenization is disabled"
             )
-            return [
-                UGSRTPreparedInput(
-                    input_ids=input_ids,
-                    input_text=input_text,
-                    messages=messages,
-                    mm_inputs=mm_inputs,
-                )
-            ]
 
         prepared_inputs: list[UGSRTPreparedInput] = []
-        default_messages: list[UGInterleavedMessage] = []
-        used_custom = False
-
-        def flush_default() -> None:
-            if not default_messages:
-                return
-            input_ids, input_text, mm_inputs = self._tokenize_interleaved_messages(
-                default_messages
-            )
-            prepared_inputs.append(
-                UGSRTPreparedInput(
-                    input_ids=input_ids,
-                    input_text=input_text,
-                    messages=list(default_messages),
-                    mm_inputs=mm_inputs,
-                )
-            )
-            default_messages.clear()
-
         for message in messages:
             custom = prepare_one(record=record, message=message, state=state)
             if custom is None:
-                default_messages.append(message)
-                continue
-            used_custom = True
-            flush_default()
-            prepared_inputs.extend(custom)
-
-        if not used_custom:
-            input_ids, input_text, mm_inputs = self._tokenize_interleaved_messages(
-                messages
-            )
-            return [
-                UGSRTPreparedInput(
-                    input_ids=input_ids,
-                    input_text=input_text,
-                    messages=messages,
-                    mm_inputs=mm_inputs,
+                raise RuntimeError(
+                    f"{self.model_runner.__class__.__name__} did not prepare UG "
+                    f"SRT input for message type {message.type!r}"
                 )
-            ]
-        flush_default()
+            prepared_inputs.extend(custom)
+        if not prepared_inputs:
+            raise RuntimeError("UG SRT prepared inputs must not be empty")
         return prepared_inputs
 
     def _apply_prepared_srt_input(
@@ -1119,7 +1053,7 @@ class UGSessionRuntime:
         request_id: str,
         input_ids: list[int],
         input_text: str,
-        mm_inputs: _UGSessionMMInputs | None,
+        mm_inputs: Any | None,
         max_new_tokens: int,
         drop_previous_output: bool = False,
         greedy: bool = False,
@@ -1376,49 +1310,6 @@ class UGSessionRuntime:
                 f"UGSRTKVTokenBinding, got {type(binding).__name__}"
             )
         return binding
-
-    def _tokenize_interleaved_messages(
-        self, messages: list[UGInterleavedMessage]
-    ) -> tuple[list[int], str, _UGSessionMMInputs | None]:
-        input_ids = [self._bos_token_id()]
-        text_parts: list[str] = []
-        mm_items: list[_UGSessionMMItem] = []
-        for message in messages:
-            if message.type == "text":
-                text = str(message.content)
-                text_parts.append(text)
-                input_ids.extend(self._text_token_ids(text))
-            elif message.type == "image":
-                if self.srt_image_tokenization == "text_placeholder":
-                    input_ids.extend(self._text_token_ids("<image>"))
-                else:
-                    start = len(input_ids)
-                    input_ids.extend([self.vocab_size + 1, self.vocab_size + 2])
-                    mm_items.append(_UGSessionMMItem(offsets=[(start, len(input_ids))]))
-                text_parts.append("<image>")
-            else:
-                raise ValueError(f"Unsupported UG message type: {message.type}")
-        mm_inputs = _UGSessionMMInputs(mm_items) if mm_items else None
-        return input_ids, " ".join(text_parts), mm_inputs
-
-    def _bos_token_id(self) -> int:
-        token_id = getattr(self.tokenizer, "bos_token_id", None)
-        if token_id is None:
-            token_id = getattr(self.tokenizer, "eos_token_id", None)
-        return int(token_id) if token_id is not None else 1
-
-    def _text_token_ids(self, text: str) -> list[int]:
-        encode = getattr(self.tokenizer, "encode", None)
-        if callable(encode):
-            try:
-                return list(encode(text, add_special_tokens=False))
-            except TypeError:
-                return list(encode(text))
-        return self._fallback_text_token_ids(text)
-
-    @staticmethod
-    def _fallback_text_token_ids(text: str) -> list[int]:
-        return [100 + (sum(word.encode("utf-8")) % 1000) for word in text.split()]
 
     @staticmethod
     def _collect_mm_offsets(mm_inputs: Any | None) -> list[tuple[int, int]]:

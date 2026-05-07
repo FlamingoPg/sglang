@@ -4,7 +4,13 @@ import math
 import unittest
 
 from sglang.multimodal_gen.configs.pipeline_configs.ug import UGPipelineConfig
-from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
+from sglang.multimodal_gen.configs.sample.ug import (
+    UGSamplingParams,
+    mark_ug_explicit_sampling_fields,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_bagel import (
+    apply_bagel_official_sampling_defaults,
+)
 from sglang.multimodal_gen.runtime.pipelines.ug import _resolve_vlm_max_new_tokens
 from sglang.srt.ug.interleaved import DEFAULT_UG_TEXT_MAX_NEW_TOKENS
 
@@ -29,7 +35,9 @@ class TestUGSamplingParams(unittest.TestCase):
             UGSamplingParams(cfg_interval=[0.1])
 
     def test_cfg_renorm_type_must_be_known(self):
-        self.assertEqual(UGSamplingParams(cfg_renorm_type="none").cfg_renorm_type, "none")
+        self.assertEqual(
+            UGSamplingParams(cfg_renorm_type="none").cfg_renorm_type, "none"
+        )
 
         with self.assertRaisesRegex(ValueError, "cfg_renorm_type"):
             UGSamplingParams(cfg_renorm_type="local")
@@ -40,6 +48,49 @@ class TestUGSamplingParams(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "cfg_img_scale"):
             UGSamplingParams(cfg_img_scale=-1.0)
+
+    def test_bagel_official_defaults_are_model_specific(self):
+        t2i_params = UGSamplingParams(prompt="a cup")
+
+        apply_bagel_official_sampling_defaults(
+            t2i_params,
+            mode="t2i",
+            has_input_image=False,
+        )
+
+        self.assertEqual(t2i_params.cfg_text_scale, 4.0)
+        self.assertEqual(t2i_params.cfg_img_scale, 1.5)
+        self.assertEqual(t2i_params.cfg_interval, [0.4, 1.0])
+        self.assertEqual(t2i_params.cfg_renorm_type, "global")
+        self.assertEqual(t2i_params.num_inference_steps, 50)
+
+        edit_params = UGSamplingParams(prompt="edit the cup")
+
+        apply_bagel_official_sampling_defaults(
+            edit_params,
+            mode="interleave",
+            has_input_image=True,
+        )
+
+        self.assertEqual(edit_params.cfg_text_scale, 4.0)
+        self.assertEqual(edit_params.cfg_img_scale, 2.0)
+        self.assertEqual(edit_params.cfg_interval, [0.0, 1.0])
+        self.assertEqual(edit_params.cfg_renorm_type, "text_channel")
+
+    def test_bagel_defaults_do_not_clobber_explicit_user_values(self):
+        params = mark_ug_explicit_sampling_fields(
+            UGSamplingParams(cfg_text_scale=1.0, cfg_img_scale=1.0),
+            {"cfg_text_scale"},
+        )
+
+        apply_bagel_official_sampling_defaults(
+            params,
+            mode="t2i",
+            has_input_image=False,
+        )
+
+        self.assertEqual(params.cfg_text_scale, 1.0)
+        self.assertEqual(params.cfg_img_scale, 1.5)
 
 
 class TestUGPipelineConfig(unittest.TestCase):

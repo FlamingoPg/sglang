@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 UGGenerationMode = Literal["t2i", "edit", "interleave", "vlm"]
-UGGKind = Literal["latent_flow", "pixel_flow", "native_ar_image"]
+UGGKind = Literal["latent_flow", "pixel_flow"]
 DEFAULT_UG_TEXT_MAX_NEW_TOKENS = 128
 
 _UG_MODE_ALIASES = {

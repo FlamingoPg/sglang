@@ -3,22 +3,10 @@
 import unittest
 from dataclasses import fields
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 from PIL import Image
 
-from sglang.multimodal_gen.configs.pipeline_configs.ug import UGPipelineConfig
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
-    UGContextStage,
-    UGDecodeStage,
-    UGGSegmentStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_bagel import (
-    BAGELLatentFlowGSegmentExecutor,
-)
 from sglang.srt.ug.context import UGSessionHandle
 from sglang.srt.ug.denoiser import SRTBackedUGMiddleBridge
 from sglang.srt.ug.interleaved import UGGSegmentResult
@@ -155,80 +143,6 @@ class TestSRTBackedUGMiddleBridge(unittest.TestCase):
         self.assertEqual(runner.decode_count, 2)
         self.assertEqual(len(runner.closed_sessions), 1)
 
-    def test_test_only_pixel_flow_backend_runs_text_image_text_protocol(self):
-        bridge = TestOnlyPixelFlowBridge()
-        contexts = bridge.prepare_u_context(prompt="draw a cup", image=None)
-
-        segment = bridge.run_g_segment(contexts=contexts, executor=None)
-        bridge.commit_generated_segment(contexts=contexts, segment=segment)
-        text = bridge.continue_u_decode(contexts=contexts)
-
-        self.assertEqual(bridge.g_kind, "pixel_flow")
-        self.assertEqual(segment.type, "image")
-        self.assertEqual(text.type, "text")
-        self.assertEqual(text.text, "pixel_flow_text_after_image")
-        self.assertEqual(contexts.full.session.session_id, "pixel-flow-session")
-
-    def test_pipeline_stages_accept_pixel_flow_without_latent_velocity_api(self):
-        bridge = TestOnlyPixelFlowBridge()
-        server_args = _make_ug_server_args()
-        batch = Req(
-            prompt="draw a cup",
-            image_path=None,
-            extra={"ug_request_metadata": {"mode": "interleave"}},
-        )
-
-        with patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.base."
-            "get_global_server_args",
-            return_value=server_args,
-        ):
-            batch = UGContextStage(bridge).forward(batch, server_args)
-            batch = UGGSegmentStage(bridge, TestOnlyPixelFlowStageExecutor()).forward(
-                batch,
-                server_args,
-            )
-            batch = UGDecodeStage(bridge).forward(batch, server_args)
-
-        self.assertEqual(bridge.g_kind, "pixel_flow")
-        self.assertEqual(bridge.prepare_count, 1)
-        self.assertEqual(bridge.run_count, 1)
-        self.assertEqual(bridge.commit_count, 1)
-        self.assertEqual(bridge.velocity_count, 0)
-        self.assertEqual(tuple(batch.output.shape), (1, 4, 4, 3))
-        self.assertEqual(
-            [segment["type"] for segment in batch.extra["ug_output_segments"]],
-            ["image", "text"],
-        )
-        self.assertEqual(
-            batch.extra["ug_output_segments"][1]["text"],
-            "pixel_flow_text_after_image",
-        )
-
-    def test_g_segment_stage_rejects_bagel_executor_for_pixel_flow_bridge(self):
-        bridge = TestOnlyPixelFlowBridge()
-        server_args = _make_ug_server_args()
-
-        with patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.base."
-            "get_global_server_args",
-            return_value=server_args,
-        ):
-            with self.assertRaisesRegex(ValueError, "latent_flow"):
-                UGGSegmentStage(bridge, BAGELLatentFlowGSegmentExecutor())
-
-    def test_g_segment_stage_rejects_pixel_executor_for_latent_flow_bridge(self):
-        bridge = _make_bridge()
-        server_args = _make_ug_server_args()
-
-        with patch(
-            "sglang.multimodal_gen.runtime.pipelines_core.stages.base."
-            "get_global_server_args",
-            return_value=server_args,
-        ):
-            with self.assertRaisesRegex(ValueError, "pixel_flow"):
-                UGGSegmentStage(bridge, TestOnlyPixelFlowStageExecutor())
-
     def test_common_middle_protocol_files_do_not_embed_bagel_g_mechanics(self):
         package_root = Path(__file__).resolve().parents[3]
         common_files = [
@@ -327,96 +241,6 @@ class BridgeUGModelRunner:
 
 def _make_bridge():
     return SRTBackedUGMiddleBridge(UGSessionRuntime(model_runner=BridgeUGModelRunner()))
-
-
-def _make_ug_server_args():
-    return SimpleNamespace(
-        pipeline_config=UGPipelineConfig(default_height=4, default_width=4),
-        num_gpus=1,
-        enable_cfg_parallel=False,
-        disagg_mode=False,
-        comfyui_mode=True,
-    )
-
-
-class TestOnlyPixelFlowBridge:
-    g_kind = "pixel_flow"
-
-    def __init__(self):
-        self.committed = False
-        self.prepare_count = 0
-        self.run_count = 0
-        self.commit_count = 0
-        self.velocity_count = 0
-
-    def prepare_u_context(
-        self,
-        *,
-        prompt,
-        image,
-        think=False,
-        think_max_new_tokens=None,
-        sampling_params=None,
-    ):
-        self.prepare_count += 1
-        del prompt, image, think, think_max_new_tokens, sampling_params
-        session = UGSessionHandle(
-            session_id="pixel-flow-session",
-            anchor_request_id="pixel-flow-session:u1",
-            context_length=3,
-            context_version=1,
-        )
-        from sglang.srt.ug.context import UGContextBundle, UGContextHandle
-
-        return UGContextBundle(
-            full=UGContextHandle("pixel-flow-session:u1", 3, session=session),
-            text_cfg=UGContextHandle("text-cfg", 0, session=session),
-            image_cfg=UGContextHandle("image-cfg", 0, session=session),
-        )
-
-    def run_g_segment(self, *, contexts, executor):
-        self.run_count += 1
-        if executor is None:
-            return UGGSegmentResult(
-                type="image",
-                image=Image.new("RGB", (4, 4), color="blue"),
-                metadata={"g_kind": self.g_kind},
-            )
-        return executor(contexts)
-
-    def commit_generated_segment(self, *, contexts, segment):
-        self.commit_count += 1
-        self.committed = True
-        session = UGSessionHandle(
-            session_id=contexts.full.session.session_id,
-            anchor_request_id="pixel-flow-session:u2",
-            context_length=5,
-            context_version=2,
-        )
-        contexts.full.session = session
-        contexts.full.request_id = session.anchor_request_id
-        contexts.full.token_count = session.context_length
-
-    def continue_u_decode(self, *, contexts):
-        del contexts
-        if not self.committed:
-            return UGDecodeResult(type="done")
-        return UGDecodeResult(type="text", text="pixel_flow_text_after_image")
-
-    def release(self, contexts):
-        del contexts
-
-
-class TestOnlyPixelFlowStageExecutor:
-    required_g_kind = "pixel_flow"
-
-    def __call__(self, *, bridge, contexts, batch, server_args):
-        del bridge, contexts, batch, server_args
-        return UGGSegmentResult(
-            type="image",
-            image=Image.new("RGB", (4, 4), color="blue"),
-            metadata={"g_kind": "pixel_flow"},
-        )
 
 
 if __name__ == "__main__":

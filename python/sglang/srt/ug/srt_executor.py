@@ -46,19 +46,6 @@ class UGSRTTemporaryForwardBatch:
                 self.req_to_token_pool.free(self.temp_req)
 
 
-class UGSRTRequestBoundaryExecutor:
-    """Records materialized UG SRT requests at the execution boundary."""
-
-    finish_request_after_execute = True
-
-    def execute_ug_request(self, *, record, req, state) -> None:
-        del record, req, state
-
-    def pad_input_ids(self, input_ids: list[int], mm_inputs: Any) -> list[int]:
-        del mm_inputs
-        return list(input_ids)
-
-
 class UGSRTSchedulerExecutor:
     """Minimal adapter from UG materialized requests into an SRT Scheduler."""
 

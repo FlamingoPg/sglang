@@ -728,29 +728,11 @@ class NEOQwen3Attention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         else:
             q, k, v = projected_qkv
-        _record_u1_u_sublayer_state(forward_batch, "attn_q_proj", q)
-        _record_u1_u_sublayer_state(forward_batch, "attn_k_proj", k)
-        _record_u1_u_sublayer_state(forward_batch, "attn_v_proj", v)
-        _record_u1_g_sublayer_state(forward_batch, "attn_q_proj", q)
-        _record_u1_g_sublayer_state(forward_batch, "attn_k_proj", k)
-        _record_u1_g_sublayer_state(forward_batch, "attn_v_proj", v)
 
         q = self._split_u1_heads(q, self.num_heads, q_norm, q_norm_hw)
         k = self._split_u1_heads(k, self.num_kv_heads, k_norm, k_norm_hw)
         q_t, q_h, q_w = q
         k_t, k_h, k_w = k
-        _record_u1_u_sublayer_state(forward_batch, "attn_q_norm_t", q_t)
-        _record_u1_u_sublayer_state(forward_batch, "attn_q_norm_h", q_h)
-        _record_u1_u_sublayer_state(forward_batch, "attn_q_norm_w", q_w)
-        _record_u1_u_sublayer_state(forward_batch, "attn_k_norm_t", k_t)
-        _record_u1_u_sublayer_state(forward_batch, "attn_k_norm_h", k_h)
-        _record_u1_u_sublayer_state(forward_batch, "attn_k_norm_w", k_w)
-        _record_u1_g_sublayer_state(forward_batch, "attn_q_norm_t", q_t)
-        _record_u1_g_sublayer_state(forward_batch, "attn_q_norm_h", q_h)
-        _record_u1_g_sublayer_state(forward_batch, "attn_q_norm_w", q_w)
-        _record_u1_g_sublayer_state(forward_batch, "attn_k_norm_t", k_t)
-        _record_u1_g_sublayer_state(forward_batch, "attn_k_norm_h", k_h)
-        _record_u1_g_sublayer_state(forward_batch, "attn_k_norm_w", k_w)
 
         q_t, k_t = self._apply_rotary(
             self.rotary_emb,
@@ -773,18 +755,6 @@ class NEOQwen3Attention(nn.Module):
             k_w,
             self.spatial_head_dim,
         )
-        _record_u1_u_sublayer_state(forward_batch, "attn_q_rope_t", q_t)
-        _record_u1_u_sublayer_state(forward_batch, "attn_q_rope_h", q_h)
-        _record_u1_u_sublayer_state(forward_batch, "attn_q_rope_w", q_w)
-        _record_u1_u_sublayer_state(forward_batch, "attn_k_rope_t", k_t)
-        _record_u1_u_sublayer_state(forward_batch, "attn_k_rope_h", k_h)
-        _record_u1_u_sublayer_state(forward_batch, "attn_k_rope_w", k_w)
-        _record_u1_g_sublayer_state(forward_batch, "attn_q_rope_t", q_t)
-        _record_u1_g_sublayer_state(forward_batch, "attn_q_rope_h", q_h)
-        _record_u1_g_sublayer_state(forward_batch, "attn_q_rope_w", q_w)
-        _record_u1_g_sublayer_state(forward_batch, "attn_k_rope_t", k_t)
-        _record_u1_g_sublayer_state(forward_batch, "attn_k_rope_h", k_h)
-        _record_u1_g_sublayer_state(forward_batch, "attn_k_rope_w", k_w)
 
         num_tokens = hidden_states.shape[0]
         q = torch.cat(
@@ -803,19 +773,9 @@ class NEOQwen3Attention(nn.Module):
             ],
             dim=-1,
         ).reshape(num_tokens, self.kv_size)
-        _record_u1_u_sublayer_state(forward_batch, "attn_q_ready", q)
-        _record_u1_u_sublayer_state(forward_batch, "attn_k_ready", k)
-        _record_u1_u_sublayer_state(forward_batch, "attn_v_ready", v)
-        _record_u1_g_sublayer_state(forward_batch, "attn_q_ready", q)
-        _record_u1_g_sublayer_state(forward_batch, "attn_k_ready", k)
-        _record_u1_g_sublayer_state(forward_batch, "attn_v_ready", v)
 
         attn_output = self.attn(q, k, v, forward_batch)
-        _record_u1_u_sublayer_state(forward_batch, "attn_context", attn_output)
-        _record_u1_g_sublayer_state(forward_batch, "attn_context", attn_output)
         output, _ = output_proj(attn_output)
-        _record_u1_u_sublayer_state(forward_batch, "attn_o_proj_out", output)
-        _record_u1_g_sublayer_state(forward_batch, "attn_o_proj_out", output)
         return output
 
     def _apply_rotary(
@@ -894,62 +854,6 @@ class NEOQwen3Attention(nn.Module):
         )
 
 
-def _record_u1_g_sublayer_state(
-    forward_batch: ForwardBatch,
-    name: str,
-    hidden_states: torch.Tensor,
-) -> None:
-    if not _capture_u1_g_sublayer_state(forward_batch):
-        return
-    records = getattr(forward_batch, "ug_debug_g_sublayer_states", None)
-    if records is None:
-        return
-    layer_index = getattr(forward_batch, "ug_debug_current_g_layer", None)
-    records.append(
-        {
-            "layer": int(layer_index),
-            "name": name,
-            "hidden_states": hidden_states,
-        }
-    )
-
-
-def _capture_u1_g_sublayer_state(forward_batch: ForwardBatch) -> bool:
-    layer_index = getattr(forward_batch, "ug_debug_current_g_layer", None)
-    capture_layers = getattr(forward_batch, "ug_debug_capture_g_sublayers", ())
-    if layer_index is None or int(layer_index) not in capture_layers:
-        return False
-    return getattr(forward_batch, "ug_debug_g_sublayer_states", None) is not None
-
-
-def _record_u1_u_sublayer_state(
-    forward_batch: ForwardBatch,
-    name: str,
-    hidden_states: torch.Tensor,
-) -> None:
-    if not _capture_u1_u_sublayer_state(forward_batch):
-        return
-    records = getattr(forward_batch, "ug_debug_u_sublayer_states", None)
-    if records is None:
-        return
-    layer_index = getattr(forward_batch, "ug_debug_current_u_layer", None)
-    records.append(
-        {
-            "layer": int(layer_index),
-            "name": name,
-            "hidden_states": hidden_states,
-        }
-    )
-
-
-def _capture_u1_u_sublayer_state(forward_batch: ForwardBatch) -> bool:
-    layer_index = getattr(forward_batch, "ug_debug_current_u_layer", None)
-    capture_layers = getattr(forward_batch, "ug_debug_capture_u_sublayers", ())
-    if layer_index is None or int(layer_index) not in capture_layers:
-        return False
-    return getattr(forward_batch, "ug_debug_u_sublayer_states", None) is not None
-
-
 class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
     def __init__(
         self,
@@ -1012,27 +916,18 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
         if post_residual_addition is not None:
             hidden_states = hidden_states + post_residual_addition
 
-        _record_u1_u_sublayer_state(forward_batch, "layer_input", hidden_states)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        _record_u1_u_sublayer_state(forward_batch, "input_norm", hidden_states)
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-            _record_u1_u_sublayer_state(forward_batch, "attn_out", hidden_states)
 
         hidden_states = residual + hidden_states
-        _record_u1_u_sublayer_state(
-            forward_batch,
-            "post_attn_residual",
-            hidden_states,
-        )
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        _record_u1_u_sublayer_state(forward_batch, "post_attn_norm", hidden_states)
         if self._use_reference_u_mlp_path(forward_batch):
             hidden_states = self._forward_reference_u_mlp(
                 hidden_states,
@@ -1040,9 +935,7 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
             )
         else:
             hidden_states = self.mlp(hidden_states)
-        _record_u1_u_sublayer_state(forward_batch, "mlp_out", hidden_states)
         hidden_states = residual + hidden_states
-        _record_u1_u_sublayer_state(forward_batch, "layer_out", hidden_states)
         return hidden_states, None
 
     @staticmethod
@@ -1071,11 +964,7 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
 
         gate = F.linear(hidden_states, gate_weight, gate_bias)
         up = F.linear(hidden_states, up_weight, up_bias)
-        _record_u1_u_sublayer_state(forward_batch, "mlp_gate", gate)
-        _record_u1_u_sublayer_state(forward_batch, "mlp_up", up)
-        _record_u1_u_sublayer_state(forward_batch, "mlp_act", F.silu(gate))
         hidden_states = F.silu(gate) * up
-        _record_u1_u_sublayer_state(forward_batch, "mlp_act_mul", hidden_states)
 
         down_proj = self.mlp.down_proj
         down_weight = getattr(down_proj, "weight", None)
@@ -1092,13 +981,11 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        _record_u1_g_sublayer_state(forward_batch, "layer_input", hidden_states)
         if residual is not None:
             hidden_states = hidden_states + residual
 
         residual = hidden_states
         hidden_states = self.input_layernorm_mot_gen(hidden_states)
-        _record_u1_g_sublayer_state(forward_batch, "input_norm", hidden_states)
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn.forward_gen(
@@ -1106,24 +993,15 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-            _record_u1_g_sublayer_state(forward_batch, "attn_out", hidden_states)
 
         hidden_states = residual + hidden_states
-        _record_u1_g_sublayer_state(
-            forward_batch,
-            "post_attn_residual",
-            hidden_states,
-        )
         residual = hidden_states
         hidden_states = self.post_attention_layernorm_mot_gen(hidden_states)
-        _record_u1_g_sublayer_state(forward_batch, "post_attn_norm", hidden_states)
         hidden_states = self._forward_reference_g_mlp(
             hidden_states,
             forward_batch=forward_batch,
         )
-        _record_u1_g_sublayer_state(forward_batch, "mlp_out", hidden_states)
         hidden_states = residual + hidden_states
-        _record_u1_g_sublayer_state(forward_batch, "layer_out", hidden_states)
         return hidden_states, None
 
     def _forward_reference_g_mlp(
@@ -1148,11 +1026,7 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
 
         gate = F.linear(hidden_states, gate_weight, gate_bias)
         up = F.linear(hidden_states, up_weight, up_bias)
-        _record_u1_g_sublayer_state(forward_batch, "mlp_gate", gate)
-        _record_u1_g_sublayer_state(forward_batch, "mlp_up", up)
-        _record_u1_g_sublayer_state(forward_batch, "mlp_act", F.silu(gate))
         hidden_states = F.silu(gate) * up
-        _record_u1_g_sublayer_state(forward_batch, "mlp_act_mul", hidden_states)
 
         down_proj = self.mlp_mot_gen.down_proj
         down_weight = getattr(down_proj, "weight", None)
@@ -1207,19 +1081,8 @@ class NEOQwen3Model(Qwen2Model):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        capture_layer_hidden_states = bool(
-            getattr(forward_batch, "ug_debug_capture_u_layers", False)
-        )
-        layer_hidden_states = [] if capture_layer_hidden_states else None
-        self._last_u1_u_hidden_states = None
-        self._last_u1_u_layer_hidden_states = None
-        self._last_u1_u_sublayer_states = None
-        if capture_layer_hidden_states:
-            forward_batch.ug_debug_u_sublayer_states = []
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
-            if capture_layer_hidden_states:
-                forward_batch.ug_debug_current_u_layer = int(i)
             if i in self.layers_to_capture:
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
@@ -1231,8 +1094,6 @@ class NEOQwen3Model(Qwen2Model):
                 forward_batch,
                 residual,
             )
-            if layer_hidden_states is not None:
-                layer_hidden_states.append((int(i), hidden_states))
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -1247,15 +1108,6 @@ class NEOQwen3Model(Qwen2Model):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
-
-        if layer_hidden_states is not None:
-            self._last_u1_u_hidden_states = hidden_states
-            self._last_u1_u_layer_hidden_states = layer_hidden_states
-            self._last_u1_u_sublayer_states = getattr(
-                forward_batch,
-                "ug_debug_u_sublayer_states",
-                None,
-            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1275,17 +1127,7 @@ class NEOQwen3Model(Qwen2Model):
 
         hidden_states = input_embeds
         residual = None
-        capture_layer_hidden_states = bool(
-            getattr(forward_batch, "ug_debug_capture_g_layers", False)
-        )
-        layer_hidden_states = [] if capture_layer_hidden_states else None
-        self._last_u1_gen_layer_hidden_states = None
-        self._last_u1_gen_sublayer_states = None
-        if capture_layer_hidden_states:
-            forward_batch.ug_debug_g_sublayer_states = []
         for i in range(self.start_layer, self.end_layer):
-            if capture_layer_hidden_states:
-                forward_batch.ug_debug_current_g_layer = int(i)
             layer = self.layers[i]
             hidden_states, residual = layer.forward_gen(
                 positions=positions,
@@ -1293,21 +1135,12 @@ class NEOQwen3Model(Qwen2Model):
                 forward_batch=forward_batch,
                 residual=residual,
             )
-            if layer_hidden_states is not None:
-                layer_hidden_states.append((int(i), hidden_states))
 
         if hidden_states.shape[0] != 0:
             if residual is None:
                 hidden_states = self.norm_mot_gen(hidden_states)
             else:
                 hidden_states, _ = self.norm_mot_gen(hidden_states, residual)
-        if layer_hidden_states is not None:
-            self._last_u1_gen_layer_hidden_states = layer_hidden_states
-            self._last_u1_gen_sublayer_states = getattr(
-                forward_batch,
-                "ug_debug_g_sublayer_states",
-                None,
-            )
         return hidden_states
 
 
@@ -1692,27 +1525,6 @@ class NEOChatModel(nn.Module):
                 -1,
             )
 
-        debug_payload = {
-            "hidden_states": hidden_states,
-            "x_pred": x_pred,
-        }
-        layer_hidden_states = getattr(
-            self.language_model.model,
-            "_last_u1_gen_layer_hidden_states",
-            None,
-        )
-        if layer_hidden_states is not None:
-            debug_payload["layer_hidden_states"] = layer_hidden_states
-        sublayer_states = getattr(
-            self.language_model.model,
-            "_last_u1_gen_sublayer_states",
-            None,
-        )
-        if sublayer_states is not None:
-            debug_payload["sublayer_states"] = sublayer_states
-        self._last_u1_pixel_flow_debug = {
-            **debug_payload,
-        }
         t = timestep.to(device=z.device, dtype=z.dtype)
         return (x_pred - z) / (1 - t).clamp_min(
             float(getattr(self.config, "t_eps", 0.02))

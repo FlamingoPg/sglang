@@ -14,6 +14,7 @@ from sglang.srt.ug.runtime import (
     UGInterleavedMessage,
     UGSegmentState,
     UGSessionRuntime,
+    UGSRTPreparedInput,
     UGVelocityRequest,
     UGVLMTextGenerationResult,
 )
@@ -28,6 +29,29 @@ class FakeTreeCache:
 
 
 class RecordingUGModelRunner:
+    def prepare_srt_u_interleaved_inputs(self, *, record, messages, state):
+        del record, state
+        input_ids = [1]
+        input_text_parts = []
+        next_token_id = 100
+        for message in messages:
+            if message.type == "text":
+                text = str(message.content)
+                input_text_parts.append(text)
+                words = text.split()
+                input_ids.extend(range(next_token_id, next_token_id + len(words)))
+                next_token_id += len(words)
+            elif message.type == "image":
+                input_text_parts.append("<image>")
+                input_ids.extend([900, 901])
+        return [
+            UGSRTPreparedInput(
+                input_ids=input_ids,
+                input_text=" ".join(input_text_parts),
+                messages=list(messages),
+            )
+        ]
+
     def prefill_interleaved(self, *, record, messages):
         del record
         token_count = 0

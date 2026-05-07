@@ -37,7 +37,10 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
+from sglang.multimodal_gen.configs.sample.ug import (
+    UGSamplingParams,
+    build_ug_sampling_params,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
@@ -191,7 +194,7 @@ def _build_ug_sampling_params(
     payload: dict[str, Any] | UGSamplingParams | None,
 ) -> UGSamplingParams:
     if payload is None:
-        return UGSamplingParams()
+        return build_ug_sampling_params()
     if isinstance(payload, UGSamplingParams):
         return payload
     if not isinstance(payload, dict):
@@ -199,31 +202,26 @@ def _build_ug_sampling_params(
     values = dict(payload)
     for key in ("mode", "max_new_tokens", "max_length"):
         values.pop(key, None)
-    return UGSamplingParams(**values)
+    return build_ug_sampling_params(values)
 
 
 def _build_ug_request_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     metadata = dict(payload.get("metadata") or {})
     sampling_params = payload.get("sampling_params")
-    if isinstance(sampling_params, dict):
-        for key in (
-            "mode",
-            "think",
-            "max_new_tokens",
-            "max_length",
-            "think_max_new_tokens",
-        ):
-            if key in sampling_params and sampling_params[key] is not None:
-                metadata[key] = sampling_params[key]
-    for key in (
+    metadata_keys = (
         "mode",
         "think",
         "max_new_tokens",
         "max_length",
         "think_max_new_tokens",
+    )
+    for source in (
+        sampling_params if isinstance(sampling_params, dict) else {},
+        payload,
     ):
-        if key in payload and payload[key] is not None:
-            metadata[key] = payload[key]
+        for key in metadata_keys:
+            if key in source and source[key] is not None:
+                metadata[key] = source[key]
     return metadata
 
 

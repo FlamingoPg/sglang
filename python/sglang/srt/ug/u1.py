@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import math
 from contextlib import contextmanager
-from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Protocol
+from typing import Any
 
 from sglang.srt.ug.adapter import UGModelAppendImageResult, UGModelPrefillResult
 from sglang.srt.ug.context import UGContextBundle
@@ -77,24 +76,6 @@ U1_INTERLEAVE_SYSTEM_MESSAGE = (
 )
 
 
-@dataclass(frozen=True, slots=True)
-class U1VLMBackendResult:
-    text: str
-    token_ids: tuple[int, ...] = ()
-    next_token_ids: tuple[int, ...] = ()
-    position_ids: tuple[int, ...] = ()
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-class U1VLMBackend(Protocol):
-    def generate_text(
-        self,
-        *,
-        messages: list[UGInterleavedMessage],
-        max_new_tokens: int,
-    ) -> U1VLMBackendResult: ...
-
-
 def is_sensenova_u1_ug_model(
     model_path: str | None,
     model_id: str | None = None,
@@ -112,21 +93,11 @@ class U1UGModelAdapter:
 
     g_kind: UGGKind = "pixel_flow"
 
-    bos_token_id = 1
-    text_token_base = 1000
-    image_token_id = 31001
-    generated_image_token_id = 31003
-
     def __init__(
         self,
         *,
-        vlm_backend: U1VLMBackend | None = None,
         native_tokenizer: Any | None = None,
     ) -> None:
-        self.observed_u_forwards: list[dict[str, Any]] = []
-        self._pending_segments_by_session: dict[str, list[dict[str, Any]]] = {}
-        self._messages_by_session: dict[str, list[UGInterleavedMessage]] = {}
-        self.vlm_backend = vlm_backend
         self.native_tokenizer = native_tokenizer
         self.include_t2i_cfg_uncondition = False
         self.include_interleave_text_uncondition = False
@@ -231,13 +202,12 @@ class U1UGModelAdapter:
         message: Any,
         state: Any,
     ) -> list[UGSRTPreparedInput] | None:
+        if self.native_tokenizer is None:
+            return None
         if message.type == "text":
-            return [self._prepare_text_input(session=session, message=message)]
+            return None
         if message.type == "image":
-            if (
-                state == UGSegmentState.APPEND_IMAGE
-                and self.native_tokenizer is not None
-            ):
+            if state == UGSegmentState.APPEND_IMAGE:
                 return [
                     build_u1_native_generated_image_commit_prepared_input(
                         tokenizer=self.native_tokenizer,
@@ -245,32 +215,7 @@ class U1UGModelAdapter:
                         session=session,
                     )
                 ]
-            return [
-                self._prepare_image_input(
-                    session=session,
-                    message=message,
-                    generated_image_commit=state == UGSegmentState.APPEND_IMAGE,
-                )
-            ]
         return None
-
-    def observe_srt_u_forward(
-        self,
-        *,
-        session: Any,
-        request: Any,
-        messages: list[Any],
-    ) -> None:
-        del session
-        self.observed_u_forwards.append(
-            {
-                "request_id": request.request_id,
-                "state": request.state,
-                "origin_input_len": request.origin_input_len,
-                "metadata": request.metadata,
-                "message_types": [message.type for message in messages],
-            }
-        )
 
     def prefill_interleaved(
         self,
@@ -278,13 +223,9 @@ class U1UGModelAdapter:
         session: Any,
         messages: list[Any],
     ) -> UGModelPrefillResult:
-        try:
-            self._remember_session_messages(session, messages)
-            return UGModelPrefillResult(
-                added_tokens=self._added_tokens_from_srt_session_view(session, messages)
-            )
-        finally:
-            self._clear_pending_segments(session)
+        return UGModelPrefillResult(
+            added_tokens=self._added_tokens_from_srt_session_view(session)
+        )
 
     def decode_next_segment(self, *, session: Any) -> Any:
         if self._has_generated_image_commit(session):
@@ -534,32 +475,19 @@ class U1UGModelAdapter:
         session: Any,
         max_new_tokens: int,
     ) -> Any:
-        if self.vlm_backend is None:
-            if runtime is None:
-                raise _not_wired()
-            decoded = runtime.decode_text(
-                session,
-                max_new_tokens=max_new_tokens,
-                greedy=True,
-            )
-            return UGVLMTextGenerationResult(
-                session=decoded.session,
-                text=decoded.text,
-                token_ids=decoded.input_ids,
-                next_token_ids=decoded.output_ids,
-                position_ids=decoded.position_ids,
-            )
-        messages = self._messages_for_session(session)
-        result = self.vlm_backend.generate_text(
-            messages=messages,
+        if runtime is None:
+            raise RuntimeError("SenseNova U1 VLM text generation requires SRT runtime")
+        decoded = runtime.decode_text(
+            session,
             max_new_tokens=max_new_tokens,
+            greedy=True,
         )
         return UGVLMTextGenerationResult(
-            session=session,
-            text=result.text,
-            token_ids=result.token_ids,
-            next_token_ids=result.next_token_ids,
-            position_ids=result.position_ids,
+            session=decoded.session,
+            text=decoded.text,
+            token_ids=decoded.input_ids,
+            next_token_ids=decoded.output_ids,
+            position_ids=decoded.position_ids,
         )
 
     def append_generated_image(
@@ -569,197 +497,33 @@ class U1UGModelAdapter:
         image: Any | None,
     ) -> UGModelAppendImageResult:
         del image
-        try:
-            return UGModelAppendImageResult(
-                added_tokens=self._added_tokens_from_srt_session_view(session, [])
-            )
-        finally:
-            self._clear_pending_segments(session)
+        return UGModelAppendImageResult(
+            added_tokens=self._added_tokens_from_srt_session_view(session)
+        )
 
     def close_session(self, *, session_id: str) -> None:
-        self._messages_by_session.pop(str(session_id), None)
-        self._pending_segments_by_session.pop(str(session_id), None)
+        del session_id
 
-    def _prepare_text_input(
-        self,
-        *,
-        session: Any,
-        message: UGInterleavedMessage,
-    ) -> UGSRTPreparedInput:
-        text = str(message.content)
-        text_token_ids = self._text_token_ids(text)
-        input_ids = [self.bos_token_id] + text_token_ids
-        token_indices = list(range(1, len(input_ids)))
-        metadata = self._segment_metadata(
-            session=session,
-            segment_type="text",
-            source="user_text",
-            token_indices=token_indices,
-            attention="causal",
-            generated_image_commit=False,
-        )
-        return UGSRTPreparedInput(
-            input_ids=input_ids,
-            input_text=text,
-            messages=[message],
-            mot_text_token_indices=token_indices,
-            adapter_metadata=metadata,
-        )
-
-    def _prepare_image_input(
-        self,
-        *,
-        session: Any,
-        message: UGInterleavedMessage,
-        generated_image_commit: bool,
-    ) -> UGSRTPreparedInput:
-        image_token_id = (
-            self.generated_image_token_id
-            if generated_image_commit
-            else self.image_token_id
-        )
-        input_ids = [self.bos_token_id, image_token_id, image_token_id + 1]
-        token_indices = [1, 2]
-        source = "generated_image" if generated_image_commit else "input_image"
-        metadata = self._segment_metadata(
-            session=session,
-            segment_type="image",
-            source=source,
-            token_indices=token_indices,
-            attention="hybrid",
-            generated_image_commit=generated_image_commit,
-        )
-        return UGSRTPreparedInput(
-            input_ids=input_ids,
-            input_text=f"<u1:{source}>",
-            messages=[message],
-            non_causal_query_attention=True,
-            mot_image_token_indices=token_indices,
-            adapter_metadata=metadata,
-        )
-
-    def _segment_metadata(
-        self,
-        *,
-        session: Any,
-        segment_type: str,
-        source: str,
-        token_indices: list[int],
-        attention: str,
-        generated_image_commit: bool,
-    ) -> dict[str, Any]:
-        u1_segment = {
-            "segment_type": segment_type,
-            "source": source,
-            "token_indices": list(token_indices),
-            "attention_rows": [
-                {
-                    "kind": segment_type,
-                    "attention": attention,
-                    "start": min(token_indices) if token_indices else 0,
-                    "end": (max(token_indices) + 1) if token_indices else 0,
-                }
-            ],
-            "generated_image_commit": bool(generated_image_commit),
-        }
-        previous_segments = self._previous_u1_segments(session)
-        u1_state = {
-            "segments": previous_segments + [u1_segment],
-            "last_segment_type": segment_type,
-            "last_source": source,
-            "last_generated_image_commit": bool(generated_image_commit),
-        }
-        self._remember_pending_segment(session, u1_segment)
-        return {
-            "u1": u1_segment,
-            "ug_model_state_updates": {"u1": u1_state},
-        }
-
-    def _previous_u1_segments(self, session: Any) -> list[dict[str, Any]]:
+    def _has_generated_image_commit(self, session: Any) -> bool:
         session_metadata = getattr(session, "metadata", {}) or {}
         model_state = session_metadata.get("ug_model_state") or {}
         u1_state = model_state.get("u1") or {}
-        segments = [dict(segment) for segment in u1_state.get("segments", [])]
-        session_key = self._session_key(session)
-        if session_key is not None:
-            segments.extend(
-                dict(segment)
-                for segment in self._pending_segments_by_session.get(session_key, [])
-            )
-        return segments
-
-    def _has_generated_image_commit(self, session: Any) -> bool:
+        if bool(u1_state.get("last_generated_image_commit")):
+            return True
         return any(
             bool(segment.get("generated_image_commit"))
-            for segment in self._previous_u1_segments(session)
+            for segment in u1_state.get("segments", [])
         )
-
-    def _remember_pending_segment(self, session: Any, segment: dict[str, Any]) -> None:
-        session_key = self._session_key(session)
-        if session_key is None:
-            return
-        self._pending_segments_by_session.setdefault(session_key, []).append(
-            dict(segment)
-        )
-
-    def _clear_pending_segments(self, session: Any) -> None:
-        session_key = self._session_key(session)
-        if session_key is not None:
-            self._pending_segments_by_session.pop(session_key, None)
-
-    def _remember_session_messages(
-        self,
-        session: Any,
-        messages: list[UGInterleavedMessage],
-    ) -> None:
-        session_key = self._session_key(session)
-        if session_key is None:
-            return
-        stored = self._messages_by_session.setdefault(session_key, [])
-        stored.extend(messages)
-
-    def _messages_for_session(self, session: Any) -> list[UGInterleavedMessage]:
-        session_key = getattr(session, "session_id", None)
-        if session_key is None:
-            session_key = self._session_key(session)
-        if session_key is None:
-            raise RuntimeError("U1 VLM decode requires a UG session id")
-        messages = self._messages_by_session.get(str(session_key), [])
-        if not messages:
-            raise RuntimeError(
-                f"U1 VLM decode has no messages for session {session_key}"
-            )
-        return list(messages)
-
-    @staticmethod
-    def _session_key(session: Any) -> str | None:
-        handle = getattr(session, "handle", None)
-        session_id = getattr(handle, "session_id", None)
-        return str(session_id) if session_id is not None else None
-
-    def _text_token_ids(self, text: str) -> list[int]:
-        words = text.split() or [text]
-        return [
-            self.text_token_base + (sum(word.encode("utf-8")) % 1000) for word in words
-        ]
 
     def _added_tokens_from_srt_session_view(
         self,
         session: Any,
-        messages: list[Any],
     ) -> int:
         handle = getattr(session, "handle", None)
         previous_length = int(getattr(handle, "context_length", 0) or 0)
         srt_length = int(getattr(session, "srt_last_origin_input_len", 0) or 0)
         if srt_length > previous_length:
             return srt_length - previous_length
-        return sum(self._message_token_count(message) for message in messages)
-
-    def _message_token_count(self, message: Any) -> int:
-        if message.type == "text":
-            return 1 + len(self._text_token_ids(str(message.content)))
-        if message.type == "image":
-            return 3
         return 0
 
 
@@ -922,12 +686,12 @@ class U1SRTBackedUGMiddleBridge:
             raise RuntimeError(
                 "U1 native pixel-flow requires latest SRT session token binding"
             )
-        binding = get_binding(contexts.full.session.session_id)
-        if binding is None:
-            raise RuntimeError(
-                "U1 native pixel-flow has no SRT KV token binding for session "
-                f"{contexts.full.session.session_id}"
-            )
+        session_id = contexts.full.session.session_id
+        binding = _u1_require_srt_binding(
+            get_binding,
+            session_id,
+            "U1 native pixel-flow has no SRT KV token binding",
+        )
         cfg_img_condition_binding = None
         cfg_uncondition_binding = None
         sampling_params = batch.sampling_params
@@ -941,59 +705,41 @@ class U1SRTBackedUGMiddleBridge:
         needs_uncondition = needs_cfg and cfg_img_scale != 1.0
         if mode == "edit":
             if needs_img_condition:
-                sidecar_session_id = (
-                    f"{contexts.full.session.session_id}:"
-                    f"{U1_EDIT_IMG_CONDITION_ROLE}"
+                cfg_img_condition_binding = _u1_require_sidecar_srt_binding(
+                    get_binding,
+                    session_id,
+                    U1_EDIT_IMG_CONDITION_ROLE,
+                    "U1 native edit image CFG requires sidecar SRT KV token binding",
                 )
-                cfg_img_condition_binding = get_binding(sidecar_session_id)
-                if cfg_img_condition_binding is None:
-                    raise RuntimeError(
-                        "U1 native edit image CFG requires sidecar SRT KV token "
-                        f"binding for session {sidecar_session_id}"
-                    )
             if needs_uncondition:
-                sidecar_session_id = (
-                    f"{contexts.full.session.session_id}:" f"{U1_EDIT_UNCONDITION_ROLE}"
+                cfg_uncondition_binding = _u1_require_sidecar_srt_binding(
+                    get_binding,
+                    session_id,
+                    U1_EDIT_UNCONDITION_ROLE,
+                    "U1 native edit uncondition CFG requires sidecar SRT KV binding",
                 )
-                cfg_uncondition_binding = get_binding(sidecar_session_id)
-                if cfg_uncondition_binding is None:
-                    raise RuntimeError(
-                        "U1 native edit uncondition CFG requires sidecar SRT KV "
-                        f"token binding for session {sidecar_session_id}"
-                    )
         elif mode == "interleave":
             if needs_img_condition:
-                sidecar_session_id = (
-                    f"{contexts.full.session.session_id}:"
-                    f"{U1_INTERLEAVE_TEXT_UNCONDITION_ROLE}"
+                cfg_img_condition_binding = _u1_require_sidecar_srt_binding(
+                    get_binding,
+                    session_id,
+                    U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
+                    "U1 native interleave text CFG requires sidecar SRT KV binding",
                 )
-                cfg_img_condition_binding = get_binding(sidecar_session_id)
-                if cfg_img_condition_binding is None:
-                    raise RuntimeError(
-                        "U1 native interleave text CFG requires sidecar SRT KV "
-                        f"token binding for session {sidecar_session_id}"
-                    )
             if needs_uncondition:
-                sidecar_session_id = (
-                    f"{contexts.full.session.session_id}:"
-                    f"{U1_T2I_CFG_UNCONDITION_ROLE}"
+                cfg_uncondition_binding = _u1_require_sidecar_srt_binding(
+                    get_binding,
+                    session_id,
+                    U1_T2I_CFG_UNCONDITION_ROLE,
+                    "U1 native interleave image CFG requires sidecar SRT KV binding",
                 )
-                cfg_uncondition_binding = get_binding(sidecar_session_id)
-                if cfg_uncondition_binding is None:
-                    raise RuntimeError(
-                        "U1 native interleave image CFG requires sidecar SRT KV "
-                        f"token binding for session {sidecar_session_id}"
-                    )
         elif cfg_text_scale > 1.0:
-            sidecar_session_id = (
-                f"{contexts.full.session.session_id}:" f"{U1_T2I_CFG_UNCONDITION_ROLE}"
+            cfg_img_condition_binding = _u1_require_sidecar_srt_binding(
+                get_binding,
+                session_id,
+                U1_T2I_CFG_UNCONDITION_ROLE,
+                "U1 native pixel-flow CFG requires sidecar SRT KV token binding",
             )
-            cfg_img_condition_binding = get_binding(sidecar_session_id)
-            if cfg_img_condition_binding is None:
-                raise RuntimeError(
-                    "U1 native pixel-flow CFG requires sidecar SRT KV token "
-                    f"binding for session {sidecar_session_id}"
-                )
         native_executor = create_executor()
         return native_executor.generate(
             contexts=contexts,
@@ -1091,6 +837,43 @@ class U1SRTBackedUGMiddleBridge:
         )
 
 
+def _u1_grid_hw_metadata(grid_hw: Any) -> list[list[int]]:
+    return [list(map(int, row)) for row in grid_hw.tolist()]
+
+
+def _u1_multimodal_inputs(
+    *,
+    pixel_values: Any,
+    grid_hw: Any,
+    offsets: list[tuple[int, int]],
+    position_ids: list[list[int]] | None = None,
+    precomputed_embeddings: Any | None = None,
+) -> Any:
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+    )
+
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        feature=pixel_values,
+        precomputed_embeddings=precomputed_embeddings,
+        model_specific_data={"image_grid_hws": grid_hw},
+        offsets=offsets,
+    )
+    item.set_pad_value()
+    mm_inputs = MultimodalInputs(mm_items=[item])
+    if position_ids is not None:
+        import torch
+
+        mm_inputs.mrope_positions = torch.tensor(position_ids, dtype=torch.long).t()
+        mm_inputs.mrope_position_delta = (
+            mm_inputs.mrope_positions[:, -1:].max(dim=0, keepdim=True).values
+        )
+    return mm_inputs
+
+
 def build_u1_native_vlm_prepared_input(
     *,
     tokenizer: Any,
@@ -1106,20 +889,11 @@ def build_u1_native_vlm_prepared_input(
         question=question,
     )
 
-    from sglang.srt.managers.schedule_batch import (
-        Modality,
-        MultimodalDataItem,
-        MultimodalInputs,
-    )
-
-    item = MultimodalDataItem(
-        modality=Modality.IMAGE,
-        feature=pixel_values,
-        model_specific_data={"image_grid_hws": grid_hw},
+    mm_inputs = _u1_multimodal_inputs(
+        pixel_values=pixel_values,
+        grid_hw=grid_hw,
         offsets=image_offsets,
     )
-    item.set_pad_value()
-    mm_inputs = MultimodalInputs(mm_items=[item])
     return UGSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
@@ -1129,7 +903,7 @@ def build_u1_native_vlm_prepared_input(
             "u1": {
                 "segment_type": "vlm",
                 "source": "native_vlm_input",
-                "image_grid_hw": [list(map(int, row)) for row in grid_hw.tolist()],
+                "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
                 "image_offsets": list(image_offsets),
             },
             "ug_model_state_updates": {
@@ -1137,9 +911,7 @@ def build_u1_native_vlm_prepared_input(
                     "last_segment_type": "vlm",
                     "last_source": "native_vlm_input",
                     "native_vlm_prompt": True,
-                    "session_id": getattr(
-                        getattr(session, "handle", None), "session_id", None
-                    ),
+                    "session_id": _u1_session_id(session),
                 }
             },
         },
@@ -1216,7 +988,6 @@ def build_u1_native_interleave_text_uncondition_marker_prepared_input(
     logical_position: int,
 ) -> UGSRTPreparedInput:
     img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
-    session_id = getattr(getattr(session, "handle", None), "session_id", None)
     next_position = int(logical_position) + 1
     return UGSRTPreparedInput(
         input_ids=[int(img_start_id)],
@@ -1224,10 +995,9 @@ def build_u1_native_interleave_text_uncondition_marker_prepared_input(
         messages=[],
         position_ids=[[int(logical_position), 0, 0]],
         srt_sidecar_role=U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
-        srt_sidecar_session_id=(
-            f"{session_id}:{U1_INTERLEAVE_TEXT_UNCONDITION_ROLE}"
-            if session_id is not None
-            else None
+        srt_sidecar_session_id=_u1_sidecar_session_id(
+            session,
+            U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
         ),
         adapter_metadata={
             "u1": {
@@ -1242,7 +1012,7 @@ def build_u1_native_interleave_text_uncondition_marker_prepared_input(
                     "native_interleave_text_uncondition_prompt": True,
                     "open_image_marker": True,
                     "g_position_start": next_position,
-                    "session_id": session_id,
+                    "session_id": _u1_session_id(session),
                 }
             },
         },
@@ -1289,11 +1059,6 @@ def _build_u1_native_interleave_like_prepared_input(
     if not input_ids:
         raise RuntimeError(f"U1 native {segment_type} prompt produced no input ids")
     if images:
-        from sglang.srt.managers.schedule_batch import (
-            Modality,
-            MultimodalDataItem,
-            MultimodalInputs,
-        )
         from sglang.srt.models.neo_chat import build_u1_vlm_thw_indexes
 
         context_id = tokenizer.convert_tokens_to_ids(U1_IMG_CONTEXT_TOKEN)
@@ -1313,18 +1078,15 @@ def _build_u1_native_interleave_like_prepared_input(
             img_context_token_id=context_id,
         )
         g_position_start = int(positions[0].max().item()) + 1
-        item = MultimodalDataItem(
-            modality=Modality.IMAGE,
-            feature=pixel_values,
-            model_specific_data={"image_grid_hws": grid_hw},
+        mm_inputs = _u1_multimodal_inputs(
+            pixel_values=pixel_values,
+            grid_hw=grid_hw,
             offsets=image_offsets,
         )
-        item.set_pad_value()
-        mm_inputs = MultimodalInputs(mm_items=[item])
     else:
         g_position_start = len(input_ids)
 
-    session_id = getattr(getattr(session, "handle", None), "session_id", None)
+    session_id = _u1_session_id(session)
     u1_metadata = {
         "segment_type": segment_type,
         "source": source,
@@ -1345,11 +1107,7 @@ def _build_u1_native_interleave_like_prepared_input(
         messages=messages,
         mm_inputs=mm_inputs,
         srt_sidecar_role=role,
-        srt_sidecar_session_id=(
-            f"{session_id}:{role}"
-            if role is not None and session_id is not None
-            else None
-        ),
+        srt_sidecar_session_id=_u1_sidecar_session_id(session, role),
         adapter_metadata=adapter_metadata,
     )
 
@@ -1388,9 +1146,7 @@ def build_u1_native_t2i_prepared_input(
                     "last_source": "native_t2i_prompt",
                     "native_t2i_prompt": True,
                     "open_image_marker": input_ids[-1] == img_start_id,
-                    "session_id": getattr(
-                        getattr(session, "handle", None), "session_id", None
-                    ),
+                    "session_id": _u1_session_id(session),
                 }
             },
         },
@@ -1429,11 +1185,6 @@ def build_u1_native_edit_prepared_input(
     if not selected:
         raise RuntimeError("U1 native edit prompt did not contain image context tokens")
 
-    from sglang.srt.managers.schedule_batch import (
-        Modality,
-        MultimodalDataItem,
-        MultimodalInputs,
-    )
     from sglang.srt.models.neo_chat import build_u1_vlm_thw_indexes
 
     positions = build_u1_vlm_thw_indexes(
@@ -1443,14 +1194,12 @@ def build_u1_native_edit_prepared_input(
         img_context_token_id=context_id,
     )
     g_position_start = int(positions[0].max().item()) + 1
-    item = MultimodalDataItem(
-        modality=Modality.IMAGE,
-        feature=pixel_values,
-        model_specific_data={"image_grid_hws": grid_hw},
-        offsets=[(selected[0], selected[-1])],
+    image_offsets = [(selected[0], selected[-1])]
+    mm_inputs = _u1_multimodal_inputs(
+        pixel_values=pixel_values,
+        grid_hw=grid_hw,
+        offsets=image_offsets,
     )
-    item.set_pad_value()
-    mm_inputs = MultimodalInputs(mm_items=[item])
     return UGSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
@@ -1460,8 +1209,8 @@ def build_u1_native_edit_prepared_input(
             "u1": {
                 "segment_type": "edit",
                 "source": "native_edit_prompt",
-                "image_grid_hw": [list(map(int, row)) for row in grid_hw.tolist()],
-                "image_offsets": [(selected[0], selected[-1])],
+                "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
+                "image_offsets": image_offsets,
                 "g_position_start": g_position_start,
             },
             "ug_model_state_updates": {
@@ -1470,9 +1219,7 @@ def build_u1_native_edit_prepared_input(
                     "last_source": "native_edit_prompt",
                     "native_edit_prompt": True,
                     "g_position_start": g_position_start,
-                    "session_id": getattr(
-                        getattr(session, "handle", None), "session_id", None
-                    ),
+                    "session_id": _u1_session_id(session),
                 }
             },
         },
@@ -1527,16 +1274,15 @@ def build_u1_native_edit_uncondition_prepared_input(
     img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
     if input_ids[-1] != img_start_id:
         raise RuntimeError("U1 native edit uncondition prompt must end with <img>")
-    session_id = getattr(getattr(session, "handle", None), "session_id", None)
+    session_id = _u1_session_id(session)
     return UGSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
         messages=[UGInterleavedMessage(type="text", content="")],
         srt_sidecar_role=U1_EDIT_UNCONDITION_ROLE,
-        srt_sidecar_session_id=(
-            f"{session_id}:{U1_EDIT_UNCONDITION_ROLE}"
-            if session_id is not None
-            else None
+        srt_sidecar_session_id=_u1_sidecar_session_id(
+            session,
+            U1_EDIT_UNCONDITION_ROLE,
         ),
         adapter_metadata={
             "u1": {
@@ -1576,11 +1322,6 @@ def _build_u1_native_image_sidecar_prepared_input(
             f"U1 native {segment_type} prompt did not contain image context tokens"
         )
 
-    from sglang.srt.managers.schedule_batch import (
-        Modality,
-        MultimodalDataItem,
-        MultimodalInputs,
-    )
     from sglang.srt.models.neo_chat import build_u1_vlm_thw_indexes
 
     positions = build_u1_vlm_thw_indexes(
@@ -1590,30 +1331,26 @@ def _build_u1_native_image_sidecar_prepared_input(
         img_context_token_id=context_id,
     )
     g_position_start = int(positions[0].max().item()) + 1
-    item = MultimodalDataItem(
-        modality=Modality.IMAGE,
-        feature=pixel_values,
-        model_specific_data={"image_grid_hws": grid_hw},
-        offsets=[(selected[0], selected[-1])],
+    image_offsets = [(selected[0], selected[-1])]
+    mm_inputs = _u1_multimodal_inputs(
+        pixel_values=pixel_values,
+        grid_hw=grid_hw,
+        offsets=image_offsets,
     )
-    item.set_pad_value()
-    mm_inputs = MultimodalInputs(mm_items=[item])
-    session_id = getattr(getattr(session, "handle", None), "session_id", None)
+    session_id = _u1_session_id(session)
     return UGSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
         messages=[UGInterleavedMessage(type="image", content=image)],
         mm_inputs=mm_inputs,
         srt_sidecar_role=role,
-        srt_sidecar_session_id=(
-            f"{session_id}:{role}" if session_id is not None else None
-        ),
+        srt_sidecar_session_id=_u1_sidecar_session_id(session, role),
         adapter_metadata={
             "u1": {
                 "segment_type": segment_type,
                 "source": source,
-                "image_grid_hw": [list(map(int, row)) for row in grid_hw.tolist()],
-                "image_offsets": [(selected[0], selected[-1])],
+                "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
+                "image_offsets": image_offsets,
                 "g_position_start": g_position_start,
             }
         },
@@ -1707,30 +1444,12 @@ def build_u1_native_generated_image_commit_prepared_input(
     input_ids.append(int(img_end_id))
     position_ids.append([end_t, 0, 0])
 
-    from sglang.srt.managers.schedule_batch import (
-        Modality,
-        MultimodalDataItem,
-        MultimodalInputs,
-    )
-    import torch
-
-    item = MultimodalDataItem(
-        modality=Modality.IMAGE,
-        feature=pixel_values,
-        precomputed_embeddings=precomputed_embeddings,
-        model_specific_data={"image_grid_hws": grid_hw},
+    mm_inputs = _u1_multimodal_inputs(
+        pixel_values=pixel_values,
+        grid_hw=grid_hw,
         offsets=[(context_start, context_end)],
-    )
-    item.set_pad_value()
-    mm_inputs = MultimodalInputs(mm_items=[item])
-    mm_inputs.mrope_positions = torch.tensor(position_ids, dtype=torch.long).t()
-    mm_inputs.mrope_position_delta = (
-        mm_inputs.mrope_positions[:, -1:]
-        .max(
-            dim=0,
-            keepdim=True,
-        )
-        .values
+        position_ids=position_ids,
+        precomputed_embeddings=precomputed_embeddings,
     )
 
     message = UGInterleavedMessage(type="image", content=image)
@@ -1768,16 +1487,15 @@ def build_u1_native_t2i_cfg_uncondition_prepared_input(
     img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
     if input_ids[-1] != img_start_id:
         raise RuntimeError("U1 native T2I CFG prompt must end with <img>")
-    session_id = getattr(getattr(session, "handle", None), "session_id", None)
+    session_id = _u1_session_id(session)
     return UGSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
         messages=[UGInterleavedMessage(type="text", content="")],
         srt_sidecar_role=U1_T2I_CFG_UNCONDITION_ROLE,
-        srt_sidecar_session_id=(
-            f"{session_id}:{U1_T2I_CFG_UNCONDITION_ROLE}"
-            if session_id is not None
-            else None
+        srt_sidecar_session_id=_u1_sidecar_session_id(
+            session,
+            U1_T2I_CFG_UNCONDITION_ROLE,
         ),
         adapter_metadata={
             "u1": {
@@ -2409,6 +2127,23 @@ def _u1_binding_position_count(binding: Any) -> int:
     return int(getattr(binding, "token_count"))
 
 
+def _u1_require_srt_binding(get_binding: Any, session_id: str, message: str):
+    binding = get_binding(session_id)
+    if binding is None:
+        raise RuntimeError(f"{message} for session {session_id}")
+    return binding
+
+
+def _u1_require_sidecar_srt_binding(
+    get_binding: Any,
+    session_id: str,
+    role: str,
+    message: str,
+):
+    sidecar_session_id = f"{session_id}:{role}"
+    return _u1_require_srt_binding(get_binding, sidecar_session_id, message)
+
+
 def _u1_session_torch_generator(
     metadata: dict[str, Any],
     *,
@@ -2505,10 +2240,7 @@ def load_u1_native_image(
     )
     array = np.asarray(resized, dtype=np.float32) / 255.0
     pixel_values = torch.from_numpy(array).permute(2, 0, 1)
-    mean = torch.tensor(U1_IMAGENET_MEAN, dtype=torch.float32).view(3, 1, 1)
-    std = torch.tensor(U1_IMAGENET_STD, dtype=torch.float32).view(3, 1, 1)
-    pixel_values = (pixel_values - mean) / std
-    return _u1_preprocess_pixel_values(pixel_values, patch_size=patch_size)
+    return _u1_normalize_and_patchify(pixel_values, patch_size=patch_size)
 
 
 def load_u1_generated_image_for_commit(
@@ -2550,17 +2282,10 @@ def load_u1_generated_image_for_commit(
         array = np.asarray(image, dtype=np.float32) / 255.0
         pixel_values = torch.from_numpy(array).permute(2, 0, 1)
 
-    height = int(pixel_values.shape[1])
-    width = int(pixel_values.shape[2])
-    if height % patch_size or width % patch_size:
-        raise ValueError(
-            "U1 generated image commit requires image size divisible by "
-            f"patch_size={patch_size}, got {width}x{height}"
-        )
-    mean = torch.tensor(U1_IMAGENET_MEAN, dtype=torch.float32).view(3, 1, 1)
-    std = torch.tensor(U1_IMAGENET_STD, dtype=torch.float32).view(3, 1, 1)
-    pixel_values = (pixel_values - mean) / std
-    return _u1_preprocess_pixel_values(pixel_values, patch_size=patch_size)
+    return _u1_normalize_and_patchify_commit_image(
+        pixel_values,
+        patch_size=patch_size,
+    )
 
 
 def _load_u1_generated_tensor_for_commit(
@@ -2592,17 +2317,21 @@ def _load_u1_generated_tensor_for_commit(
     elif float(pixel_values.min()) < 0.0:
         pixel_values = pixel_values * 0.5 + 0.5
 
-    height = int(pixel_values.shape[1])
-    width = int(pixel_values.shape[2])
-    if height % patch_size or width % patch_size:
-        raise ValueError(
-            "U1 generated image commit requires image size divisible by "
-            f"patch_size={patch_size}, got {width}x{height}"
-        )
-    mean = torch.tensor(U1_IMAGENET_MEAN, dtype=pixel_values.dtype).view(3, 1, 1)
-    std = torch.tensor(U1_IMAGENET_STD, dtype=pixel_values.dtype).view(3, 1, 1)
-    pixel_values = (pixel_values - mean) / std
-    return _u1_preprocess_pixel_values(pixel_values, patch_size=patch_size)
+    return _u1_normalize_and_patchify_commit_image(
+        pixel_values,
+        patch_size=patch_size,
+    )
+
+
+def _u1_session_id(session: Any | None) -> str | None:
+    return getattr(getattr(session, "handle", None), "session_id", None)
+
+
+def _u1_sidecar_session_id(session: Any | None, role: str | None) -> str | None:
+    session_id = _u1_session_id(session)
+    if role is None or session_id is None:
+        return None
+    return f"{session_id}:{role}"
 
 
 def _u1_precompute_generated_image_commit_embeddings(
@@ -2766,6 +2495,28 @@ def _u1_smart_resize(
     return h_bar, w_bar
 
 
+def _u1_normalize_and_patchify(pixel_values: Any, *, patch_size: int):
+    import torch
+
+    mean = torch.tensor(U1_IMAGENET_MEAN, dtype=pixel_values.dtype).view(3, 1, 1)
+    std = torch.tensor(U1_IMAGENET_STD, dtype=pixel_values.dtype).view(3, 1, 1)
+    return _u1_preprocess_pixel_values(
+        (pixel_values - mean) / std,
+        patch_size=patch_size,
+    )
+
+
+def _u1_normalize_and_patchify_commit_image(pixel_values: Any, *, patch_size: int):
+    height = int(pixel_values.shape[1])
+    width = int(pixel_values.shape[2])
+    if height % patch_size or width % patch_size:
+        raise ValueError(
+            "U1 generated image commit requires image size divisible by "
+            f"patch_size={patch_size}, got {width}x{height}"
+        )
+    return _u1_normalize_and_patchify(pixel_values, patch_size=patch_size)
+
+
 def _u1_preprocess_pixel_values(pixel_values: Any, *, patch_size: int):
     import torch
 
@@ -2779,14 +2530,6 @@ def _u1_preprocess_pixel_values(pixel_values: Any, *, patch_size: int):
     )
     grid_hw = torch.tensor([[grid_h, grid_w]], dtype=torch.long)
     return flatten_pixel_values.to(torch.float32), grid_hw
-
-
-def _not_wired() -> NotImplementedError:
-    return NotImplementedError(
-        "SenseNova U1 UG backend is not wired yet. This shell only declares "
-        "the pixel_flow capability; U path, G pixel-flow mechanics, and true "
-        "weights are covered by later roadmap items."
-    )
 
 
 def _first_u1_image_content(messages: list[UGInterleavedMessage]) -> Any:

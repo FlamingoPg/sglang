@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
-from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
+from sglang.multimodal_gen.configs.sample.ug import (
+    UGSamplingParams,
+    build_ug_sampling_params,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
@@ -15,12 +18,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_bagel import (
     BAGELLatentFlowGSegmentExecutor,
+    apply_bagel_official_sampling_defaults,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_u1 import (
     U1PixelFlowGSegmentExecutor,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.srt.session.session_controller import SessionController
 from sglang.srt.ug.adapter import UGModelRunnerAdapter
 from sglang.srt.ug.bagel import create_bagel_ug_model_adapter
 from sglang.srt.ug.denoiser import SRTBackedUGMiddleBridge, UGMiddleBridge
@@ -32,23 +35,12 @@ from sglang.srt.ug.interleaved import (
     normalize_ug_generation_mode,
 )
 from sglang.srt.ug.runtime import UGSessionRuntime
-from sglang.srt.ug.srt_executor import (
-    UGSRTRequestBoundaryExecutor,
-    UGSRTSchedulerExecutor,
-)
+from sglang.srt.ug.srt_executor import UGSRTSchedulerExecutor
 from sglang.srt.ug.u1 import (
     U1SRTBackedUGMiddleBridge,
     U1UGModelAdapter,
     is_sensenova_u1_ug_model,
 )
-
-
-class _UGRuntimeTreeCache:
-    def __init__(self) -> None:
-        self.released_sessions: list[str] = []
-
-    def release_session(self, session_id: str) -> None:
-        self.released_sessions.append(session_id)
 
 
 def _build_srt_owned_ug_runtime(
@@ -57,15 +49,10 @@ def _build_srt_owned_ug_runtime(
     scheduler=None,
     srt_request_executor=None,
     srt_u_decode_max_new_tokens: int = 0,
-    srt_image_tokenization: Literal["multimodal", "text_placeholder"] = "multimodal",
 ) -> UGSessionRuntime:
     if srt_request_executor is None:
         srt_request_executor = _build_srt_request_executor(scheduler)
-    session_controller = (
-        srt_request_executor.session_controller
-        if scheduler is not None
-        else SessionController(_UGRuntimeTreeCache())
-    )
+    session_controller = srt_request_executor.session_controller
     model_config = getattr(scheduler, "model_config", None)
     return UGSessionRuntime(
         model_runner=model_runner,
@@ -74,64 +61,97 @@ def _build_srt_owned_ug_runtime(
         tokenizer=getattr(scheduler, "tokenizer", None),
         vocab_size=getattr(model_config, "vocab_size", 32000),
         srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
-        srt_image_tokenization=srt_image_tokenization,
     )
 
 
 def _build_srt_request_executor(scheduler=None):
-    if scheduler is not None:
-        return UGSRTSchedulerExecutor(scheduler)
-    return UGSRTRequestBoundaryExecutor()
+    if scheduler is None:
+        raise ValueError(
+            "UGPipeline requires an attached SRT scheduler so U owns the session/KV"
+        )
+    return UGSRTSchedulerExecutor(scheduler)
 
 
-def _load_ug_bridge(
+def _load_ug_bridge_and_g_executor(
     model_path: str,
     *,
     scheduler=None,
     srt_u_decode_max_new_tokens: int | None = None,
-) -> UGMiddleBridge:
+) -> tuple[UGMiddleBridge, Any]:
     srt_request_executor = _build_srt_request_executor(scheduler)
-    if "bagel" in model_path.lower():
-        if srt_u_decode_max_new_tokens is None:
-            srt_u_decode_max_new_tokens = 1 if scheduler is not None else 0
-        native_srt_denoise_executor = None
-        native_srt_u_context = False
-        if scheduler is not None:
-            native_srt_denoise_executor = (
-                srt_request_executor.create_bagel_native_srt_denoise_executor()
-            )
-            native_srt_u_context = True
-        adapter = create_bagel_ug_model_adapter(
-            model_path,
-            native_srt_denoise_executor=native_srt_denoise_executor,
-            native_srt_u_context=native_srt_u_context,
-        )
-        return SRTBackedUGMiddleBridge(
-            _build_srt_owned_ug_runtime(
-                UGModelRunnerAdapter(adapter),
-                scheduler=scheduler,
-                srt_request_executor=srt_request_executor,
-                srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
-                srt_image_tokenization="multimodal",
-            )
-        )
-    if is_sensenova_u1_ug_model(model_path):
-        if srt_u_decode_max_new_tokens is None:
-            srt_u_decode_max_new_tokens = 0
-        return U1SRTBackedUGMiddleBridge(
-            _build_srt_owned_ug_runtime(
-                UGModelRunnerAdapter(
-                    U1UGModelAdapter(
-                        native_tokenizer=getattr(scheduler, "tokenizer", None)
-                    )
+    for matches, build_bridge, build_g_segment_executor in _UG_BACKENDS:
+        if matches(model_path):
+            return (
+                build_bridge(
+                    model_path,
+                    scheduler,
+                    srt_request_executor,
+                    srt_u_decode_max_new_tokens,
                 ),
-                scheduler=scheduler,
-                srt_request_executor=srt_request_executor,
-                srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
-                srt_image_tokenization="multimodal",
+                build_g_segment_executor(),
             )
-        )
     raise ValueError(f"Unsupported UG model path: {model_path}")
+
+
+def _build_bagel_bridge(
+    model_path: str,
+    scheduler,
+    srt_request_executor,
+    srt_u_decode_max_new_tokens: int | None,
+) -> UGMiddleBridge:
+    if srt_u_decode_max_new_tokens is None:
+        srt_u_decode_max_new_tokens = 1
+
+    native_srt_denoise_executor = (
+        srt_request_executor.create_bagel_native_srt_denoise_executor()
+    )
+
+    adapter = create_bagel_ug_model_adapter(
+        model_path,
+        native_srt_denoise_executor=native_srt_denoise_executor,
+        native_srt_u_context=True,
+    )
+    bridge = SRTBackedUGMiddleBridge(
+        _build_srt_owned_ug_runtime(
+            UGModelRunnerAdapter(adapter),
+            scheduler=scheduler,
+            srt_request_executor=srt_request_executor,
+            srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
+        )
+    )
+    bridge.apply_sampling_defaults = apply_bagel_official_sampling_defaults
+    return bridge
+
+
+def _build_u1_bridge(
+    model_path: str,
+    scheduler,
+    srt_request_executor,
+    srt_u_decode_max_new_tokens: int | None,
+) -> UGMiddleBridge:
+    del model_path
+    if srt_u_decode_max_new_tokens is None:
+        srt_u_decode_max_new_tokens = 0
+    return U1SRTBackedUGMiddleBridge(
+        _build_srt_owned_ug_runtime(
+            UGModelRunnerAdapter(
+                U1UGModelAdapter(native_tokenizer=getattr(scheduler, "tokenizer", None))
+            ),
+            scheduler=scheduler,
+            srt_request_executor=srt_request_executor,
+            srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
+        )
+    )
+
+
+def _is_bagel_model_path(model_path: str) -> bool:
+    return "bagel" in str(model_path).lower()
+
+
+_UG_BACKENDS = (
+    (_is_bagel_model_path, _build_bagel_bridge, BAGELLatentFlowGSegmentExecutor),
+    (is_sensenova_u1_ug_model, _build_u1_bridge, U1PixelFlowGSegmentExecutor),
+)
 
 
 def _build_ug_g_segment_executor(bridge: UGMiddleBridge):
@@ -154,7 +174,7 @@ class UGPipeline(ComposedPipelineBase):
     ) -> dict[str, Any]:
         modules = dict(loaded_modules or {})
         if "ug_bridge" not in modules:
-            modules["ug_bridge"] = _load_ug_bridge(
+            bridge, g_segment_executor = _load_ug_bridge_and_g_executor(
                 self.model_path,
                 scheduler=getattr(server_args, "ug_srt_scheduler", None),
                 srt_u_decode_max_new_tokens=getattr(
@@ -163,6 +183,8 @@ class UGPipeline(ComposedPipelineBase):
                     None,
                 ),
             )
+            modules["ug_bridge"] = bridge
+            modules.setdefault("ug_g_segment_executor", g_segment_executor)
         if "ug_g_segment_executor" not in modules:
             modules["ug_g_segment_executor"] = _build_ug_g_segment_executor(
                 modules["ug_bridge"]
@@ -175,6 +197,14 @@ class UGPipeline(ComposedPipelineBase):
         self.add_stage(UGContextStage(bridge))
         self.add_stage(UGGSegmentStage(bridge, g_segment_executor))
         self.add_stage(UGDecodeStage(bridge))
+
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ):
+        _apply_bridge_sampling_defaults(self.get_module("ug_bridge"), batch)
+        return super().forward(batch, server_args)
 
     def forward_interleaved(
         self,
@@ -201,7 +231,7 @@ class UGPipeline(ComposedPipelineBase):
             metadata.get("mode"), default="interleave"
         )
         if metadata["mode"] == "vlm":
-            return self.forward_vlm(request, server_args=server_args)
+            return self._forward_vlm_request(request, metadata=metadata)
         batch = Req(
             sampling_params=request.sampling_params,
             extra={
@@ -245,6 +275,7 @@ class UGPipeline(ComposedPipelineBase):
         context_stage = UGContextStage(bridge)
         g_stage = UGGSegmentStage(bridge, g_segment_executor)
 
+        _apply_bridge_sampling_defaults(bridge, batch)
         batch = context_stage.forward(batch, server_args)
         contexts = batch.extra.get("ug_contexts")
         if contexts is None:
@@ -266,7 +297,9 @@ class UGPipeline(ComposedPipelineBase):
             batch = g_stage.forward(batch, server_args)
             generated_segment = batch.extra.get("ug_generated_segment")
             if generated_segment is None:
-                raise ValueError("UG interleave loop expected a generated image segment")
+                raise ValueError(
+                    "UG interleave loop expected a generated image segment"
+                )
             image_for_append = generated_segment.image
             output_segments.append(
                 {
@@ -315,14 +348,6 @@ class UGPipeline(ComposedPipelineBase):
         requests: list[UGInterleavedRequest],
         server_args: ServerArgs | None = None,
     ) -> list[UGInterleavedResponse]:
-        """Run multiple UG sessions through the experimental interleaved API.
-
-        This intentionally provides session isolation before throughput
-        batching. Each request gets its own SRT-owned UG session and release
-        path, so it is safe for the server/API surface while the native batch
-        optimizer remains a future step.
-        """
-
         return [
             self.forward_interleaved(request, server_args=server_args)
             for request in requests
@@ -339,7 +364,7 @@ class UGPipeline(ComposedPipelineBase):
         """Experimental VLM-only UG API.
 
         This path runs only SRT-owned U prefill and U text decode. It must not
-        enter latent preparation, G denoise, VAE decode, or append-image stages.
+        enter G preparation, G execution, image decode, or append-image stages.
         """
 
         server_args = server_args or self.server_args
@@ -348,6 +373,21 @@ class UGPipeline(ComposedPipelineBase):
         request = _normalize_interleaved_request(
             messages, sampling_params, sampling_kwargs
         )
+        metadata = dict(request.metadata)
+        metadata["mode"] = "vlm"
+        return self._forward_vlm_request(
+            request,
+            max_new_tokens=max_new_tokens,
+            metadata=metadata,
+        )
+
+    def _forward_vlm_request(
+        self,
+        request: UGInterleavedRequest,
+        *,
+        max_new_tokens: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> UGInterleavedResponse:
         max_new_tokens = _resolve_vlm_max_new_tokens(
             request.metadata,
             explicit_max_new_tokens=max_new_tokens,
@@ -366,15 +406,15 @@ class UGPipeline(ComposedPipelineBase):
         runtime = getattr(bridge, "runtime", None)
         try:
             stats = _collect_runtime_stats_from_session(bridge, result.session)
-            segment_metadata: dict[str, Any] = {}
-            if result.token_ids:
-                segment_metadata["token_ids"] = list(result.token_ids)
-            if result.next_token_ids:
-                segment_metadata["next_token_ids"] = list(result.next_token_ids)
-            if result.position_ids:
-                segment_metadata["position_ids"] = list(result.position_ids)
-            metadata = dict(request.metadata)
-            metadata["mode"] = "vlm"
+            segment_metadata = {
+                name: list(value)
+                for name, value in (
+                    ("token_ids", result.token_ids),
+                    ("next_token_ids", result.next_token_ids),
+                    ("position_ids", result.position_ids),
+                )
+                if value
+            }
             return UGInterleavedResponse.from_legacy_segments(
                 [
                     {
@@ -384,7 +424,7 @@ class UGPipeline(ComposedPipelineBase):
                     }
                 ],
                 stats=stats,
-                metadata=metadata,
+                metadata=metadata or {"mode": "vlm"},
             )
         finally:
             if runtime is not None:
@@ -441,17 +481,64 @@ def _normalize_interleaved_sampling_params(
     sampling_kwargs: dict[str, Any],
 ) -> UGSamplingParams:
     if sampling_params is None:
-        return UGSamplingParams(**sampling_kwargs)
+        return build_ug_sampling_params(sampling_kwargs)
     if isinstance(sampling_params, dict):
         values = dict(sampling_params)
         values.update(sampling_kwargs)
-        return UGSamplingParams(**values)
+        return build_ug_sampling_params(values)
     if sampling_kwargs:
         raise ValueError(
             "UG interleaved sampling keyword overrides require sampling_params "
             "to be omitted or passed as a dict"
         )
     return sampling_params
+
+
+def _apply_bridge_sampling_defaults(bridge: UGMiddleBridge, batch: Req) -> None:
+    if batch.sampling_params is None:
+        return
+    apply_defaults = getattr(bridge, "apply_sampling_defaults", None)
+    if not callable(apply_defaults):
+        return
+    interleaved_messages = batch.extra.get("ug_interleaved_messages")
+    request_metadata = dict(batch.extra.get("ug_request_metadata") or {})
+    mode = _resolve_ug_mode_for_defaults(batch, request_metadata, interleaved_messages)
+    setattr(batch.sampling_params, "ug_generation_mode", mode)
+    apply_defaults(
+        batch.sampling_params,
+        mode=mode,
+        has_input_image=_has_ug_input_image(batch, interleaved_messages),
+        explicit_fields=set(batch.extra.get("explicit_fields", [])),
+    )
+
+
+def _resolve_ug_mode_for_defaults(
+    batch: Req,
+    metadata: dict[str, Any],
+    interleaved_messages,
+):
+    if "ug_mode" in batch.extra:
+        return normalize_ug_generation_mode(
+            batch.extra["ug_mode"], default="interleave"
+        )
+    if "mode" in metadata:
+        return normalize_ug_generation_mode(metadata["mode"], default="interleave")
+    if interleaved_messages is not None:
+        return "interleave"
+    return "edit" if batch.condition_image is not None or batch.image_path else "t2i"
+
+
+def _has_ug_input_image(batch: Req, interleaved_messages) -> bool:
+    if interleaved_messages is not None:
+        return any(
+            (
+                isinstance(message, dict)
+                and message.get("type") == "image"
+                or getattr(message, "type", None) == "image"
+            )
+            for message in interleaved_messages
+        )
+    return batch.condition_image is not None or batch.image_path is not None
 
 
 def _resolve_vlm_max_new_tokens(

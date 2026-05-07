@@ -2,17 +2,73 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import cast
 
 import numpy as np
 import torch
 from PIL import Image
 
+from sglang.multimodal_gen.configs.sample.ug import (
+    UGSamplingParams,
+    get_ug_explicit_sampling_fields,
+    mark_ug_explicit_sampling_fields,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.ug.context import UGContextBundle
 from sglang.srt.ug.denoiser import UGLatentFlowMiddleBridge, UGMiddleBridge
 from sglang.srt.ug.interleaved import UGGSegmentResult
+
+BAGEL_OFFICIAL_T2I_DEFAULTS = {
+    "cfg_text_scale": 4.0,
+    "cfg_img_scale": 1.5,
+    "cfg_interval": [0.4, 1.0],
+    "cfg_renorm_min": 0.0,
+    "cfg_renorm_type": "global",
+    "timestep_shift": 3.0,
+    "num_inference_steps": 50,
+}
+
+BAGEL_OFFICIAL_EDIT_DEFAULTS = {
+    "cfg_text_scale": 4.0,
+    "cfg_img_scale": 2.0,
+    "cfg_interval": [0.0, 1.0],
+    "cfg_renorm_min": 0.0,
+    "cfg_renorm_type": "text_channel",
+    "timestep_shift": 3.0,
+    "num_inference_steps": 50,
+}
+
+
+def apply_bagel_official_sampling_defaults(
+    params: UGSamplingParams | None,
+    *,
+    mode: str,
+    has_input_image: bool,
+    explicit_fields: set[str] | None = None,
+) -> UGSamplingParams | None:
+    """Apply BAGEL demo defaults without clobbering user-provided fields."""
+
+    if params is None or mode == "vlm":
+        return params
+
+    explicit = get_ug_explicit_sampling_fields(params)
+    if explicit_fields is not None:
+        explicit |= set(explicit_fields)
+
+    if mode == "edit" or (mode == "interleave" and has_input_image):
+        defaults = BAGEL_OFFICIAL_EDIT_DEFAULTS
+    else:
+        defaults = BAGEL_OFFICIAL_T2I_DEFAULTS
+
+    for name, value in defaults.items():
+        if name not in explicit:
+            setattr(params, name, deepcopy(value))
+
+    params._validate_ug_fields()
+    mark_ug_explicit_sampling_fields(params, explicit)
+    return params
 
 
 class BAGELLatentFlowGSegmentExecutor:
@@ -64,7 +120,7 @@ class BAGELLatentFlowGSegmentExecutor:
         batch: Req,
         server_args: ServerArgs,
     ) -> None:
-        cfg = server_args.pipeline_config
+        del server_args
         prepared = bridge.prepare_g_latents(
             contexts=contexts,
             sampling_params=batch.sampling_params,
@@ -76,28 +132,10 @@ class BAGELLatentFlowGSegmentExecutor:
             batch.extra["ug_latent_shape"] = prepared.latent_shape
             return
 
-        height = int(batch.height)
-        width = int(batch.width)
-        latent_height = height // cfg.latent_downsample
-        latent_width = width // cfg.latent_downsample
-        if latent_height <= 0 or latent_width <= 0:
-            raise ValueError(
-                f"UG latent shape is empty for height={height}, width={width}, "
-                f"latent_downsample={cfg.latent_downsample}"
-            )
-
-        num_tokens = latent_height * latent_width
-        latent_dim = cfg.latent_channel * cfg.latent_patch_size * cfg.latent_patch_size
-        generator = torch.Generator(device="cpu").manual_seed(int(batch.seed))
-        batch.latents = torch.randn(
-            1,
-            num_tokens,
-            latent_dim,
-            generator=generator,
-            dtype=torch.float32,
+        raise RuntimeError(
+            "BAGEL latent-flow requires backend-prepared VAE latents from "
+            "SRT-owned U context"
         )
-        batch.extra["ug_latent_position_ids"] = torch.arange(num_tokens)
-        batch.extra["ug_latent_shape"] = (latent_height, latent_width, latent_dim)
 
     @staticmethod
     def _denoise(
@@ -155,13 +193,9 @@ class BAGELLatentFlowGSegmentExecutor:
             sampling_params=batch.sampling_params,
         )
         if image is None:
-            value = int(batch.latents.mean().abs().item() * 255) % 255
-            image = Image.fromarray(
-                np.full(
-                    (int(batch.height), int(batch.width), 3),
-                    value,
-                    dtype=np.uint8,
-                )
+            raise RuntimeError(
+                "BAGEL latent-flow requires backend image decode from SRT-owned "
+                "U context"
             )
         if isinstance(image, Image.Image):
             return image

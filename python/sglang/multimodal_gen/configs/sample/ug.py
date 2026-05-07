@@ -77,3 +77,27 @@ class UGSamplingParams(SamplingParams):
                     "think_max_new_tokens must be positive when set, got "
                     f"{self.think_max_new_tokens!r}"
                 )
+
+
+def get_ug_explicit_sampling_fields(params: Any | None) -> set[str]:
+    if params is None:
+        return set()
+    return set(getattr(params, "_explicit_fields", set()) or set())
+
+
+def mark_ug_explicit_sampling_fields(
+    params: UGSamplingParams,
+    explicit_fields: set[str],
+) -> UGSamplingParams:
+    params._explicit_fields = get_ug_explicit_sampling_fields(params) | set(
+        explicit_fields
+    )
+    return params
+
+
+def build_ug_sampling_params(values: dict[str, Any] | None = None) -> UGSamplingParams:
+    values = dict(values or {})
+    return mark_ug_explicit_sampling_fields(
+        UGSamplingParams(**values),
+        set(values.keys()),
+    )

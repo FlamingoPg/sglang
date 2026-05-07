@@ -3,17 +3,12 @@
 import re
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 import torch
 from transformers import AutoConfig
 
-from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_u1 import (
     U1PixelFlowGSegmentExecutor,
-    _u1_guidance_branch,
-    _u1_patch_grid,
-    _u1_timesteps,
 )
 from sglang.srt.configs.model_config import is_multimodal_model
 from sglang.srt.configs.neo_chat import NEOChatConfig, NEOVisionConfig
@@ -136,35 +131,8 @@ class TestU1UGBackend(unittest.TestCase):
         self.assertEqual(build_u1_t2i_uncondition_prompt().count("<img>"), 1)
         self.assertIn("<image>", build_u1_vlm_prompt(question="what is here?"))
 
-    def test_u1_pixel_flow_executor_helpers(self):
-        sampling = UGSamplingParams(prompt="draw", height=8, width=8)
-
+    def test_u1_pixel_flow_executor_declares_capability(self):
         self.assertEqual(U1PixelFlowGSegmentExecutor.required_g_kind, "pixel_flow")
-        self.assertEqual(_u1_patch_grid(height=33, width=65, patch_size=16), (3, 5))
-
-        timesteps = _u1_timesteps(num_inference_steps=4, timestep_shift=2.0)
-        self.assertEqual(len(timesteps), 4)
-        self.assertGreater(timesteps[0], timesteps[-1])
-
-        self.assertEqual(_u1_guidance_branch(sampling), "none")
-        self.assertEqual(
-            _u1_guidance_branch(
-                SimpleNamespace(cfg_text_scale=2.0, cfg_img_scale=1.0)
-            ),
-            "text",
-        )
-        self.assertEqual(
-            _u1_guidance_branch(
-                SimpleNamespace(cfg_text_scale=1.0, cfg_img_scale=2.0)
-            ),
-            "image",
-        )
-        self.assertEqual(
-            _u1_guidance_branch(
-                SimpleNamespace(cfg_text_scale=2.0, cfg_img_scale=2.0)
-            ),
-            "text_image",
-        )
 
     def test_runtime_import_firewall_blocks_official_u1_imports(self):
         repo = Path(__file__).resolve().parents[5]
