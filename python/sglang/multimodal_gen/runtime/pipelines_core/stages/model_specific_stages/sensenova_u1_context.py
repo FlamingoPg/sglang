@@ -283,7 +283,7 @@ def _build_u1_native_interleave_like_prepared_input(
     if not input_ids:
         raise RuntimeError(f"U1 native {segment_type} prompt produced no input ids")
     if images:
-        from sglang.srt.models.neo_chat import build_u1_vlm_thw_indexes
+        from sglang.srt.models.sensenova_u1 import build_u1_vlm_thw_indexes
 
         context_id = tokenizer.convert_tokens_to_ids(U1_IMG_CONTEXT_TOKEN)
         image_offsets = _u1_image_context_offsets(
@@ -409,7 +409,7 @@ def build_u1_native_edit_prepared_input(
     if not selected:
         raise RuntimeError("U1 native edit prompt did not contain image context tokens")
 
-    from sglang.srt.models.neo_chat import build_u1_vlm_thw_indexes
+    from sglang.srt.models.sensenova_u1 import build_u1_vlm_thw_indexes
 
     positions = build_u1_vlm_thw_indexes(
         input_ids,
@@ -545,7 +545,7 @@ def _build_u1_native_image_sidecar_prepared_input(
             f"U1 native {segment_type} prompt did not contain image context tokens"
         )
 
-    from sglang.srt.models.neo_chat import build_u1_vlm_thw_indexes
+    from sglang.srt.models.sensenova_u1 import build_u1_vlm_thw_indexes
 
     positions = build_u1_vlm_thw_indexes(
         input_ids,

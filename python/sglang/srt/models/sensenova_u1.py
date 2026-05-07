@@ -9,16 +9,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.neo_chat import NEOChatConfig
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.utils import PPMissingLayer
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -30,10 +25,13 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM, Qwen3MLP
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.models.qwen3 import (
+    Qwen3DecoderLayer,
+    Qwen3ForCausalLM,
+    Qwen3MLP,
+    Qwen3Model,
+)
+from sglang.srt.utils import add_prefix
 
 
 @dataclass(frozen=True, slots=True)
@@ -1035,20 +1033,18 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
         return F.linear(hidden_states, down_weight, down_bias)
 
 
-class NEOQwen3Model(Qwen2Model):
+class NEOQwen3Model(Qwen3Model):
     def __init__(
         self,
         config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        alt_stream = torch.cuda.Stream() if is_cuda() else None
         super().__init__(
             config=config,
             quant_config=quant_config,
             prefix=prefix,
             decoder_layer_type=NEOQwen3DecoderLayer,
-            alt_stream=alt_stream,
         )
         if self.pp_group.is_last_rank:
             self.norm = U1Qwen3RMSNorm(
@@ -1059,57 +1055,6 @@ class NEOQwen3Model(Qwen2Model):
                 config.hidden_size,
                 eps=config.rms_norm_eps,
             )
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ):
-        if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
-            residual = None
-        else:
-            assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
-
-        aux_hidden_states = []
-        for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
-
-        if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-
-        if hidden_states.shape[0] != 0:
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
-
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-        return hidden_states, aux_hidden_states
 
     def forward_gen_embeds(
         self,
@@ -1143,39 +1088,7 @@ class NEOQwen3Model(Qwen2Model):
 
 
 class NEOQwen3ForCausalLM(Qwen3ForCausalLM):
-    def __init__(
-        self,
-        config,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        nn.Module.__init__(self)
-        self.pp_group = get_pp_group()
-        self.config = config
-        self.quant_config = quant_config
-        self.model = NEOQwen3Model(
-            config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
-
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-                    prefix=add_prefix("lm_head", prefix),
-                )
-        else:
-            self.lm_head = PPMissingLayer()
-
-        self.logits_processor = LogitsProcessor(config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        self.capture_aux_hidden_states = False
+    model_cls = NEOQwen3Model
 
     def forward_u1_gen_embeds(
         self,
