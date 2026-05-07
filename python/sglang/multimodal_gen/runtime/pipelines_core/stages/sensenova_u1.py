@@ -36,7 +36,7 @@ class SenseNovaU1GSegmentExecutor(Protocol):
     ) -> UGGSegmentResult: ...
 
 
-class SenseNovaU1ContextStage(PipelineStage):
+class SenseNovaU1InputStage(PipelineStage):
     def __init__(self, bridge: UGMiddleBridge) -> None:
         super().__init__()
         self.bridge = bridge
@@ -54,8 +54,7 @@ class SenseNovaU1ContextStage(PipelineStage):
         )
         if unsupported:
             raise ValueError(
-                "Unsupported SenseNovaU1Pipeline runtime settings: "
-                f"{unsupported}"
+                f"Unsupported SenseNovaU1Pipeline runtime settings: {unsupported}"
             )
 
         if batch.height is None:
@@ -70,20 +69,18 @@ class SenseNovaU1ContextStage(PipelineStage):
         think_max_new_tokens = _resolve_ug_think_max_new_tokens(batch, request_metadata)
         batch.extra["ug_mode"] = mode
         batch.extra["ug_think"] = think
+        batch.extra["ug_think_max_new_tokens"] = think_max_new_tokens
         if batch.sampling_params is not None:
             setattr(batch.sampling_params, "ug_generation_mode", mode)
+            _apply_bridge_sampling_defaults(
+                self.bridge,
+                batch,
+                mode=mode,
+                interleaved_messages=interleaved_messages,
+            )
         if interleaved_messages is not None:
             messages = _normalize_pipeline_interleaved_messages(interleaved_messages)
             batch.extra["ug_interleaved_messages"] = messages
-            batch.extra["ug_contexts"] = self.bridge.prepare_u_context_from_messages(
-                messages=messages,
-                think=think,
-                think_max_new_tokens=think_max_new_tokens,
-                sampling_params=batch.sampling_params,
-            )
-            batch.extra["ug_pre_image_segments"] = batch.extra[
-                "ug_contexts"
-            ].full.metadata.get("pre_image_segments", [])
             return batch
 
         if batch.condition_image is None and batch.image_path is not None:
@@ -103,6 +100,33 @@ class SenseNovaU1ContextStage(PipelineStage):
                 "SenseNovaU1Pipeline expects a PIL image input, got "
                 f"{type(batch.condition_image)}"
             )
+        return batch
+
+
+class SenseNovaU1UContextStage(PipelineStage):
+    def __init__(self, bridge: UGMiddleBridge) -> None:
+        super().__init__()
+        self.bridge = bridge
+
+    @property
+    def role_affinity(self):
+        return RoleType.ENCODER
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        interleaved_messages = batch.extra.get("ug_interleaved_messages")
+        think = bool(batch.extra.get("ug_think", False))
+        think_max_new_tokens = batch.extra.get("ug_think_max_new_tokens")
+        if interleaved_messages is not None:
+            batch.extra["ug_contexts"] = self.bridge.prepare_u_context_from_messages(
+                messages=interleaved_messages,
+                think=think,
+                think_max_new_tokens=think_max_new_tokens,
+                sampling_params=batch.sampling_params,
+            )
+            batch.extra["ug_pre_image_segments"] = batch.extra[
+                "ug_contexts"
+            ].full.metadata.get("pre_image_segments", [])
+            return batch
 
         batch.extra["ug_contexts"] = self.bridge.prepare_u_context(
             prompt=batch.prompt,
@@ -137,6 +161,7 @@ class SenseNovaU1GSegmentStage(PipelineStage):
         if contexts is None:
             return batch
 
+        batch.extra.pop("ug_generated_segment_committed", None)
         segment = self.bridge.run_g_segment(
             contexts=contexts,
             executor=lambda run_contexts: _run_g_segment_executor(
@@ -149,6 +174,32 @@ class SenseNovaU1GSegmentStage(PipelineStage):
         )
         batch.extra["ug_generated_segment"] = segment
         batch.output = _image_to_numpy_batch(segment.image)
+        return batch
+
+
+class SenseNovaU1CommitStage(PipelineStage):
+    def __init__(self, bridge: UGMiddleBridge) -> None:
+        super().__init__()
+        self.bridge = bridge
+
+    @property
+    def role_affinity(self):
+        return RoleType.DECODER
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        contexts = batch.extra.get("ug_contexts")
+        mode = normalize_ug_generation_mode(batch.extra.get("ug_mode"), default="t2i")
+        generated_segment = batch.extra.get("ug_generated_segment")
+        if (
+            contexts is not None
+            and mode == "interleave"
+            and generated_segment is not None
+        ):
+            self.bridge.commit_generated_segment(
+                contexts=contexts,
+                segment=generated_segment,
+            )
+            batch.extra["ug_generated_segment_committed"] = True
         return batch
 
 
@@ -170,10 +221,6 @@ class SenseNovaU1DecodeStage(PipelineStage):
         else:
             image_for_append = generated_segment.image
         if contexts is not None and mode == "interleave":
-            self.bridge.commit_generated_segment(
-                contexts=contexts,
-                segment=generated_segment,
-            )
             batch.extra["ug_post_image_segment"] = self.bridge.continue_u_decode(
                 contexts=contexts
             )
@@ -222,6 +269,36 @@ def _validate_g_segment_capability(
             "UG G executor requires "
             f"g_kind={required_g_kind!r}, got {bridge_g_kind!r}"
         )
+
+
+def _apply_bridge_sampling_defaults(
+    bridge: UGMiddleBridge,
+    batch: Req,
+    *,
+    mode: UGGenerationMode,
+    interleaved_messages,
+) -> None:
+    apply_defaults = getattr(bridge, "apply_sampling_defaults", None)
+    if not callable(apply_defaults):
+        return
+    apply_defaults(
+        batch.sampling_params,
+        mode=mode,
+        has_input_image=_has_input_image(batch, interleaved_messages),
+        explicit_fields=set(batch.extra.get("explicit_fields", [])),
+    )
+
+
+def _has_input_image(batch: Req, interleaved_messages) -> bool:
+    if interleaved_messages is not None:
+        return any(_message_is_image(message) for message in interleaved_messages)
+    return batch.condition_image is not None or batch.image_path is not None
+
+
+def _message_is_image(message) -> bool:
+    if isinstance(message, dict):
+        return message.get("type") == "image"
+    return getattr(message, "type", None) == "image"
 
 
 def _image_to_numpy_batch(image) -> np.ndarray:

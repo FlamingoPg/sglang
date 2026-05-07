@@ -12,9 +12,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     SenseNovaU1PixelFlowGSegmentExecutor,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.sensenova_u1 import (
-    SenseNovaU1ContextStage,
+    SenseNovaU1CommitStage,
     SenseNovaU1DecodeStage,
     SenseNovaU1GSegmentStage,
+    SenseNovaU1InputStage,
+    SenseNovaU1UContextStage,
     _normalize_pipeline_interleaved_messages,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -53,8 +55,10 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs):
         bridge = self.get_module("srt_middle_bridge")
         g_segment_executor = self.get_module("g_segment_executor")
-        self.add_stage(SenseNovaU1ContextStage(bridge))
+        self.add_stage(SenseNovaU1InputStage(bridge))
+        self.add_stage(SenseNovaU1UContextStage(bridge))
         self.add_stage(SenseNovaU1GSegmentStage(bridge, g_segment_executor))
+        self.add_stage(SenseNovaU1CommitStage(bridge))
         self.add_stage(SenseNovaU1DecodeStage(bridge))
 
     def forward(
@@ -62,7 +66,6 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         batch: Req,
         server_args: ServerArgs,
     ):
-        _apply_bridge_sampling_defaults(self.get_module("srt_middle_bridge"), batch)
         return super().forward(batch, server_args)
 
     def forward_interleaved(
@@ -131,10 +134,12 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
     ) -> Req:
         bridge = self.get_module("srt_middle_bridge")
         g_segment_executor = self.get_module("g_segment_executor")
-        context_stage = SenseNovaU1ContextStage(bridge)
+        input_stage = SenseNovaU1InputStage(bridge)
+        context_stage = SenseNovaU1UContextStage(bridge)
         g_stage = SenseNovaU1GSegmentStage(bridge, g_segment_executor)
+        commit_stage = SenseNovaU1CommitStage(bridge)
 
-        _apply_bridge_sampling_defaults(bridge, batch)
+        batch = input_stage.forward(batch, server_args)
         batch = context_stage.forward(batch, server_args)
         contexts = batch.extra.get("ug_contexts")
         if contexts is None:
@@ -169,11 +174,9 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
                     "metadata": dict(generated_segment.metadata),
                 }
             )
-            bridge.commit_generated_segment(
-                contexts=contexts,
-                segment=generated_segment,
-            )
+            batch = commit_stage.forward(batch, server_args)
             batch.extra.pop("ug_generated_segment", None)
+            batch.extra.pop("ug_generated_segment_committed", None)
 
             next_image_requested = False
             for _ in range(max_text_segments):
@@ -357,55 +360,6 @@ def _normalize_interleaved_sampling_params(
             "to be omitted or passed as a dict"
         )
     return sampling_params
-
-
-def _apply_bridge_sampling_defaults(bridge: UGMiddleBridge, batch: Req) -> None:
-    if batch.sampling_params is None:
-        return
-    apply_defaults = getattr(bridge, "apply_sampling_defaults", None)
-    if not callable(apply_defaults):
-        return
-    interleaved_messages = batch.extra.get("ug_interleaved_messages")
-    request_metadata = dict(batch.extra.get("ug_request_metadata") or {})
-    mode = _resolve_generation_mode_for_defaults(
-        batch, request_metadata, interleaved_messages
-    )
-    setattr(batch.sampling_params, "ug_generation_mode", mode)
-    apply_defaults(
-        batch.sampling_params,
-        mode=mode,
-        has_input_image=_has_input_image(batch, interleaved_messages),
-        explicit_fields=set(batch.extra.get("explicit_fields", [])),
-    )
-
-
-def _resolve_generation_mode_for_defaults(
-    batch: Req,
-    metadata: dict[str, Any],
-    interleaved_messages,
-):
-    if "ug_mode" in batch.extra:
-        return normalize_ug_generation_mode(
-            batch.extra["ug_mode"], default="interleave"
-        )
-    if "mode" in metadata:
-        return normalize_ug_generation_mode(metadata["mode"], default="interleave")
-    if interleaved_messages is not None:
-        return "interleave"
-    return "edit" if batch.condition_image is not None or batch.image_path else "t2i"
-
-
-def _has_input_image(batch: Req, interleaved_messages) -> bool:
-    if interleaved_messages is not None:
-        return any(
-            (
-                isinstance(message, dict)
-                and message.get("type") == "image"
-                or getattr(message, "type", None) == "image"
-            )
-            for message in interleaved_messages
-        )
-    return batch.condition_image is not None or batch.image_path is not None
 
 
 def _resolve_vlm_max_new_tokens(
