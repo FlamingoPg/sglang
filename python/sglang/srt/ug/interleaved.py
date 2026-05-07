@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 UGGenerationMode = Literal["t2i", "edit", "interleave", "vlm"]
-UGGKind = Literal["latent_flow", "pixel_flow"]
+UGGKind = Literal["pixel_flow"]
 DEFAULT_UG_TEXT_MAX_NEW_TOKENS = 128
 
 _UG_MODE_ALIASES = {
@@ -215,7 +215,6 @@ class UGRuntimeStats:
     context_length: int = 0
     context_version: int = 0
     prefill_count: int = 0
-    velocity_count: int = 0
     append_image_count: int = 0
     decode_count: int = 0
     srt_request_count: int = 0
@@ -231,7 +230,6 @@ class UGRuntimeStats:
             context_length=int(counters.get("context_length", 0)),
             context_version=int(counters.get("context_version", 0)),
             prefill_count=int(counters.get("prefill_count", 0)),
-            velocity_count=int(counters.get("velocity_count", 0)),
             append_image_count=int(counters.get("append_image_count", 0)),
             decode_count=int(counters.get("decode_count", 0)),
             srt_request_count=int(counters.get("srt_request_count", 0)),

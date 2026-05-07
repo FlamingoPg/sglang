@@ -87,8 +87,8 @@ def is_sensenova_u1_ug_model(
 class U1UGModelAdapter:
     """SenseNova U1 UG adapter shell for the UG middle protocol.
 
-    U1 uses pixel-flow G mechanics, so it intentionally does not expose latent-flow
-    methods such as velocity prediction or latent decode.
+    U1 uses pixel-flow G mechanics; image-generation math stays in this backend
+    instead of the common UG middle layer.
     """
 
     g_kind: UGGKind = "pixel_flow"

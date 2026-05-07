@@ -119,12 +119,10 @@ class TestU1UGBackend(unittest.TestCase):
             "model.language_model.diffusion_model.layers.0.self_attn.q_proj.weight",
         )
 
-    def test_u1_adapter_declares_pixel_flow_without_latent_flow_api(self):
+    def test_u1_adapter_declares_pixel_flow_only(self):
         adapter = U1UGModelAdapter()
 
         self.assertEqual(adapter.g_kind, "pixel_flow")
-        self.assertFalse(hasattr(adapter, "predict_velocity_from_session"))
-        self.assertFalse(hasattr(adapter, "decode_latents_to_image"))
 
     def test_u1_prompt_builders_keep_generation_and_vlm_shapes(self):
         self.assertIn("<img>", build_u1_t2i_prompt(prompt="draw a cup"))

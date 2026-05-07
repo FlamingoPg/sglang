@@ -54,42 +54,6 @@ class UGSRTPreparedInput:
 
 
 @dataclass(frozen=True, slots=True)
-class UGVelocityRequest:
-    session: UGSessionHandle
-    latent_tokens: torch.Tensor
-    timestep: torch.Tensor
-    latent_position_ids: torch.Tensor
-    sampling_params: Any
-
-
-@dataclass(frozen=True, slots=True)
-class UGVelocityResponse:
-    session: UGSessionHandle
-    velocity: torch.Tensor
-
-
-@dataclass(frozen=True, slots=True)
-class UGLatentPrepareRequest:
-    session: UGSessionHandle
-    sampling_params: Any
-    seed: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class UGLatentPrepareResult:
-    latent_tokens: torch.Tensor
-    latent_position_ids: torch.Tensor
-    latent_shape: tuple[int, int, int] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class UGLatentDecodeRequest:
-    session: UGSessionHandle
-    latent_tokens: torch.Tensor
-    sampling_params: Any
-
-
-@dataclass(frozen=True, slots=True)
 class UGDecodeResult:
     type: Literal["text", "image_marker", "done"]
     text: str | None = None
@@ -122,7 +86,6 @@ class UGSessionRecord:
     context_length: int = 0
     context_version: int = 0
     prefill_count: int = 0
-    velocity_count: int = 0
     append_image_count: int = 0
     decode_count: int = 0
     srt_request_count: int = 0
@@ -175,21 +138,9 @@ class UGModelRunnerProtocol(Protocol):
 
     def decode_next_segment(self, *, record: UGSessionRecord) -> UGDecodeResult: ...
 
-    def predict_velocity_from_session(
-        self, *, request: UGVelocityRequest, record: UGSessionRecord
-    ) -> torch.Tensor: ...
-
-    def prepare_latents_from_session(
-        self, *, request: UGLatentPrepareRequest, record: UGSessionRecord
-    ) -> UGLatentPrepareResult | None: ...
-
     def append_generated_image(
         self, *, record: UGSessionRecord, image: Any | None
     ) -> int: ...
-
-    def decode_latents_to_image(
-        self, *, request: UGLatentDecodeRequest, record: UGSessionRecord
-    ) -> Any | None: ...
 
     def close_session(self, *, session_id: str) -> None: ...
 
@@ -434,45 +385,6 @@ class UGSessionRuntime:
         )
         return record.handle()
 
-    def predict_velocity(self, request: UGVelocityRequest) -> UGVelocityResponse:
-        record = self._record_for(request.session)
-        if record.state != UGSegmentState.G_DENOISE:
-            raise ValueError(
-                f"Cannot predict UG velocity from state {record.state} "
-                f"for UG session {request.session.session_id}"
-            )
-        velocity = self.model_runner.predict_velocity_from_session(
-            request=request, record=record
-        )
-        record.velocity_count += 1
-        return UGVelocityResponse(session=record.handle(), velocity=velocity)
-
-    def prepare_latents(
-        self, request: UGLatentPrepareRequest
-    ) -> UGLatentPrepareResult | None:
-        record = self._record_for(request.session)
-        if record.state != UGSegmentState.G_DENOISE:
-            raise ValueError(
-                f"Cannot prepare UG latents from state {record.state} "
-                f"for UG session {request.session.session_id}"
-            )
-        return self.model_runner.prepare_latents_from_session(
-            request=request,
-            record=record,
-        )
-
-    def decode_latents_to_image(self, request: UGLatentDecodeRequest) -> Any | None:
-        record = self._record_for(request.session)
-        if record.state != UGSegmentState.G_DENOISE:
-            raise ValueError(
-                f"Cannot decode UG latents from state {record.state} "
-                f"for UG session {request.session.session_id}"
-            )
-        return self.model_runner.decode_latents_to_image(
-            request=request,
-            record=record,
-        )
-
     def append_generated_image(
         self, handle: UGSessionHandle, image: Any | None
     ) -> UGSessionHandle:
@@ -569,7 +481,6 @@ class UGSessionRuntime:
             "context_length": record.context_length,
             "context_version": record.context_version,
             "prefill_count": record.prefill_count,
-            "velocity_count": record.velocity_count,
             "append_image_count": record.append_image_count,
             "decode_count": record.decode_count,
             "srt_request_count": record.srt_request_count,

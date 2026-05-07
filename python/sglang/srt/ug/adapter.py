@@ -6,19 +6,13 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-import torch
-
 from sglang.srt.ug.context import UGSessionHandle, UGSRTRequestView
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
-    UGLatentDecodeRequest,
-    UGLatentPrepareRequest,
-    UGLatentPrepareResult,
     UGSegmentState,
     UGSessionRecord,
     UGSRTPreparedInput,
-    UGVelocityRequest,
     UGVLMTextGenerationResult,
 )
 
@@ -90,33 +84,12 @@ class UGModelAdapterProtocol(Protocol):
         max_new_tokens: int,
     ) -> UGVLMTextGenerationResult: ...
 
-    def predict_velocity_from_session(
-        self,
-        *,
-        session: UGModelSessionView,
-        request: UGVelocityRequest,
-    ) -> torch.Tensor: ...
-
-    def prepare_latents_from_session(
-        self,
-        *,
-        session: UGModelSessionView,
-        request: UGLatentPrepareRequest,
-    ) -> UGLatentPrepareResult | None: ...
-
     def append_generated_image(
         self,
         *,
         session: UGModelSessionView,
         image: Any | None,
     ) -> UGModelAppendImageResult: ...
-
-    def decode_latents_to_image(
-        self,
-        *,
-        session: UGModelSessionView,
-        request: UGLatentDecodeRequest,
-    ) -> Any | None: ...
 
     def close_session(self, *, session_id: str) -> None: ...
 
@@ -215,22 +188,6 @@ class UGModelRunnerAdapter:
             max_new_tokens=max_new_tokens,
         )
 
-    def predict_velocity_from_session(
-        self, *, request: UGVelocityRequest, record: UGSessionRecord
-    ) -> torch.Tensor:
-        return self.adapter.predict_velocity_from_session(
-            session=self._session_view(record),
-            request=request,
-        )
-
-    def prepare_latents_from_session(
-        self, *, request: UGLatentPrepareRequest, record: UGSessionRecord
-    ) -> UGLatentPrepareResult | None:
-        return self.adapter.prepare_latents_from_session(
-            session=self._session_view(record),
-            request=request,
-        )
-
     def append_generated_image(
         self, *, record: UGSessionRecord, image: Any | None
     ) -> int:
@@ -239,14 +196,6 @@ class UGModelRunnerAdapter:
             image=image,
         )
         return result.added_tokens
-
-    def decode_latents_to_image(
-        self, *, request: UGLatentDecodeRequest, record: UGSessionRecord
-    ) -> Any | None:
-        return self.adapter.decode_latents_to_image(
-            session=self._session_view(record),
-            request=request,
-        )
 
     def close_session(self, *, session_id: str) -> None:
         self.adapter.close_session(session_id=session_id)

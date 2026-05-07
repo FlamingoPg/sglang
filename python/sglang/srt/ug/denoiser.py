@@ -5,8 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Protocol
 
-import torch
-
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle, UGSessionHandle
 from sglang.srt.ug.interleaved import (
     DEFAULT_UG_TEXT_MAX_NEW_TOKENS,
@@ -16,11 +14,7 @@ from sglang.srt.ug.interleaved import (
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
-    UGLatentDecodeRequest,
-    UGLatentPrepareRequest,
-    UGLatentPrepareResult,
     UGSessionRuntime,
-    UGVelocityRequest,
     UGVLMTextGenerationResult,
 )
 
@@ -72,40 +66,8 @@ class UGMiddleBridge(Protocol):
     ) -> UGVLMTextGenerationResult: ...
 
 
-class UGLatentFlowMiddleBridge(UGMiddleBridge, Protocol):
-    """Optional narrow surface for latent-flow G mechanics."""
-
-    def prepare_g_latents(
-        self,
-        *,
-        contexts: UGContextBundle,
-        sampling_params: Any,
-        seed: int | None,
-    ) -> UGLatentPrepareResult | None: ...
-
-    def predict_g_velocity(
-        self,
-        *,
-        contexts: UGContextBundle,
-        latent_tokens: torch.Tensor,
-        timestep: torch.Tensor,
-        latent_position_ids: torch.Tensor,
-        sampling_params: Any,
-    ) -> torch.Tensor: ...
-
-    def decode_g_latents(
-        self,
-        *,
-        contexts: UGContextBundle,
-        latent_tokens: torch.Tensor,
-        sampling_params: Any,
-    ) -> Any | None: ...
-
-
 class SRTBackedUGMiddleBridge:
     """UG middle bridge that keeps SRT as the session/KV owner."""
-
-    g_kind: UGGKind = "latent_flow"
 
     def __init__(
         self,
@@ -329,48 +291,6 @@ class SRTBackedUGMiddleBridge:
             self.runtime.close_session(session)
             raise
 
-    def predict_g_velocity(
-        self,
-        *,
-        contexts: UGContextBundle,
-        latent_tokens: torch.Tensor,
-        timestep: torch.Tensor,
-        latent_position_ids: torch.Tensor,
-        sampling_params: Any,
-    ) -> torch.Tensor:
-        if contexts.full.session is None:
-            raise ValueError("SRT-backed UG contexts require a session handle")
-        response = self.runtime.predict_velocity(
-            UGVelocityRequest(
-                session=contexts.full.session,
-                latent_tokens=latent_tokens,
-                timestep=timestep,
-                latent_position_ids=latent_position_ids,
-                sampling_params=sampling_params,
-            )
-        )
-        contexts.full.session = response.session
-        contexts.text_cfg.session = response.session
-        contexts.image_cfg.session = response.session
-        return response.velocity
-
-    def prepare_g_latents(
-        self,
-        *,
-        contexts: UGContextBundle,
-        sampling_params: Any,
-        seed: int | None,
-    ) -> UGLatentPrepareResult | None:
-        if contexts.full.session is None:
-            raise ValueError("SRT-backed UG contexts require a session handle")
-        return self.runtime.prepare_latents(
-            UGLatentPrepareRequest(
-                session=contexts.full.session,
-                sampling_params=sampling_params,
-                seed=seed,
-            )
-        )
-
     def _commit_generated_image(
         self, *, contexts: UGContextBundle, image: Any | None
     ) -> None:
@@ -384,24 +304,6 @@ class SRTBackedUGMiddleBridge:
         contexts.full.session = session
         contexts.text_cfg.session = session
         contexts.image_cfg.session = session
-
-    def decode_g_latents(
-        self,
-        *,
-        contexts: UGContextBundle,
-        latent_tokens: torch.Tensor,
-        sampling_params: Any,
-    ) -> Any | None:
-        if contexts.full.session is None:
-            raise ValueError("SRT-backed UG contexts require a session handle")
-        return self.runtime.decode_latents_to_image(
-            UGLatentDecodeRequest(
-                session=contexts.full.session,
-                latent_tokens=latent_tokens,
-                sampling_params=sampling_params,
-            )
-        )
-
 
 def normalize_ug_interleaved_messages(
     messages: list[UGInterleavedMessage | dict[str, Any]],
