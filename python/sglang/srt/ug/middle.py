@@ -142,8 +142,7 @@ class SRTBackedUGMiddleBridge:
                             "text": segment.text or "",
                             "metadata": {
                                 "token_ids": [
-                                    int(token_id)
-                                    for token_id in segment.token_ids
+                                    int(token_id) for token_id in segment.token_ids
                                 ]
                             },
                         }
@@ -302,6 +301,7 @@ class SRTBackedUGMiddleBridge:
         contexts.full.session = session
         contexts.text_cfg.session = session
         contexts.image_cfg.session = session
+
 
 def normalize_ug_interleaved_messages(
     messages: list[UGInterleavedMessage | dict[str, Any]],

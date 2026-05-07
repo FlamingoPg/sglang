@@ -7,16 +7,16 @@ from typing import Any
 
 from sglang.srt.ug.adapter import UGModelAppendImageResult, UGModelPrefillResult
 from sglang.srt.ug.context import UGContextBundle
+from sglang.srt.ug.interleaved import UGGKind
 from sglang.srt.ug.middle import (
     SRTBackedUGMiddleBridge,
     UGGSegmentExecutor,
 )
-from sglang.srt.ug.interleaved import UGGKind, UGGSegmentResult
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
-    UGSessionRuntime,
     UGSegmentState,
+    UGSessionRuntime,
     UGSRTPreparedInput,
     UGVLMTextGenerationResult,
 )
@@ -71,14 +71,6 @@ U1_INTERLEAVE_SYSTEM_MESSAGE = (
     "The answer may include text, images, or both. Match the user's language in "
     "both reasoning and the final answer."
 )
-
-
-def is_sensenova_u1_ug_model(
-    model_path: str | None,
-    model_id: str | None = None,
-) -> bool:
-    identifier = f"{model_path or ''} {model_id or ''}".lower()
-    return "sensenova-u1" in identifier or "sensenova_u1" in identifier
 
 
 class U1UGModelAdapter:
@@ -528,6 +520,10 @@ class U1SRTBackedUGMiddleBridge:
     """Pixel-flow U1 bridge shell backed by the common SRT UG session runtime."""
 
     g_kind: UGGKind = "pixel_flow"
+    t2i_cfg_uncondition_role = U1_T2I_CFG_UNCONDITION_ROLE
+    interleave_text_uncondition_role = U1_INTERLEAVE_TEXT_UNCONDITION_ROLE
+    edit_img_condition_role = U1_EDIT_IMG_CONDITION_ROLE
+    edit_uncondition_role = U1_EDIT_UNCONDITION_ROLE
 
     def __init__(
         self,
@@ -563,7 +559,6 @@ class U1SRTBackedUGMiddleBridge:
                 think_max_new_tokens=think_max_new_tokens,
                 sampling_params=sampling_params,
             )
-        self._attach_u1_context_metadata(contexts)
         return contexts
 
     def prepare_u_context_from_messages(
@@ -586,7 +581,6 @@ class U1SRTBackedUGMiddleBridge:
                 think_max_new_tokens=think_max_new_tokens,
                 sampling_params=sampling_params,
             )
-        self._attach_u1_context_metadata(contexts)
         return contexts
 
     @contextmanager
@@ -643,16 +637,6 @@ class U1SRTBackedUGMiddleBridge:
                 adapter.native_generation_mode = old_mode
                 adapter.native_interleave_think_mode = old_interleave_think_mode
 
-    def _attach_u1_context_metadata(self, contexts: UGContextBundle) -> None:
-        session = contexts.full.session
-        if session is None:
-            return
-        counters = self.runtime.get_debug_counters(session)
-        u1_state = counters.get("ug_model_state", {}).get("u1", {})
-        g_position_start = u1_state.get("g_position_start")
-        if g_position_start is not None:
-            contexts.full.metadata["u1_g_position_start"] = int(g_position_start)
-
     def run_g_segment(
         self,
         *,
@@ -660,92 +644,6 @@ class U1SRTBackedUGMiddleBridge:
         executor: UGGSegmentExecutor,
     ) -> Any:
         return self._bridge.run_g_segment(contexts=contexts, executor=executor)
-
-    def run_native_pixel_flow_g_segment(
-        self,
-        *,
-        contexts: UGContextBundle,
-        batch: Any,
-        server_args: Any,
-    ) -> UGGSegmentResult | None:
-        srt_executor = self.runtime.srt_request_executor
-        create_executor = getattr(
-            srt_executor,
-            "create_u1_native_srt_pixel_flow_executor",
-            None,
-        )
-        if not callable(create_executor):
-            return None
-        if contexts.full.session is None:
-            raise ValueError("U1 native pixel-flow requires a SRT UG session")
-        get_binding = getattr(srt_executor, "get_latest_ug_session_token_binding", None)
-        if not callable(get_binding):
-            raise RuntimeError(
-                "U1 native pixel-flow requires latest SRT session token binding"
-            )
-        session_id = contexts.full.session.session_id
-        binding = _u1_require_srt_binding(
-            get_binding,
-            session_id,
-            "U1 native pixel-flow has no SRT KV token binding",
-        )
-        cfg_img_condition_binding = None
-        cfg_uncondition_binding = None
-        sampling_params = batch.sampling_params
-        mode = getattr(sampling_params, "ug_generation_mode", None)
-        cfg_text_scale = float(getattr(sampling_params, "cfg_text_scale", 1.0))
-        cfg_img_scale = float(getattr(sampling_params, "cfg_img_scale", 1.0))
-        needs_cfg = _u1_needs_any_cfg(sampling_params)
-        needs_img_condition = needs_cfg and (
-            cfg_img_scale == 1.0 or cfg_text_scale != cfg_img_scale
-        )
-        needs_uncondition = needs_cfg and cfg_img_scale != 1.0
-        if mode == "edit":
-            if needs_img_condition:
-                cfg_img_condition_binding = _u1_require_sidecar_srt_binding(
-                    get_binding,
-                    session_id,
-                    U1_EDIT_IMG_CONDITION_ROLE,
-                    "U1 native edit image CFG requires sidecar SRT KV token binding",
-                )
-            if needs_uncondition:
-                cfg_uncondition_binding = _u1_require_sidecar_srt_binding(
-                    get_binding,
-                    session_id,
-                    U1_EDIT_UNCONDITION_ROLE,
-                    "U1 native edit uncondition CFG requires sidecar SRT KV binding",
-                )
-        elif mode == "interleave":
-            if needs_img_condition:
-                cfg_img_condition_binding = _u1_require_sidecar_srt_binding(
-                    get_binding,
-                    session_id,
-                    U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
-                    "U1 native interleave text CFG requires sidecar SRT KV binding",
-                )
-            if needs_uncondition:
-                cfg_uncondition_binding = _u1_require_sidecar_srt_binding(
-                    get_binding,
-                    session_id,
-                    U1_T2I_CFG_UNCONDITION_ROLE,
-                    "U1 native interleave image CFG requires sidecar SRT KV binding",
-                )
-        elif cfg_text_scale > 1.0:
-            cfg_img_condition_binding = _u1_require_sidecar_srt_binding(
-                get_binding,
-                session_id,
-                U1_T2I_CFG_UNCONDITION_ROLE,
-                "U1 native pixel-flow CFG requires sidecar SRT KV token binding",
-            )
-        native_executor = create_executor()
-        return native_executor.generate(
-            contexts=contexts,
-            batch=batch,
-            server_args=server_args,
-            srt_kv_token_binding=binding,
-            cfg_img_condition_srt_kv_token_binding=cfg_img_condition_binding,
-            cfg_uncondition_srt_kv_token_binding=cfg_uncondition_binding,
-        )
 
     def commit_generated_segment(
         self,
@@ -763,9 +661,7 @@ class U1SRTBackedUGMiddleBridge:
         self._bridge.release(contexts)
 
     def continue_u_decode(self, *, contexts: UGContextBundle) -> UGDecodeResult:
-        result = self._bridge.continue_u_decode(contexts=contexts)
-        self._attach_u1_context_metadata(contexts)
-        return result
+        return self._bridge.continue_u_decode(contexts=contexts)
 
     def _commit_interleave_text_uncondition_sidecar(
         self,
@@ -1271,7 +1167,6 @@ def build_u1_native_edit_uncondition_prepared_input(
     img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
     if input_ids[-1] != img_start_id:
         raise RuntimeError("U1 native edit uncondition prompt must end with <img>")
-    session_id = _u1_session_id(session)
     return UGSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
@@ -1334,7 +1229,6 @@ def _build_u1_native_image_sidecar_prepared_input(
         grid_hw=grid_hw,
         offsets=image_offsets,
     )
-    session_id = _u1_session_id(session)
     return UGSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
@@ -1483,7 +1377,6 @@ def build_u1_native_t2i_cfg_uncondition_prepared_input(
     img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
     if input_ids[-1] != img_start_id:
         raise RuntimeError("U1 native T2I CFG prompt must end with <img>")
-    session_id = _u1_session_id(session)
     return UGSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
@@ -1628,408 +1521,6 @@ def build_u1_vlm_prompt(*, question: str) -> str:
     )
 
 
-class U1NativeSRTPixelFlowExecutor:
-    """Run SenseNova U1 pixel-flow G steps through SRT's ModelRunner/KV path."""
-
-    def __init__(
-        self,
-        srt_model: Any,
-        *,
-        forward_batch_provider: Any,
-    ) -> None:
-        self.srt_model = srt_model
-        self.forward_batch_provider = forward_batch_provider
-
-    def generate(
-        self,
-        *,
-        contexts: UGContextBundle,
-        batch: Any,
-        server_args: Any,
-        srt_kv_token_binding: Any,
-        cfg_img_condition_srt_kv_token_binding: Any | None = None,
-        cfg_uncondition_srt_kv_token_binding: Any | None = None,
-    ) -> UGGSegmentResult:
-        import torch
-
-        with torch.inference_mode():
-            return self._generate_impl(
-                contexts=contexts,
-                batch=batch,
-                server_args=server_args,
-                srt_kv_token_binding=srt_kv_token_binding,
-                cfg_img_condition_srt_kv_token_binding=(
-                    cfg_img_condition_srt_kv_token_binding
-                ),
-                cfg_uncondition_srt_kv_token_binding=(
-                    cfg_uncondition_srt_kv_token_binding
-                ),
-            )
-
-    def _generate_impl(
-        self,
-        *,
-        contexts: UGContextBundle,
-        batch: Any,
-        server_args: Any,
-        srt_kv_token_binding: Any,
-        cfg_img_condition_srt_kv_token_binding: Any | None = None,
-        cfg_uncondition_srt_kv_token_binding: Any | None = None,
-    ) -> UGGSegmentResult:
-        del server_args
-        import numpy as np
-        import torch
-        from PIL import Image
-
-        if contexts.full.session is None:
-            raise ValueError("U1 native pixel-flow requires contexts.full.session")
-        sampling_params = batch.sampling_params
-        cfg_text_scale = float(getattr(sampling_params, "cfg_text_scale", 1.0))
-        cfg_img_scale = float(getattr(sampling_params, "cfg_img_scale", 1.0))
-        needs_cfg = not (cfg_text_scale == 1.0 and cfg_img_scale == 1.0)
-        needs_img_condition = needs_cfg and (
-            cfg_img_scale == 1.0 or cfg_text_scale != cfg_img_scale
-        )
-        needs_uncondition = needs_cfg and cfg_img_scale != 1.0
-        if (
-            needs_img_condition
-            and cfg_img_condition_srt_kv_token_binding is None
-            and not needs_uncondition
-            and cfg_uncondition_srt_kv_token_binding is not None
-        ):
-            cfg_img_condition_srt_kv_token_binding = (
-                cfg_uncondition_srt_kv_token_binding
-            )
-            cfg_uncondition_srt_kv_token_binding = None
-        if needs_img_condition and cfg_img_condition_srt_kv_token_binding is None:
-            raise RuntimeError(
-                "U1 native SRT pixel-flow CFG requires an image-condition "
-                "SRT KV token binding"
-            )
-        if needs_uncondition and cfg_uncondition_srt_kv_token_binding is None:
-            raise RuntimeError(
-                "U1 native SRT pixel-flow CFG requires an uncondition SRT KV "
-                "token binding"
-            )
-
-        image_size = _u1_batch_image_size(batch)
-        width, height = image_size
-        patch_size = int(self.srt_model.patch_size)
-        merge_size = int(1 / float(self.srt_model.downsample_ratio))
-        divisor = patch_size * merge_size
-        if width % divisor or height % divisor:
-            raise ValueError(
-                "U1 native pixel-flow image size must be divisible by "
-                f"{divisor}, got {width}x{height}"
-            )
-
-        token_h = height // divisor
-        token_w = width // divisor
-        grid_h = height // patch_size
-        grid_w = width // patch_size
-        steps = int(getattr(sampling_params, "num_inference_steps", None) or 0)
-        if steps <= 0:
-            raise ValueError(f"num_inference_steps must be positive, got {steps}")
-
-        device = _u1_model_device(self.srt_model)
-        dtype = _u1_model_dtype(self.srt_model)
-        seed = int(getattr(batch, "seed", None) or 0)
-        generator = _u1_session_torch_generator(
-            contexts.full.metadata,
-            seed=seed,
-            device=device,
-        )
-        noise_scale = float(
-            self.srt_model.noise_scale_for_image(grid_h=grid_h, grid_w=grid_w)
-        )
-        image_prediction = noise_scale * torch.randn(
-            (1, 3, height, width),
-            device=device,
-            dtype=dtype,
-            generator=generator,
-        )
-        gen_grid_hw = torch.tensor([[grid_h, grid_w]], device=device, dtype=torch.long)
-        timesteps = torch.linspace(0.0, 1.0, steps + 1, device=device)
-        timesteps = self.srt_model.apply_time_schedule(
-            timesteps,
-            image_seq_len=token_h * token_w,
-            timestep_shift=float(getattr(sampling_params, "timestep_shift", 1.0)),
-        )
-        g_position_start = int(
-            contexts.full.metadata.get(
-                "u1_g_position_start",
-                _u1_binding_position_count(srt_kv_token_binding),
-            )
-        )
-        indexes_image = self.srt_model.build_t2i_image_indexes(
-            token_h=token_h,
-            token_w=token_w,
-            text_len=g_position_start,
-            device=device,
-        )
-        cfg_img_condition_position_count = None
-        indexes_image_img_condition = None
-        if cfg_img_condition_srt_kv_token_binding is not None:
-            cfg_img_condition_position_count = int(
-                _u1_binding_position_count(cfg_img_condition_srt_kv_token_binding)
-            )
-            indexes_image_img_condition = self.srt_model.build_t2i_image_indexes(
-                token_h=token_h,
-                token_w=token_w,
-                text_len=cfg_img_condition_position_count,
-                device=device,
-            )
-        cfg_uncondition_position_count = None
-        indexes_image_uncondition = None
-        if cfg_uncondition_srt_kv_token_binding is not None:
-            cfg_uncondition_position_count = int(
-                _u1_binding_position_count(cfg_uncondition_srt_kv_token_binding)
-            )
-            indexes_image_uncondition = self.srt_model.build_t2i_image_indexes(
-                token_h=token_h,
-                token_w=token_w,
-                text_len=cfg_uncondition_position_count,
-                device=device,
-            )
-        generation_input = {
-            "packed_seqlens": torch.tensor(
-                [token_h * token_w], dtype=torch.int32, device=device
-            ),
-            "packed_position_ids": indexes_image,
-        }
-        prepared = SimpleNamespace(
-            generation_input=generation_input,
-            srt_kv_token_binding=srt_kv_token_binding,
-        )
-        prepared_img_condition = None
-        if cfg_img_condition_srt_kv_token_binding is not None:
-            prepared_img_condition = SimpleNamespace(
-                generation_input={
-                    "packed_seqlens": generation_input["packed_seqlens"],
-                    "packed_position_ids": indexes_image_img_condition,
-                },
-                srt_kv_token_binding=cfg_img_condition_srt_kv_token_binding,
-            )
-        prepared_uncondition = None
-        if cfg_uncondition_srt_kv_token_binding is not None:
-            prepared_uncondition = SimpleNamespace(
-                generation_input={
-                    "packed_seqlens": generation_input["packed_seqlens"],
-                    "packed_position_ids": indexes_image_uncondition,
-                },
-                srt_kv_token_binding=cfg_uncondition_srt_kv_token_binding,
-            )
-        cfg_interval = list(getattr(sampling_params, "cfg_interval", [0.0, 1.0]))
-        if len(cfg_interval) != 2:
-            raise ValueError("U1 native pixel-flow cfg_interval must have two values")
-        cfg_start, cfg_end = float(cfg_interval[0]), float(cfg_interval[1])
-        cfg_renorm_type = str(getattr(sampling_params, "cfg_renorm_type", "none"))
-
-        for step_i in range(steps):
-            timestep = timesteps[step_i]
-            next_timestep = timesteps[step_i + 1]
-            use_cfg = (float(timestep) > cfg_start and float(timestep) < cfg_end) or (
-                cfg_start == 0.0
-            )
-            z = self.srt_model.patchify(image_prediction, patch_size * merge_size)
-            image_input = self.srt_model.patchify(
-                image_prediction,
-                patch_size,
-                channel_first=True,
-            )
-            image_embeds = self.srt_model.extract_feature(
-                image_input.view(grid_h * grid_w, -1),
-                gen_model=True,
-                grid_hw=gen_grid_hw,
-            ).view(1, token_h * token_w, -1)
-            timestep_values = timestep.expand(token_h * token_w)
-            timestep_embeddings = self.srt_model.fm_modules["timestep_embedder"](
-                timestep_values
-            ).view(1, token_h * token_w, -1)
-            if getattr(self.srt_model, "add_noise_scale_embedding", False):
-                noise_values = torch.full_like(
-                    timestep_values,
-                    noise_scale / float(self.srt_model.noise_scale_max_value),
-                )
-                timestep_embeddings = timestep_embeddings + self.srt_model.fm_modules[
-                    "noise_scale_embedder"
-                ](noise_values).view(1, token_h * token_w, -1)
-            image_embeds = image_embeds + timestep_embeddings
-
-            v_condition = self._predict_v(
-                prepared=prepared,
-                image_embeds=image_embeds,
-                indexes_image=indexes_image,
-                timestep=timestep,
-                z=z,
-                image_size=image_size,
-            )
-            if not use_cfg or not needs_cfg:
-                v_pred = v_condition
-            elif cfg_img_scale == 1.0:
-                v_img_condition = self._predict_v(
-                    prepared=prepared_img_condition,
-                    image_embeds=image_embeds,
-                    indexes_image=indexes_image_img_condition,
-                    timestep=timestep,
-                    z=z,
-                    image_size=image_size,
-                )
-                v_pred = v_img_condition + cfg_text_scale * (
-                    v_condition - v_img_condition
-                )
-            elif cfg_text_scale == cfg_img_scale:
-                v_uncondition = self._predict_v(
-                    prepared=prepared_uncondition,
-                    image_embeds=image_embeds,
-                    indexes_image=indexes_image_uncondition,
-                    timestep=timestep,
-                    z=z,
-                    image_size=image_size,
-                )
-                v_pred = v_uncondition + cfg_text_scale * (v_condition - v_uncondition)
-            else:
-                v_img_condition = self._predict_v(
-                    prepared=prepared_img_condition,
-                    image_embeds=image_embeds,
-                    indexes_image=indexes_image_img_condition,
-                    timestep=timestep,
-                    z=z,
-                    image_size=image_size,
-                )
-                v_uncondition = self._predict_v(
-                    prepared=prepared_uncondition,
-                    image_embeds=image_embeds,
-                    indexes_image=indexes_image_uncondition,
-                    timestep=timestep,
-                    z=z,
-                    image_size=image_size,
-                )
-                v_pred = (
-                    v_uncondition
-                    + cfg_text_scale * (v_condition - v_img_condition)
-                    + cfg_img_scale * (v_img_condition - v_uncondition)
-                )
-            if needs_cfg and use_cfg:
-                v_pred = self._apply_cfg_renorm(
-                    v_condition=v_condition,
-                    v_pred=v_pred,
-                    cfg_renorm_type=cfg_renorm_type,
-                )
-
-            z = z + (next_timestep - timestep) * v_pred
-            image_prediction = self.srt_model.unpatchify(
-                z,
-                patch_size * merge_size,
-                height,
-                width,
-            )
-
-        array = (
-            (image_prediction[0].float() * 0.5 + 0.5)
-            .clamp(0, 1)
-            .permute(1, 2, 0)
-            .detach()
-            .cpu()
-            .numpy()
-        )
-        image = Image.fromarray((array * 255.0).round().astype(np.uint8), "RGB")
-        commit_embeddings, commit_grid_hw = (
-            _u1_precompute_generated_image_commit_embeddings(
-                self.srt_model,
-                image_prediction,
-                patch_size=patch_size,
-                grid_hw=gen_grid_hw[:1],
-            )
-        )
-        commit_image = {
-            "pixel_values": image_prediction.detach().to(torch.bfloat16).cpu(),
-            "value_range": "minus_one_to_one",
-            "grid_hw": commit_grid_hw,
-            "precomputed_embeddings": commit_embeddings,
-        }
-        return UGGSegmentResult(
-            type="image",
-            image=image,
-            metadata={
-                "g_kind": "pixel_flow",
-                "native_srt_pixel_flow": True,
-                "temporary_g_kv": True,
-                "timesteps": steps,
-                "seed": seed,
-                "width": width,
-                "height": height,
-                "grid": (token_h, token_w),
-                "g_position_start": g_position_start,
-                "condition_position_count": g_position_start,
-                "cfg_img_condition_position_count": (cfg_img_condition_position_count),
-                "cfg_uncondition_position_count": cfg_uncondition_position_count,
-                "noise_scale": noise_scale,
-                "cfg_text_scale": cfg_text_scale,
-                "cfg_img_scale": cfg_img_scale,
-                "cfg_renorm_type": (cfg_renorm_type if needs_cfg else "none"),
-            },
-            commit_image=commit_image,
-        )
-
-    def _predict_v(
-        self,
-        *,
-        prepared: Any,
-        image_embeds: Any,
-        indexes_image: Any,
-        timestep: Any,
-        z: Any,
-        image_size: tuple[int, int],
-    ) -> Any:
-        forward_batch_context = self.forward_batch_provider(
-            prepared=prepared,
-            g_query_embeds=image_embeds,
-            timestep=timestep,
-        )
-        forward_batch = getattr(
-            forward_batch_context,
-            "forward_batch",
-            forward_batch_context,
-        )
-        try:
-            v = self.srt_model.predict_u1_pixel_flow_from_srt(
-                image_embeds=image_embeds,
-                indexes_image=indexes_image,
-                forward_batch=forward_batch,
-                timestep=timestep,
-                z=z,
-                image_size=image_size,
-            )
-            return v
-        finally:
-            release = getattr(forward_batch_context, "release", None)
-            if callable(release):
-                release()
-
-    @staticmethod
-    def _apply_cfg_renorm(
-        *,
-        v_condition: Any,
-        v_pred: Any,
-        cfg_renorm_type: str,
-    ) -> Any:
-        if cfg_renorm_type == "none":
-            return v_pred
-        if cfg_renorm_type == "global":
-            norm_v_condition = v_condition.norm(dim=(1, 2), keepdim=True)
-            norm_v_cfg = v_pred.norm(dim=(1, 2), keepdim=True)
-        elif cfg_renorm_type == "channel":
-            norm_v_condition = v_condition.norm(dim=-1, keepdim=True)
-            norm_v_cfg = v_pred.norm(dim=-1, keepdim=True)
-        else:
-            raise ValueError(
-                f"Unsupported U1 native pixel-flow CFG renorm type: {cfg_renorm_type}"
-            )
-        scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
-        return v_pred * scale
-
-
 def _u1_tokenize_to_ids(
     tokenizer: Any,
     prompt: str,
@@ -2086,21 +1577,6 @@ def _u1_decode_token_ids(tokenizer: Any, token_ids: list[int]) -> str:
         return str(decode(token_ids))
 
 
-def _u1_batch_image_size(batch: Any) -> tuple[int, int]:
-    sampling_params = batch.sampling_params
-    height = _u1_first_int(
-        getattr(batch, "height", None),
-        getattr(sampling_params, "height", None),
-        default=1024,
-    )
-    width = _u1_first_int(
-        getattr(batch, "width", None),
-        getattr(sampling_params, "width", None),
-        default=1024,
-    )
-    return width, height
-
-
 def _u1_needs_text_cfg(sampling_params: Any | None) -> bool:
     if sampling_params is None:
         return False
@@ -2114,82 +1590,6 @@ def _u1_needs_any_cfg(sampling_params: Any | None) -> bool:
         float(getattr(sampling_params, "cfg_text_scale", 1.0)) == 1.0
         and float(getattr(sampling_params, "cfg_img_scale", 1.0)) == 1.0
     )
-
-
-def _u1_binding_position_count(binding: Any) -> int:
-    position_count = getattr(binding, "position_count", None)
-    if position_count is not None:
-        return int(position_count)
-    return int(getattr(binding, "token_count"))
-
-
-def _u1_require_srt_binding(get_binding: Any, session_id: str, message: str):
-    binding = get_binding(session_id)
-    if binding is None:
-        raise RuntimeError(f"{message} for session {session_id}")
-    return binding
-
-
-def _u1_require_sidecar_srt_binding(
-    get_binding: Any,
-    session_id: str,
-    role: str,
-    message: str,
-):
-    sidecar_session_id = f"{session_id}:{role}"
-    return _u1_require_srt_binding(get_binding, sidecar_session_id, message)
-
-
-def _u1_session_torch_generator(
-    metadata: dict[str, Any],
-    *,
-    seed: int,
-    device: Any,
-):
-    import torch
-
-    key = "_u1_pixel_flow_generator"
-    device_str = str(device)
-    state = metadata.get(key)
-    if (
-        isinstance(state, dict)
-        and state.get("seed") == int(seed)
-        and state.get("device") == device_str
-        and isinstance(state.get("generator"), torch.Generator)
-    ):
-        return state["generator"]
-    generator = torch.Generator(device=device).manual_seed(int(seed))
-    metadata[key] = {
-        "seed": int(seed),
-        "device": device_str,
-        "generator": generator,
-    }
-    return generator
-
-
-def _u1_first_int(*values, default: int) -> int:
-    for value in values:
-        if value is not None:
-            return int(value)
-    return int(default)
-
-
-def _u1_model_device(srt_model: Any):
-    import torch
-
-    vision_model = getattr(srt_model, "vision_model", None)
-    device = getattr(vision_model, "device", None)
-    if device is not None:
-        return device
-    return next(srt_model.parameters()).device
-
-
-def _u1_model_dtype(srt_model: Any):
-    vision_model = getattr(srt_model, "vision_model", None)
-    dtype = getattr(vision_model, "dtype", None)
-    if dtype is not None:
-        return dtype
-    return next(srt_model.parameters()).dtype
 
 
 def load_u1_native_image(
@@ -2328,33 +1728,6 @@ def _u1_sidecar_session_id(session: Any | None, role: str | None) -> str | None:
     if role is None or session_id is None:
         return None
     return f"{session_id}:{role}"
-
-
-def _u1_precompute_generated_image_commit_embeddings(
-    srt_model: Any,
-    image: Any,
-    *,
-    patch_size: int,
-    grid_hw: Any | None = None,
-):
-    import torch
-
-    pixel_values, loaded_grid_hw = _load_u1_generated_tensor_for_commit(
-        image,
-        patch_size=patch_size,
-        minus_one_to_one=True,
-    )
-    if grid_hw is None:
-        grid_hw = loaded_grid_hw
-    else:
-        grid_hw = torch.as_tensor(grid_hw, dtype=torch.long).detach().cpu()
-    with torch.no_grad():
-        embeddings = srt_model.extract_feature(
-            pixel_values,
-            grid_hw=grid_hw,
-            gen_model=False,
-        )
-    return embeddings.reshape(-1, embeddings.shape[-1]).detach().cpu(), grid_hw
 
 
 def _u1_session_context_length(session: Any | None) -> int:

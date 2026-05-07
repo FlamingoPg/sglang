@@ -124,21 +124,31 @@ class UGSRTSchedulerExecutor:
             position_count=self._request_position_count(req),
         )
 
-    def create_u1_native_srt_pixel_flow_executor(self):
-        """Create a SenseNova U1 pixel-flow executor backed by ModelRunner."""
-
-        from sglang.srt.models.neo_chat_ug import U1NativeSRTPixelFlowExecutor
-
+    def get_srt_model(self) -> Any:
+        """Return the SRT model owned by the attached scheduler's ModelRunner."""
         model_runner = self._require_model_runner()
         srt_model = getattr(model_runner, "model", None)
         if srt_model is None:
             raise UGSRTSchedulerExecutorError(
-                "UG U1 native pixel-flow requires model_runner.model"
+                "UG SRT executor requires model_runner.model"
             )
-        return U1NativeSRTPixelFlowExecutor(
-            srt_model,
-            forward_batch_provider=self.build_ug_g_forward_batch,
+        return srt_model
+
+    def get_latest_ug_session_position_count(
+        self,
+        session_id: str,
+        *,
+        sidecar_role: str | None = None,
+    ) -> int | None:
+        binding = self.get_latest_ug_session_token_binding(
+            self._binding_session_id(session_id, sidecar_role)
         )
+        if binding is None:
+            return None
+        position_count = getattr(binding, "position_count", None)
+        if position_count is not None:
+            return int(position_count)
+        return int(getattr(binding, "token_count"))
 
     def get_latest_ug_session_token_binding(
         self,
@@ -156,6 +166,35 @@ class UGSRTSchedulerExecutor:
         if not callable(pad_input_ids):
             return list(input_ids)
         return pad_input_ids(list(input_ids), mm_inputs)
+
+    def build_ug_g_forward_batch_for_session(
+        self,
+        *,
+        prepared: Any,
+        g_query_embeds: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> UGSRTTemporaryForwardBatch:
+        session_id = getattr(prepared, "srt_session_id", None)
+        if session_id is None:
+            raise UGSRTSchedulerExecutorError(
+                "UG G forward requires prepared.srt_session_id"
+            )
+        sidecar_role = getattr(prepared, "srt_sidecar_role", None)
+        binding_session_id = self._binding_session_id(session_id, sidecar_role)
+        binding = self.get_latest_ug_session_token_binding(binding_session_id)
+        if binding is None:
+            raise UGSRTSchedulerExecutorError(
+                "UG G forward has no SRT KV token binding for session "
+                f"{binding_session_id}"
+            )
+        prepared_data = dict(getattr(prepared, "__dict__", {}))
+        prepared_data["srt_kv_token_binding"] = binding
+        prepared_with_binding = SimpleNamespace(**prepared_data)
+        return self.build_ug_g_forward_batch(
+            prepared=prepared_with_binding,
+            g_query_embeds=g_query_embeds,
+            timestep=timestep,
+        )
 
     def build_ug_g_forward_batch(
         self,
@@ -426,6 +465,12 @@ class UGSRTSchedulerExecutor:
             return model_runner
         tp_worker = getattr(self.scheduler, "tp_worker", None)
         return getattr(tp_worker, "model_runner", None)
+
+    @staticmethod
+    def _binding_session_id(session_id: str, sidecar_role: str | None = None) -> str:
+        if sidecar_role is None:
+            return session_id
+        return f"{session_id}:{sidecar_role}"
 
     @staticmethod
     def _alloc_temp_req_slot(req_to_token_pool: Any) -> Any:
@@ -757,17 +802,35 @@ class UGSRTSchedulerExecutor:
 
     @staticmethod
     def _request_position_count(req: Any) -> int | None:
+        position_count = UGSRTSchedulerExecutor._position_count_from_position_ids(
+            getattr(req, "ug_position_ids", None)
+        )
+        if position_count is not None:
+            return position_count
+
         metadata = getattr(req, "ug_u_forward_metadata", {}) or {}
         adapter_metadata = metadata.get("adapter_metadata") or {}
-        u1_metadata = adapter_metadata.get("u1") or {}
-        g_position_start = u1_metadata.get("g_position_start")
-        if g_position_start is None:
-            model_state = adapter_metadata.get("ug_model_state") or {}
-            u1_state = model_state.get("u1") or {}
-            g_position_start = u1_state.get("g_position_start")
-        if g_position_start is None:
+        position_count = adapter_metadata.get("ug_srt_position_count")
+        if position_count is not None:
+            return int(position_count)
+
+        decode_position_id = getattr(req, "ug_decode_position_id", None)
+        if decode_position_id is not None:
+            return int(decode_position_id) + 1
+        return None
+
+    @staticmethod
+    def _position_count_from_position_ids(positions: Any) -> int | None:
+        if positions is None:
             return None
-        return int(g_position_start)
+        if hasattr(positions, "detach"):
+            positions = positions.detach().cpu().tolist()
+        if not positions:
+            return None
+        first = positions[0]
+        if isinstance(first, (list, tuple)):
+            return max(int(position[0]) for position in positions) + 1
+        return max(int(position) for position in positions) + 1
 
     @staticmethod
     def _streaming_session_slot(tree_cache: Any, session_id: str) -> Any | None:
