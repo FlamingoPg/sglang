@@ -29,13 +29,6 @@ from sglang.srt.ug.middle import UGMiddleBridge
 from sglang.srt.ug.sensenova_u1 import build_sensenova_u1_middle_bridge
 
 
-def _build_sensenova_u1_g_segment_executor(bridge: UGMiddleBridge):
-    g_kind = getattr(bridge, "g_kind", None)
-    if g_kind == "pixel_flow":
-        return SenseNovaU1PixelFlowGSegmentExecutor()
-    raise ValueError(f"Unsupported SenseNova U1 G kind: {g_kind!r}")
-
-
 class SenseNovaU1Pipeline(ComposedPipelineBase):
     pipeline_name = "SenseNovaU1Pipeline"
     _required_config_modules: list[str] = []
@@ -54,9 +47,7 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
                 ),
             )
         if "g_segment_executor" not in modules:
-            modules["g_segment_executor"] = _build_sensenova_u1_g_segment_executor(
-                modules["srt_middle_bridge"]
-            )
+            modules["g_segment_executor"] = SenseNovaU1PixelFlowGSegmentExecutor()
         return modules
 
     def create_pipeline_stages(self, server_args: ServerArgs):
