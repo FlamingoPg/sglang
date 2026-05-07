@@ -16,7 +16,6 @@ from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
@@ -32,6 +31,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.qwen3 import (
+    Qwen3Attention,
     Qwen3DecoderLayer,
     Qwen3ForCausalLM,
     Qwen3MLP,
@@ -548,7 +548,7 @@ class NEOVisionModel(nn.Module):
         )()
 
 
-class NEOQwen3Attention(nn.Module):
+class NEOQwen3Attention(Qwen3Attention):
     """U1 understanding attention with temporal and HW RoPE halves."""
 
     def __init__(
@@ -557,11 +557,27 @@ class NEOQwen3Attention(nn.Module):
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        super().__init__()
-        self.hidden_size = int(config.hidden_size)
-        self.total_num_heads = int(config.num_attention_heads)
-        self.total_num_kv_heads = int(config.num_key_value_heads)
+        head_dim = int(
+            getattr(config, "head_dim", None)
+            or (int(config.hidden_size) // int(config.num_attention_heads))
+        )
+        super().__init__(
+            hidden_size=int(config.hidden_size),
+            num_heads=int(config.num_attention_heads),
+            num_kv_heads=int(config.num_key_value_heads),
+            layer_id=layer_id,
+            rope_theta=getattr(config, "rope_theta", 1000000),
+            rope_scaling=getattr(config, "rope_scaling", None),
+            head_dim=head_dim,
+            max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
+            quant_config=quant_config,
+            rms_norm_eps=config.rms_norm_eps,
+            attention_bias=bool(config.attention_bias),
+            prefix=prefix,
+            alt_stream=alt_stream,
+        )
         self.head_dim = int(
             getattr(config, "head_dim", None)
             or (self.hidden_size // self.total_num_heads)
@@ -574,36 +590,6 @@ class NEOQwen3Attention(nn.Module):
 
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
-        self.num_heads = self.total_num_heads // attn_tp_size
-        if self.total_num_kv_heads >= attn_tp_size:
-            self.num_kv_heads = self.total_num_kv_heads // attn_tp_size
-        else:
-            self.num_kv_heads = 1
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-
-        self.qkv_proj = QKVParallelLinear(
-            self.hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=bool(config.attention_bias),
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            self.hidden_size,
-            bias=bool(config.attention_bias),
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            reduce_results=False,
-            prefix=add_prefix("o_proj", prefix),
-        )
         self.qkv_proj_mot_gen = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
@@ -649,14 +635,7 @@ class NEOQwen3Attention(nn.Module):
             max_position_embeddings=getattr(config, "max_position_embeddings_hw", 4096),
             base=getattr(config, "rope_theta_hw", 10000.0),
         )
-        self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            prefix=add_prefix("attn", prefix),
-        )
+        self.use_fused_qk_norm_mrope = False
 
     def forward(
         self,
@@ -856,6 +835,37 @@ class NEOQwen3Attention(nn.Module):
         )
 
 
+def _forward_reference_qwen3_mlp(
+    mlp: Qwen3MLP,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    gate_up_proj = mlp.gate_up_proj
+    gate_up_weight = getattr(gate_up_proj, "weight", None)
+    if gate_up_weight is None:
+        return mlp(hidden_states)
+    if getattr(gate_up_proj, "tp_size", 1) != 1:
+        return mlp(hidden_states)
+
+    split_size = gate_up_weight.shape[0] // 2
+    gate_weight, up_weight = gate_up_weight.split([split_size, split_size], dim=0)
+    gate_up_bias = getattr(gate_up_proj, "bias", None)
+    gate_bias = up_bias = None
+    if gate_up_bias is not None:
+        gate_bias, up_bias = gate_up_bias.split([split_size, split_size], dim=0)
+
+    gate = F.linear(hidden_states, gate_weight, gate_bias)
+    up = F.linear(hidden_states, up_weight, up_bias)
+    hidden_states = F.silu(gate) * up
+
+    down_proj = mlp.down_proj
+    down_weight = getattr(down_proj, "weight", None)
+    if down_weight is None or getattr(down_proj, "tp_size", 1) != 1:
+        hidden_states, _ = down_proj(hidden_states)
+        return hidden_states
+    down_bias = getattr(down_proj, "bias", None)
+    return F.linear(hidden_states, down_weight, down_bias)
+
+
 class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
     def __init__(
         self,
@@ -950,31 +960,8 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
         *,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        gate_up_proj = self.mlp.gate_up_proj
-        gate_up_weight = getattr(gate_up_proj, "weight", None)
-        if gate_up_weight is None:
-            return self.mlp(hidden_states)
-        if getattr(gate_up_proj, "tp_size", 1) != 1:
-            return self.mlp(hidden_states)
-
-        split_size = gate_up_weight.shape[0] // 2
-        gate_weight, up_weight = gate_up_weight.split([split_size, split_size], dim=0)
-        gate_up_bias = getattr(gate_up_proj, "bias", None)
-        gate_bias = up_bias = None
-        if gate_up_bias is not None:
-            gate_bias, up_bias = gate_up_bias.split([split_size, split_size], dim=0)
-
-        gate = F.linear(hidden_states, gate_weight, gate_bias)
-        up = F.linear(hidden_states, up_weight, up_bias)
-        hidden_states = F.silu(gate) * up
-
-        down_proj = self.mlp.down_proj
-        down_weight = getattr(down_proj, "weight", None)
-        if down_weight is None or getattr(down_proj, "tp_size", 1) != 1:
-            hidden_states, _ = down_proj(hidden_states)
-            return hidden_states
-        down_bias = getattr(down_proj, "bias", None)
-        return F.linear(hidden_states, down_weight, down_bias)
+        del forward_batch
+        return _forward_reference_qwen3_mlp(self.mlp, hidden_states)
 
     def forward_gen(
         self,
@@ -1012,31 +999,8 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
         *,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        gate_up_proj = self.mlp_mot_gen.gate_up_proj
-        gate_up_weight = getattr(gate_up_proj, "weight", None)
-        if gate_up_weight is None:
-            return self.mlp_mot_gen(hidden_states)
-        if getattr(gate_up_proj, "tp_size", 1) != 1:
-            return self.mlp_mot_gen(hidden_states)
-
-        split_size = gate_up_weight.shape[0] // 2
-        gate_weight, up_weight = gate_up_weight.split([split_size, split_size], dim=0)
-        gate_up_bias = getattr(gate_up_proj, "bias", None)
-        gate_bias = up_bias = None
-        if gate_up_bias is not None:
-            gate_bias, up_bias = gate_up_bias.split([split_size, split_size], dim=0)
-
-        gate = F.linear(hidden_states, gate_weight, gate_bias)
-        up = F.linear(hidden_states, up_weight, up_bias)
-        hidden_states = F.silu(gate) * up
-
-        down_proj = self.mlp_mot_gen.down_proj
-        down_weight = getattr(down_proj, "weight", None)
-        if down_weight is None or getattr(down_proj, "tp_size", 1) != 1:
-            hidden_states, _ = down_proj(hidden_states)
-            return hidden_states
-        down_bias = getattr(down_proj, "bias", None)
-        return F.linear(hidden_states, down_weight, down_bias)
+        del forward_batch
+        return _forward_reference_qwen3_mlp(self.mlp_mot_gen, hidden_states)
 
 
 class NEOQwen3Model(Qwen2Model):
