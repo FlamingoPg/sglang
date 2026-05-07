@@ -1987,7 +1987,7 @@ class U1NativeSRTPixelFlowExecutor:
     ) -> Any:
         forward_batch_context = self.forward_batch_provider(
             prepared=prepared,
-            latent_tokens=image_embeds,
+            g_query_embeds=image_embeds,
             timestep=timestep,
         )
         forward_batch = getattr(

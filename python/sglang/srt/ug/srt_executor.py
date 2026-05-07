@@ -163,7 +163,7 @@ class UGSRTSchedulerExecutor:
         self,
         *,
         prepared: Any,
-        latent_tokens: torch.Tensor,
+        g_query_embeds: torch.Tensor,
         timestep: torch.Tensor,
     ) -> UGSRTTemporaryForwardBatch:
         """Build a temporary extend batch for one UG G generation step.
@@ -173,7 +173,7 @@ class UGSRTSchedulerExecutor:
         soon as the native G forward returns.
         """
 
-        del latent_tokens, timestep
+        del g_query_embeds, timestep
         self._check_scheduler_idle_for_temp_g()
         model_runner = self._require_model_runner()
         req_to_token_pool = self._require_attr(
@@ -636,10 +636,9 @@ class UGSRTSchedulerExecutor:
             "request_id": binding.request_id,
             "prefix_len": prefix_len,
             "extend_num_tokens": extend_num_tokens,
-            "attention_mode": "non_causal_query",
+            "attention_mode": "custom_full_query",
             "attention_mask_shape": (extend_num_tokens, seq_len),
         }
-        forward_batch.ug_g_non_causal_query_attention = True
         forward_batch.cross_attention_custom_mask = torch.ones(
             extend_num_tokens * seq_len,
             dtype=torch.bool,

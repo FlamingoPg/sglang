@@ -5,12 +5,6 @@ from typing import TYPE_CHECKING
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
-try:
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-except ImportError:  # pragma: no cover - older torch fallback
-    SDPBackend = None
-    sdpa_kernel = None
-
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -36,24 +30,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         scale,
         is_causal: bool,
         attn_mask=None,
-        force_flash: bool = False,
     ) -> torch.Tensor:
-        if force_flash and sdpa_kernel is not None and SDPBackend is not None:
-            try:
-                with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
-                    return scaled_dot_product_attention(
-                        query,
-                        key,
-                        value,
-                        attn_mask=attn_mask,
-                        enable_gqa=enable_gqa,
-                        scale=scale,
-                        is_causal=is_causal,
-                    )
-            except RuntimeError:
-                # Fall back to the default SDP choice on GPUs / dtypes where
-                # PyTorch cannot dispatch the flash kernel.
-                pass
         return scaled_dot_product_attention(
             query,
             key,
@@ -164,24 +141,6 @@ class TorchNativeAttnBackend(AttentionBackend):
                         enable_gqa=enable_gqa,
                         scale=scaling,
                         is_causal=False,
-                    )
-                    .squeeze(0)
-                    .movedim(query.dim() - 2, 0)
-                )
-                output[start_q:end_q, :, :] = per_req_out
-            elif (
-                getattr(forward_batch, "ug_g_non_causal_query_attention", False)
-                and not causal
-            ):
-                per_req_out = (
-                    self._scaled_dot_product_attention(
-                        per_req_query.unsqueeze(0),
-                        per_req_key.unsqueeze(0),
-                        per_req_value.unsqueeze(0),
-                        enable_gqa=enable_gqa,
-                        scale=scaling,
-                        is_causal=False,
-                        force_flash=True,
                     )
                     .squeeze(0)
                     .movedim(query.dim() - 2, 0)
@@ -485,7 +444,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         if (
             layer.is_cross_attention
             or layer.attn_type == AttentionType.ENCODER_ONLY
-            or getattr(forward_batch, "ug_g_non_causal_query_attention", False)
+            or getattr(forward_batch, "cross_attention_custom_mask", None) is not None
         ):
             causal = False
 

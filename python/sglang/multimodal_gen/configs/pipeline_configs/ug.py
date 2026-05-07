@@ -20,10 +20,6 @@ class UGPipelineConfig(PipelineConfig):
     default_height: int = 1024
     default_width: int = 1024
 
-    latent_downsample: int = 16
-    latent_patch_size: int = 2
-    latent_channel: int = 16
-
     def validate_runtime(
         self,
         *,

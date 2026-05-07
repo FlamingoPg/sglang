@@ -1296,8 +1296,6 @@ class NEOChatModel(nn.Module):
             positions=positions,
             forward_batch=forward_batch,
         )
-        if getattr(forward_batch, "cross_attention_custom_mask", None) is not None:
-            forward_batch.ug_g_non_causal_query_attention = True
 
     @torch.no_grad()
     def forward(
