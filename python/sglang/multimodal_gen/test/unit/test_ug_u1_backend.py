@@ -20,7 +20,7 @@ from sglang.srt.models.neo_chat import (
     map_u1_language_model_weight_name,
 )
 from sglang.srt.models.registry import ModelRegistry
-from sglang.srt.ug.u1 import (
+from sglang.srt.models.neo_chat_ug import (
     U1UGModelAdapter,
     build_u1_t2i_prompt,
     build_u1_t2i_uncondition_prompt,

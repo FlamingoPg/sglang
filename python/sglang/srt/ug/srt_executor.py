@@ -129,7 +129,7 @@ class UGSRTSchedulerExecutor:
     def create_u1_native_srt_pixel_flow_executor(self):
         """Create a SenseNova U1 pixel-flow executor backed by ModelRunner."""
 
-        from sglang.srt.ug.u1 import U1NativeSRTPixelFlowExecutor
+        from sglang.srt.models.neo_chat_ug import U1NativeSRTPixelFlowExecutor
 
         model_runner = self._require_model_runner()
         srt_model = getattr(model_runner, "model", None)

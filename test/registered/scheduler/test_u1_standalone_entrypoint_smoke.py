@@ -35,7 +35,7 @@ def run_u1_standalone_entrypoint_from_env(env) -> Path:
         set_global_server_args,
     )
     from sglang.srt.ug.interleaved import UGInterleavedRequest
-    from sglang.srt.ug.srt_server import create_u1_srt_scheduler
+    from sglang.srt.models.neo_chat_ug import create_u1_srt_scheduler
 
     output_dir = Path(
         env.get("SGLANG_TEST_U1_STANDALONE_OUTPUT")

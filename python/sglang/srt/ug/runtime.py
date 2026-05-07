@@ -20,7 +20,7 @@ from sglang.srt.ug.context import (
 class UGSegmentState(str, Enum):
     U_PREFILL = "u_prefill"
     U_DECODE = "u_decode"
-    G_DENOISE = "g_denoise"
+    G_GENERATE = "g_generate"
     APPEND_IMAGE = "append_image"
     DONE = "done"
 
@@ -243,14 +243,14 @@ class UGSessionRuntime:
         record.state = UGSegmentState.U_DECODE
         return record.handle()
 
-    def begin_g_denoise(self, handle: UGSessionHandle) -> UGSessionHandle:
+    def begin_g_segment(self, handle: UGSessionHandle) -> UGSessionHandle:
         record = self._record_for(handle)
         if record.state != UGSegmentState.U_DECODE:
             raise ValueError(
-                f"Cannot enter G denoise from state {record.state} "
+                f"Cannot enter G segment from state {record.state} "
                 f"for UG session {handle.session_id}"
             )
-        record.state = UGSegmentState.G_DENOISE
+        record.state = UGSegmentState.G_GENERATE
         return record.handle()
 
     def decode_next_segment(self, handle: UGSessionHandle) -> UGDecodeResult:
@@ -271,7 +271,7 @@ class UGSessionRuntime:
             result = self.model_runner.decode_next_segment(record=record)
         record.decode_count += 1
         if result.type == "image_marker":
-            record.state = UGSegmentState.G_DENOISE
+            record.state = UGSegmentState.G_GENERATE
         elif result.type == "done":
             record.state = UGSegmentState.DONE
         else:
@@ -389,7 +389,7 @@ class UGSessionRuntime:
         self, handle: UGSessionHandle, image: Any | None
     ) -> UGSessionHandle:
         record = self._record_for(handle)
-        if record.state != UGSegmentState.G_DENOISE:
+        if record.state != UGSegmentState.G_GENERATE:
             raise ValueError(
                 f"Cannot append generated image from state {record.state} "
                 f"for UG session {handle.session_id}"

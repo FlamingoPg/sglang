@@ -21,7 +21,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.u
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.ug.adapter import UGModelRunnerAdapter
-from sglang.srt.ug.denoiser import UGMiddleBridge
+from sglang.srt.ug.middle import UGMiddleBridge
 from sglang.srt.ug.interleaved import (
     DEFAULT_UG_TEXT_MAX_NEW_TOKENS,
     UGInterleavedRequest,
@@ -31,7 +31,7 @@ from sglang.srt.ug.interleaved import (
 )
 from sglang.srt.ug.runtime import UGSessionRuntime
 from sglang.srt.ug.srt_executor import UGSRTSchedulerExecutor
-from sglang.srt.ug.u1 import (
+from sglang.srt.models.neo_chat_ug import (
     U1SRTBackedUGMiddleBridge,
     U1UGModelAdapter,
     is_sensenova_u1_ug_model,

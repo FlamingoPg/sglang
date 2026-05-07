@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.srt.ug.denoiser import UGMiddleBridge
+from sglang.srt.ug.middle import UGMiddleBridge
 from sglang.srt.ug.interleaved import (
     UGGKind,
     UGGSegmentResult,

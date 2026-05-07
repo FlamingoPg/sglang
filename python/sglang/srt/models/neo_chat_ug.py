@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import math
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 from sglang.srt.ug.adapter import UGModelAppendImageResult, UGModelPrefillResult
 from sglang.srt.ug.context import UGContextBundle
-from sglang.srt.ug.denoiser import (
+from sglang.srt.ug.middle import (
     SRTBackedUGMiddleBridge,
     UGGSegmentExecutor,
 )
@@ -2545,3 +2546,96 @@ def _u1_question_text(messages: list[UGInterleavedMessage]) -> str:
     if not question:
         raise ValueError("U1 VLM text generation requires a text question")
     return question
+
+
+@dataclass
+class U1SRTSchedulerHandle:
+    """Owns the SRT scheduler used by the U1 standalone smoke path."""
+
+    scheduler: Any
+
+    def close(self) -> None:
+        for name in (
+            "recv_from_tokenizer",
+            "recv_from_rpc",
+            "send_metrics_from_scheduler",
+        ):
+            socket = getattr(self.scheduler, name, None)
+            close = getattr(socket, "close", None)
+            if callable(close):
+                close(linger=0)
+
+
+class _NoopSender:
+    def send_output(self, *args, **kwargs):
+        del args, kwargs
+
+
+def create_u1_srt_scheduler(
+    *,
+    checkpoint_dir: str,
+    gpu_id: int = 0,
+    dtype: str = "bfloat16",
+    mem_fraction_static: float = 0.35,
+    chunked_prefill_size: int = -1,
+    attention_backend: str | None = None,
+    log_level: str = "error",
+) -> U1SRTSchedulerHandle:
+    """Create the SRT Scheduler used as the SenseNova U1 UG session owner."""
+
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.server_args import (
+        PortArgs,
+        ServerArgs,
+        set_global_server_args_for_scheduler,
+    )
+
+    server_args = ServerArgs(
+        model_path=str(Path(checkpoint_dir).expanduser()),
+        tokenizer_path=str(Path(checkpoint_dir).expanduser()),
+        trust_remote_code=False,
+        dtype=dtype,
+        tp_size=1,
+        pp_size=1,
+        dp_size=1,
+        disable_cuda_graph=True,
+        disable_piecewise_cuda_graph=True,
+        disable_overlap_schedule=True,
+        skip_server_warmup=True,
+        # U1 official interleave uses SDPA-style attention. Triton is faster,
+        # but the small logits drift can flip near-tie U decode tokens and send
+        # the closed-loop image trajectory down a different branch.
+        attention_backend=attention_backend or "torch_native",
+        mem_fraction_static=float(mem_fraction_static),
+        # U1 edit/VLM prefixes use block-causal image context where tokens with
+        # the same t index attend bidirectionally. Splitting that image block
+        # across chunked-prefill boundaries commits earlier KV before later
+        # same-t tokens exist, so keep U1 UG prefill unchunked for parity.
+        chunked_prefill_size=int(chunked_prefill_size),
+        log_level=log_level,
+    )
+    server_args.check_server_args()
+    set_global_server_args_for_scheduler(server_args)
+
+    scheduler = Scheduler(
+        server_args,
+        PortArgs.init_new(server_args),
+        gpu_id=int(gpu_id),
+        tp_rank=0,
+        moe_ep_rank=0,
+        pp_rank=0,
+        attn_cp_rank=0,
+        moe_dp_rank=0,
+        dp_rank=None,
+    )
+    _replace_sender_with_noop(scheduler, "send_to_tokenizer")
+    _replace_sender_with_noop(scheduler, "send_to_detokenizer")
+    return U1SRTSchedulerHandle(scheduler=scheduler)
+
+
+def _replace_sender_with_noop(scheduler: Any, name: str) -> None:
+    sender = getattr(scheduler, name, None)
+    socket = getattr(sender, "socket", None)
+    if socket is not None:
+        socket.close(linger=0)
+    setattr(scheduler, name, _NoopSender())
