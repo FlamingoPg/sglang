@@ -13,7 +13,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 
 
 @dataclass
-class UGSamplingParams(SamplingParams):
+class U1SamplingParams(SamplingParams):
     data_type: DataType = DataType.IMAGE
     num_frames: int = 1
     height: int | None = 1024
@@ -31,9 +31,9 @@ class UGSamplingParams(SamplingParams):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self._validate_ug_fields()
+        self._validate_u1_fields()
 
-    def _validate_ug_fields(self) -> None:
+    def _validate_u1_fields(self) -> None:
         if len(self.cfg_interval) != 2:
             raise ValueError("cfg_interval must contain [start, end]")
         start, end = [float(x) for x in self.cfg_interval]
@@ -79,25 +79,25 @@ class UGSamplingParams(SamplingParams):
                 )
 
 
-def get_ug_explicit_sampling_fields(params: Any | None) -> set[str]:
+def get_u1_explicit_sampling_fields(params: Any | None) -> set[str]:
     if params is None:
         return set()
     return set(getattr(params, "_explicit_fields", set()) or set())
 
 
-def mark_ug_explicit_sampling_fields(
-    params: UGSamplingParams,
+def mark_u1_explicit_sampling_fields(
+    params: U1SamplingParams,
     explicit_fields: set[str],
-) -> UGSamplingParams:
-    params._explicit_fields = get_ug_explicit_sampling_fields(params) | set(
+) -> U1SamplingParams:
+    params._explicit_fields = get_u1_explicit_sampling_fields(params) | set(
         explicit_fields
     )
     return params
 
 
-def build_ug_sampling_params(values: dict[str, Any] | None = None) -> UGSamplingParams:
+def build_u1_sampling_params(values: dict[str, Any] | None = None) -> U1SamplingParams:
     values = dict(values or {})
-    return mark_ug_explicit_sampling_fields(
-        UGSamplingParams(**values),
+    return mark_u1_explicit_sampling_fields(
+        U1SamplingParams(**values),
         set(values.keys()),
     )

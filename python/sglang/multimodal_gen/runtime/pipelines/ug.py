@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from sglang.multimodal_gen.configs.sample.ug import (
-    UGSamplingParams,
-    build_ug_sampling_params,
+from sglang.multimodal_gen.configs.sample.u1 import (
+    U1SamplingParams,
+    build_u1_sampling_params,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -167,7 +167,7 @@ class UGPipeline(ComposedPipelineBase):
     def forward_interleaved(
         self,
         messages: UGInterleavedRequest | list[Any],
-        sampling_params: UGSamplingParams | dict[str, Any] | None = None,
+        sampling_params: U1SamplingParams | dict[str, Any] | None = None,
         server_args: ServerArgs | None = None,
         **sampling_kwargs: Any,
     ) -> UGInterleavedResponse:
@@ -314,7 +314,7 @@ class UGPipeline(ComposedPipelineBase):
     def forward_vlm(
         self,
         messages: UGInterleavedRequest | list[Any],
-        sampling_params: UGSamplingParams | dict[str, Any] | None = None,
+        sampling_params: U1SamplingParams | dict[str, Any] | None = None,
         server_args: ServerArgs | None = None,
         max_new_tokens: int | None = None,
         **sampling_kwargs: Any,
@@ -403,7 +403,7 @@ EntryClass = UGPipeline
 
 def _normalize_interleaved_request(
     messages: UGInterleavedRequest | list[Any],
-    sampling_params: UGSamplingParams | dict[str, Any] | None,
+    sampling_params: U1SamplingParams | dict[str, Any] | None,
     sampling_kwargs: dict[str, Any],
 ) -> UGInterleavedRequest:
     if isinstance(messages, UGInterleavedRequest):
@@ -435,15 +435,15 @@ def _normalize_interleaved_request(
 
 
 def _normalize_interleaved_sampling_params(
-    sampling_params: UGSamplingParams | dict[str, Any] | None,
+    sampling_params: U1SamplingParams | dict[str, Any] | None,
     sampling_kwargs: dict[str, Any],
-) -> UGSamplingParams:
+) -> U1SamplingParams:
     if sampling_params is None:
-        return build_ug_sampling_params(sampling_kwargs)
+        return build_u1_sampling_params(sampling_kwargs)
     if isinstance(sampling_params, dict):
         values = dict(sampling_params)
         values.update(sampling_kwargs)
-        return build_ug_sampling_params(values)
+        return build_u1_sampling_params(values)
     if sampling_kwargs:
         raise ValueError(
             "UG interleaved sampling keyword overrides require sampling_params "
