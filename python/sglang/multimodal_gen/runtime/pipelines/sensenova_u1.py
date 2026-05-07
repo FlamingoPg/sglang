@@ -8,18 +8,21 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
+    SenseNovaU1PixelFlowGSegmentExecutor,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_context import (
+    U1SRTBackedUGMiddleBridge,
+    U1UGModelAdapter,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.sensenova_u1 import (
     SenseNovaU1ContextStage,
     SenseNovaU1DecodeStage,
     SenseNovaU1GSegmentStage,
     _normalize_pipeline_interleaved_messages,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
-    SenseNovaU1PixelFlowGSegmentExecutor,
-)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.ug.adapter import UGModelRunnerAdapter
-from sglang.srt.ug.middle import UGMiddleBridge
 from sglang.srt.ug.interleaved import (
     DEFAULT_UG_TEXT_MAX_NEW_TOKENS,
     UGInterleavedRequest,
@@ -27,12 +30,9 @@ from sglang.srt.ug.interleaved import (
     UGRuntimeStats,
     normalize_ug_generation_mode,
 )
+from sglang.srt.ug.middle import UGMiddleBridge
 from sglang.srt.ug.runtime import UGSessionRuntime
 from sglang.srt.ug.srt_executor import UGSRTSchedulerExecutor
-from sglang.srt.models.neo_chat_ug import (
-    U1SRTBackedUGMiddleBridge,
-    U1UGModelAdapter,
-)
 
 
 def _build_srt_owned_session_runtime(
