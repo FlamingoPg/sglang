@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from __future__ import annotations
-
 import math
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
