@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.configs.neo_chat import NEOChatConfig
+from sglang.srt.configs.sensenova_u1 import SenseNovaU1Config
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
@@ -1154,7 +1154,7 @@ class NEOChatModel(nn.Module):
 
     def __init__(
         self,
-        config: NEOChatConfig,
+        config: SenseNovaU1Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -1190,7 +1190,7 @@ class NEOChatModel(nn.Module):
         self.base_image_seq_len = int(config.base_image_seq_len)
         self.max_image_seq_len = int(config.max_image_seq_len)
 
-    def _build_fm_modules(self, config: NEOChatConfig) -> nn.ModuleDict:
+    def _build_fm_modules(self, config: SenseNovaU1Config) -> nn.ModuleDict:
         merge_size = _merge_size_from_downsample_ratio(float(config.downsample_ratio))
         output_dim = 3 * (int(config.vision_config.patch_size) * merge_size) ** 2
         hidden_size = int(config.llm_config.hidden_size)

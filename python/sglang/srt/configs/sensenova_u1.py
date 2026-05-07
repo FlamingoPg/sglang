@@ -10,7 +10,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from sglang.utils import logger
 
 
-class NEOLLMConfig(Qwen3Config):
+class SenseNovaU1LLMConfig(Qwen3Config):
     """Qwen3 text config with U1's extra 2-D RoPE fields."""
 
     def __init__(
@@ -33,7 +33,7 @@ class NEOLLMConfig(Qwen3Config):
         self.max_position_embeddings_hw = max_position_embeddings_hw
 
 
-class NEOVisionConfig(PretrainedConfig):
+class SenseNovaU1VisionConfig(PretrainedConfig):
     model_type = "neo_vision"
 
     def __init__(
@@ -86,12 +86,12 @@ class NEOVisionConfig(PretrainedConfig):
         return cls.from_dict(config_dict, **kwargs)
 
 
-class NEOChatConfig(PretrainedConfig):
+class SenseNovaU1Config(PretrainedConfig):
     model_type = "neo_chat"
     is_composition = True
     sub_configs = {
-        "vision_config": NEOVisionConfig,
-        "llm_config": NEOLLMConfig,
+        "vision_config": SenseNovaU1VisionConfig,
+        "llm_config": SenseNovaU1LLMConfig,
     }
 
     def __init__(
@@ -128,19 +128,21 @@ class NEOChatConfig(PretrainedConfig):
         if vision_config is None:
             vision_config = {"architectures": ["NEOVisionModel"]}
             logger.info(
-                "vision_config is None. Initializing NEOVisionConfig with defaults."
+                "vision_config is None. Initializing SenseNovaU1VisionConfig with defaults."
             )
         if llm_config is None:
             llm_config = {"architectures": ["Qwen3ForCausalLM"]}
-            logger.info("llm_config is None. Initializing NEOLLMConfig with defaults.")
+            logger.info(
+                "llm_config is None. Initializing SenseNovaU1LLMConfig with defaults."
+            )
 
         if isinstance(vision_config, dict):
-            self.vision_config = NEOVisionConfig(**vision_config)
+            self.vision_config = SenseNovaU1VisionConfig(**vision_config)
         else:
             self.vision_config = vision_config
 
         if isinstance(llm_config, dict):
-            self.llm_config = NEOLLMConfig(**llm_config)
+            self.llm_config = SenseNovaU1LLMConfig(**llm_config)
         else:
             self.llm_config = llm_config
 
@@ -206,5 +208,5 @@ class NEOChatConfig(PretrainedConfig):
         return output
 
 
-AutoConfig.register("neo_chat", NEOChatConfig)
-AutoConfig.register("neo_vision", NEOVisionConfig)
+AutoConfig.register("neo_chat", SenseNovaU1Config)
+AutoConfig.register("neo_vision", SenseNovaU1VisionConfig)
