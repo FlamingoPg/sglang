@@ -34,11 +34,10 @@ from sglang.srt.ug.srt_executor import UGSRTSchedulerExecutor
 from sglang.srt.models.neo_chat_ug import (
     U1SRTBackedUGMiddleBridge,
     U1UGModelAdapter,
-    is_sensenova_u1_ug_model,
 )
 
 
-def _build_srt_owned_ug_runtime(
+def _build_srt_owned_session_runtime(
     model_runner=None,
     *,
     scheduler=None,
@@ -67,38 +66,15 @@ def _build_srt_request_executor(scheduler=None):
     return UGSRTSchedulerExecutor(scheduler)
 
 
-def _load_ug_bridge_and_g_executor(
-    model_path: str,
-    *,
-    scheduler=None,
-    srt_u_decode_max_new_tokens: int | None = None,
-) -> tuple[UGMiddleBridge, Any]:
-    srt_request_executor = _build_srt_request_executor(scheduler)
-    for matches, build_bridge, build_g_segment_executor in _UG_BACKENDS:
-        if matches(model_path):
-            return (
-                build_bridge(
-                    model_path,
-                    scheduler,
-                    srt_request_executor,
-                    srt_u_decode_max_new_tokens,
-                ),
-                build_g_segment_executor(),
-            )
-    raise ValueError(f"Unsupported UG model path: {model_path}")
-
-
-def _build_u1_bridge(
-    model_path: str,
+def _build_sensenova_u1_middle_bridge(
     scheduler,
     srt_request_executor,
     srt_u_decode_max_new_tokens: int | None,
 ) -> UGMiddleBridge:
-    del model_path
     if srt_u_decode_max_new_tokens is None:
         srt_u_decode_max_new_tokens = 0
     return U1SRTBackedUGMiddleBridge(
-        _build_srt_owned_ug_runtime(
+        _build_srt_owned_session_runtime(
             UGModelRunnerAdapter(
                 U1UGModelAdapter(native_tokenizer=getattr(scheduler, "tokenizer", None))
             ),
@@ -109,16 +85,11 @@ def _build_u1_bridge(
     )
 
 
-_UG_BACKENDS = (
-    (is_sensenova_u1_ug_model, _build_u1_bridge, SenseNovaU1PixelFlowGSegmentExecutor),
-)
-
-
-def _build_ug_g_segment_executor(bridge: UGMiddleBridge):
+def _build_sensenova_u1_g_segment_executor(bridge: UGMiddleBridge):
     g_kind = getattr(bridge, "g_kind", None)
     if g_kind == "pixel_flow":
         return SenseNovaU1PixelFlowGSegmentExecutor()
-    raise ValueError(f"Unsupported UG G kind: {g_kind!r}")
+    raise ValueError(f"Unsupported SenseNova U1 G kind: {g_kind!r}")
 
 
 class SenseNovaU1Pipeline(ComposedPipelineBase):
@@ -131,27 +102,24 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         loaded_modules: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         modules = dict(loaded_modules or {})
-        if "ug_bridge" not in modules:
-            bridge, g_segment_executor = _load_ug_bridge_and_g_executor(
-                self.model_path,
-                scheduler=getattr(server_args, "ug_srt_scheduler", None),
-                srt_u_decode_max_new_tokens=getattr(
-                    server_args,
-                    "ug_srt_u_decode_max_new_tokens",
-                    None,
-                ),
+        if "srt_middle_bridge" not in modules:
+            srt_request_executor = _build_srt_request_executor(
+                getattr(server_args, "ug_srt_scheduler", None)
             )
-            modules["ug_bridge"] = bridge
-            modules.setdefault("ug_g_segment_executor", g_segment_executor)
-        if "ug_g_segment_executor" not in modules:
-            modules["ug_g_segment_executor"] = _build_ug_g_segment_executor(
-                modules["ug_bridge"]
+            modules["srt_middle_bridge"] = _build_sensenova_u1_middle_bridge(
+                getattr(server_args, "ug_srt_scheduler", None),
+                srt_request_executor,
+                getattr(server_args, "ug_srt_u_decode_max_new_tokens", None),
+            )
+        if "g_segment_executor" not in modules:
+            modules["g_segment_executor"] = _build_sensenova_u1_g_segment_executor(
+                modules["srt_middle_bridge"]
             )
         return modules
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        bridge = self.get_module("ug_bridge")
-        g_segment_executor = self.get_module("ug_g_segment_executor")
+        bridge = self.get_module("srt_middle_bridge")
+        g_segment_executor = self.get_module("g_segment_executor")
         self.add_stage(SenseNovaU1ContextStage(bridge))
         self.add_stage(SenseNovaU1GSegmentStage(bridge, g_segment_executor))
         self.add_stage(SenseNovaU1DecodeStage(bridge))
@@ -161,7 +129,7 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         batch: Req,
         server_args: ServerArgs,
     ):
-        _apply_bridge_sampling_defaults(self.get_module("ug_bridge"), batch)
+        _apply_bridge_sampling_defaults(self.get_module("srt_middle_bridge"), batch)
         return super().forward(batch, server_args)
 
     def forward_interleaved(
@@ -180,7 +148,7 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
 
         server_args = server_args or self.server_args
         if server_args is None:
-            raise ValueError("UG interleaved API requires server_args")
+            raise ValueError("SenseNova U1 interleaved API requires server_args")
         request = _normalize_interleaved_request(
             messages, sampling_params, sampling_kwargs
         )
@@ -209,7 +177,7 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
                 result = self.forward(batch, server_args)
             contexts = result.extra.get("ug_contexts")
             stats = _collect_interleaved_runtime_stats(
-                self.get_module("ug_bridge"), contexts
+                self.get_module("srt_middle_bridge"), contexts
             )
             return UGInterleavedResponse.from_legacy_segments(
                 list(result.extra["ug_output_segments"]),
@@ -219,7 +187,7 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         finally:
             contexts = batch.extra.get("ug_contexts")
             if contexts is not None:
-                self.get_module("ug_bridge").release(contexts)
+                self.get_module("srt_middle_bridge").release(contexts)
 
     def _forward_interleave_loop(
         self,
@@ -228,8 +196,8 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         *,
         metadata: dict[str, Any],
     ) -> Req:
-        bridge = self.get_module("ug_bridge")
-        g_segment_executor = self.get_module("ug_g_segment_executor")
+        bridge = self.get_module("srt_middle_bridge")
+        g_segment_executor = self.get_module("g_segment_executor")
         context_stage = SenseNovaU1ContextStage(bridge)
         g_stage = SenseNovaU1GSegmentStage(bridge, g_segment_executor)
 
@@ -237,7 +205,9 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         batch = context_stage.forward(batch, server_args)
         contexts = batch.extra.get("ug_contexts")
         if contexts is None:
-            raise ValueError("UG interleave loop requires prepared UG contexts")
+            raise ValueError(
+                "SenseNova U1 interleave loop requires prepared SRT middle contexts"
+            )
 
         output_segments = list(batch.extra.get("ug_pre_image_segments", []))
         max_images = _resolve_positive_metadata_int(
@@ -256,7 +226,7 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
             generated_segment = batch.extra.get("ug_generated_segment")
             if generated_segment is None:
                 raise ValueError(
-                    "UG interleave loop expected a generated image segment"
+                    "SenseNova U1 interleave loop expected a generated image segment"
                 )
             image_for_append = generated_segment.image
             output_segments.append(
@@ -292,7 +262,8 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
                     batch.extra["ug_output_segments"] = output_segments
                     return batch
                 raise ValueError(
-                    "UG interleave loop expected U text, image marker, or done, "
+                    "SenseNova U1 interleave loop expected U text, "
+                    "image marker, or done, "
                     f"got {post_segment.type}"
                 )
             if not next_image_requested:
@@ -319,7 +290,7 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         max_new_tokens: int | None = None,
         **sampling_kwargs: Any,
     ) -> UGInterleavedResponse:
-        """Experimental VLM-only UG API.
+        """Experimental SenseNova U1 VLM-only API.
 
         This path runs only SRT-owned U prefill and U text decode. It must not
         enter G preparation, G execution, image decode, or append-image stages.
@@ -327,7 +298,7 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
 
         server_args = server_args or self.server_args
         if server_args is None:
-            raise ValueError("UG VLM API requires server_args")
+            raise ValueError("SenseNova U1 VLM API requires server_args")
         request = _normalize_interleaved_request(
             messages, sampling_params, sampling_kwargs
         )
@@ -350,11 +321,12 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
             request.metadata,
             explicit_max_new_tokens=max_new_tokens,
         )
-        bridge = self.get_module("ug_bridge")
+        bridge = self.get_module("srt_middle_bridge")
         generate_vlm_text = getattr(bridge, "generate_vlm_text", None)
         if not callable(generate_vlm_text):
             raise RuntimeError(
-                f"{bridge.__class__.__name__} does not support UG VLM text generation"
+                f"{bridge.__class__.__name__} does not support "
+                "SenseNova U1 VLM text generation"
             )
 
         result = generate_vlm_text(
@@ -411,7 +383,8 @@ def _normalize_interleaved_request(
             sampling_params is not None or sampling_kwargs
         ):
             raise ValueError(
-                "UG interleaved request already contains sampling_params; pass "
+                "SenseNova U1 interleaved request already contains "
+                "sampling_params; pass "
                 "overrides by constructing a new UGInterleavedRequest"
             )
         return UGInterleavedRequest(
@@ -446,7 +419,8 @@ def _normalize_interleaved_sampling_params(
         return build_sensenova_u1_sampling_params(values)
     if sampling_kwargs:
         raise ValueError(
-            "UG interleaved sampling keyword overrides require sampling_params "
+            "SenseNova U1 interleaved sampling keyword overrides require "
+            "sampling_params "
             "to be omitted or passed as a dict"
         )
     return sampling_params
@@ -460,17 +434,19 @@ def _apply_bridge_sampling_defaults(bridge: UGMiddleBridge, batch: Req) -> None:
         return
     interleaved_messages = batch.extra.get("ug_interleaved_messages")
     request_metadata = dict(batch.extra.get("ug_request_metadata") or {})
-    mode = _resolve_ug_mode_for_defaults(batch, request_metadata, interleaved_messages)
+    mode = _resolve_generation_mode_for_defaults(
+        batch, request_metadata, interleaved_messages
+    )
     setattr(batch.sampling_params, "ug_generation_mode", mode)
     apply_defaults(
         batch.sampling_params,
         mode=mode,
-        has_input_image=_has_ug_input_image(batch, interleaved_messages),
+        has_input_image=_has_input_image(batch, interleaved_messages),
         explicit_fields=set(batch.extra.get("explicit_fields", [])),
     )
 
 
-def _resolve_ug_mode_for_defaults(
+def _resolve_generation_mode_for_defaults(
     batch: Req,
     metadata: dict[str, Any],
     interleaved_messages,
@@ -486,7 +462,7 @@ def _resolve_ug_mode_for_defaults(
     return "edit" if batch.condition_image is not None or batch.image_path else "t2i"
 
 
-def _has_ug_input_image(batch: Req, interleaved_messages) -> bool:
+def _has_input_image(batch: Req, interleaved_messages) -> bool:
     if interleaved_messages is not None:
         return any(
             (
@@ -512,7 +488,9 @@ def _resolve_vlm_max_new_tokens(
         )
     value = int(value)
     if value <= 0:
-        raise ValueError(f"UG VLM max_new_tokens must be positive, got {value}")
+        raise ValueError(
+            f"SenseNova U1 VLM max_new_tokens must be positive, got {value}"
+        )
     return value
 
 
@@ -524,7 +502,7 @@ def _resolve_positive_metadata_int(
 ) -> int:
     value = int(metadata.get(key, default))
     if value <= 0:
-        raise ValueError(f"UG metadata {key} must be positive, got {value}")
+        raise ValueError(f"SenseNova U1 metadata {key} must be positive, got {value}")
     return value
 
 
