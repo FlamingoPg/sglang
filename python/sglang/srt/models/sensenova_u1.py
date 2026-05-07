@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -38,15 +37,6 @@ from sglang.srt.models.qwen3 import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda
-
-
-@dataclass(frozen=True, slots=True)
-class NEOVLMInputInfo:
-    """U1 VLM index metadata derived from token ids and image grids."""
-
-    thw_indexes: torch.Tensor
-    image_context_token_count: int
-    image_token_count: int
 
 
 def precompute_rope_freqs_sincos(
@@ -257,45 +247,6 @@ def build_u1_vlm_thw_indexes(
         w_indexes[selected] = abs_pos_w.to(dtype=t_indexes.dtype)
 
     return torch.stack([t_indexes, h_indexes, w_indexes], dim=0)
-
-
-def build_u1_vlm_input_info(
-    input_ids: torch.Tensor | list[int] | tuple[int, ...],
-    *,
-    grid_hw: torch.Tensor | list[list[int]] | tuple[tuple[int, int], ...] | None = None,
-    img_start_token_id: int = 151670,
-    img_context_token_id: int = 151669,
-    downsample_ratio: float = 0.5,
-) -> NEOVLMInputInfo:
-    if not torch.is_tensor(input_ids):
-        input_ids = torch.tensor(input_ids, dtype=torch.long)
-    thw_indexes = build_u1_vlm_thw_indexes(
-        input_ids,
-        grid_hw=grid_hw,
-        img_start_token_id=img_start_token_id,
-        img_context_token_id=img_context_token_id,
-        downsample_ratio=downsample_ratio,
-    )
-    image_context_token_count = int((input_ids == img_context_token_id).long().sum())
-    image_token_count = image_context_token_count + int(
-        (input_ids == img_start_token_id).long().sum()
-    )
-    return NEOVLMInputInfo(
-        thw_indexes=thw_indexes,
-        image_context_token_count=image_context_token_count,
-        image_token_count=image_token_count,
-    )
-
-
-def iter_u1_language_model_weights(
-    weights: Iterable[Tuple[str, torch.Tensor]],
-) -> Iterable[Tuple[str, torch.Tensor]]:
-    """Route only U1 language-model weights into SRT's Qwen3 loader."""
-
-    for name, loaded_weight in weights:
-        mapped_name = map_u1_language_model_weight_name(name)
-        if mapped_name is not None:
-            yield mapped_name, loaded_weight
 
 
 def map_u1_language_model_weight_name(name: str) -> str | None:
@@ -872,11 +823,9 @@ class NEOChatModel(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.patch_size = config.vision_config.patch_size
-        self.template = config.template
         self.downsample_ratio = config.downsample_ratio
         self.img_context_token_id = config.img_context_token_id
         self.img_start_token_id = config.img_start_token_id
-        self.img_end_token_id = config.img_end_token_id
         self.vision_model = NEOVisionModel(config.vision_config)
         self.language_model = NEOQwen3ForCausalLM(
             config=config.llm_config,
@@ -885,7 +834,6 @@ class NEOChatModel(nn.Module):
         )
         self.model = self.language_model.model
         self.fm_modules = self._build_fm_modules(config)
-        self.use_deep_fm_head = int(config.fm_head_layers) > 2
         self.use_pixel_head = bool(config.use_pixel_head)
         self.concat_time_token_num = int(config.concat_time_token_num)
         self.noise_scale = float(config.noise_scale)
@@ -1060,20 +1008,6 @@ class NEOChatModel(nn.Module):
 
     def set_embed_and_head(self, embed, head):
         return self.language_model.set_embed_and_head(embed, head)
-
-    def get_u1_vlm_input_info(
-        self,
-        input_ids: torch.Tensor | list[int] | tuple[int, ...],
-        *,
-        grid_hw: torch.Tensor | list[list[int]] | tuple[tuple[int, int], ...] | None,
-    ) -> NEOVLMInputInfo:
-        return build_u1_vlm_input_info(
-            input_ids,
-            grid_hw=grid_hw,
-            img_start_token_id=self.img_start_token_id,
-            img_context_token_id=self.img_context_token_id,
-            downsample_ratio=self.downsample_ratio,
-        )
 
     def get_thw_indexes(
         self,
