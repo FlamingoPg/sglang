@@ -16,8 +16,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     u1_apply_time_schedule,
     u1_noise_scale_for_image,
 )
-from sglang.srt.ug.context import UGContextBundle
-
 
 class SenseNovaU1PixelFlowPrepareStage:
     def __init__(self, srt_model: Any) -> None:
@@ -26,7 +24,7 @@ class SenseNovaU1PixelFlowPrepareStage:
     def forward(
         self,
         *,
-        contexts: UGContextBundle,
+        contexts: Any,
         batch: Any,
         srt_context: SRTGContext,
         cfg_img_condition_srt_context: SRTGContext | None = None,

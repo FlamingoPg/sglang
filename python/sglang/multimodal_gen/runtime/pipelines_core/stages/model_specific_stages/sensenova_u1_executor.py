@@ -25,24 +25,20 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     resolve_pixel_flow_cfg,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.srt.ug.context import UGContextBundle
-from sglang.srt.ug.interleaved import UGGKind, UGGSegmentResult
-from sglang.srt.ug.middle import UGMiddleBridge
-
 
 class SenseNovaU1PixelFlowGSegmentExecutor:
     """Run SenseNova U1 pixel-flow G through the model-specific diffusion stages."""
 
-    required_g_kind: UGGKind = "pixel_flow"
+    required_g_kind: str = "pixel_flow"
 
     def __call__(
         self,
         *,
-        bridge: UGMiddleBridge,
-        contexts: UGContextBundle,
+        bridge: Any,
+        contexts: Any,
         batch: Req,
         server_args: ServerArgs,
-    ) -> UGGSegmentResult:
+    ) -> Any:
         if getattr(bridge, "g_kind", None) != self.required_g_kind:
             raise ValueError(
                 "SenseNova U1 pixel-flow executor requires g_kind='pixel_flow', got "
@@ -94,8 +90,8 @@ class SenseNovaU1PixelFlowGSegmentExecutor:
 
 def _resolve_srt_contexts(
     *,
-    bridge: UGMiddleBridge,
-    contexts: UGContextBundle,
+    bridge: Any,
+    contexts: Any,
     batch: Req,
     srt_executor: Any,
 ) -> tuple[SRTGContext, SRTGContext | None, SRTGContext | None]:
@@ -203,13 +199,13 @@ class _SenseNovaU1NativePixelFlowRunner:
     def generate(
         self,
         *,
-        contexts: UGContextBundle,
+        contexts: Any,
         batch: Any,
         server_args: Any,
         srt_context: SRTGContext,
         cfg_img_condition_srt_context: SRTGContext | None = None,
         cfg_uncondition_srt_context: SRTGContext | None = None,
-    ) -> UGGSegmentResult:
+    ) -> Any:
         import torch
 
         del server_args

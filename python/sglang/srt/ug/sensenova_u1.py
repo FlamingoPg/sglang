@@ -4,7 +4,18 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_context import (
+from PIL import Image
+
+from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+    SenseNovaU1SamplingParams,
+    build_sensenova_u1_sampling_params,
+)
+from sglang.multimodal_gen.runtime.models.vision_utils import load_image
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
+    SenseNovaU1PixelFlowGSegmentExecutor,
+)
+from sglang.srt.ug.sensenova_u1_context import (
     U1_EDIT_IMG_CONDITION_ROLE,
     U1_EDIT_UNCONDITION_ROLE,
     U1_IMG_START_TOKEN,
@@ -32,7 +43,15 @@ from sglang.srt.ug.adapter import (
     UGModelRunnerAdapter,
 )
 from sglang.srt.ug.context import UGContextBundle
-from sglang.srt.ug.interleaved import UGGKind
+from sglang.srt.ug.interleaved import (
+    DEFAULT_UG_TEXT_MAX_NEW_TOKENS,
+    UGGKind,
+    UGInputSegment,
+    UGInterleavedRequest,
+    UGInterleavedResponse,
+    UGRuntimeStats,
+    normalize_ug_generation_mode,
+)
 from sglang.srt.ug.middle import SRTBackedUGMiddleBridge, UGGSegmentExecutor
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
@@ -78,6 +97,280 @@ def build_sensenova_u1_middle_bridge(
         srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
     )
     return U1SRTBackedUGMiddleBridge(runtime)
+
+
+def build_sensenova_u1_coordinator(
+    *,
+    scheduler: Any,
+    srt_request_executor: Any | None = None,
+    srt_u_decode_max_new_tokens: int | None = None,
+    g_segment_executor: Any | None = None,
+) -> "SenseNovaU1UGCoordinator":
+    return SenseNovaU1UGCoordinator(
+        bridge=build_sensenova_u1_middle_bridge(
+            scheduler=scheduler,
+            srt_request_executor=srt_request_executor,
+            srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
+        ),
+        g_segment_executor=g_segment_executor,
+    )
+
+
+class SenseNovaU1UGCoordinator:
+    """Internal owner of SenseNova U1 U/G interleave flow."""
+
+    def __init__(
+        self,
+        *,
+        bridge: "U1SRTBackedUGMiddleBridge",
+        g_segment_executor: Any | None = None,
+    ) -> None:
+        self.bridge = bridge
+        self.g_segment_executor = (
+            g_segment_executor
+            if g_segment_executor is not None
+            else SenseNovaU1PixelFlowGSegmentExecutor()
+        )
+
+    def forward_interleaved(
+        self,
+        messages: UGInterleavedRequest | list[Any],
+        sampling_params: SenseNovaU1SamplingParams | dict[str, Any] | None = None,
+        server_args: Any | None = None,
+        **sampling_kwargs: Any,
+    ) -> UGInterleavedResponse:
+        if server_args is None:
+            raise ValueError("SenseNova U1 coordinator requires server_args")
+        request = _normalize_sensenova_u1_request(
+            messages,
+            sampling_params,
+            sampling_kwargs,
+        )
+        metadata = dict(request.metadata)
+        metadata["mode"] = normalize_ug_generation_mode(
+            metadata.get("mode"), default="interleave"
+        )
+        if metadata["mode"] == "vlm":
+            return self.forward_vlm_request(request, metadata=metadata)
+
+        setattr(request.sampling_params, "ug_generation_mode", metadata["mode"])
+        batch = Req(
+            sampling_params=request.sampling_params,
+            extra={
+                "ug_interleaved_messages": request.to_legacy_segments(),
+                "ug_request_metadata": metadata,
+                "ug_mode": metadata["mode"],
+            },
+        )
+        contexts = None
+        try:
+            messages = _normalize_u1_interleaved_messages(request)
+            think = _resolve_u1_think(request.sampling_params, metadata)
+            think_max_new_tokens = _resolve_u1_think_max_new_tokens(
+                request.sampling_params,
+                metadata,
+            )
+            contexts = self.bridge.prepare_u_context_from_messages(
+                messages=messages,
+                think=think,
+                think_max_new_tokens=think_max_new_tokens,
+                sampling_params=request.sampling_params,
+            )
+            batch.extra["ug_contexts"] = contexts
+            batch.extra["ug_pre_image_segments"] = contexts.full.metadata.get(
+                "pre_image_segments", []
+            )
+            if metadata["mode"] == "interleave":
+                output_segments = self._run_interleave_loop(
+                    batch=batch,
+                    contexts=contexts,
+                    server_args=server_args,
+                    metadata=metadata,
+                )
+            else:
+                generated_segment = self._run_g_segment(
+                    batch=batch,
+                    contexts=contexts,
+                    server_args=server_args,
+                )
+                output_segments = [
+                    {
+                        "type": "image",
+                        "image": generated_segment.image,
+                        "metadata": dict(generated_segment.metadata),
+                    }
+                ]
+            return UGInterleavedResponse.from_legacy_segments(
+                output_segments,
+                stats=_collect_interleaved_runtime_stats(self.bridge, contexts),
+                metadata=metadata,
+            )
+        finally:
+            if contexts is not None:
+                self.bridge.release(contexts)
+
+    def forward_interleaved_batch(
+        self,
+        requests: list[UGInterleavedRequest],
+        server_args: Any | None = None,
+    ) -> list[UGInterleavedResponse]:
+        return [
+            self.forward_interleaved(request, server_args=server_args)
+            for request in requests
+        ]
+
+    def forward_vlm(
+        self,
+        messages: UGInterleavedRequest | list[Any],
+        sampling_params: SenseNovaU1SamplingParams | dict[str, Any] | None = None,
+        server_args: Any | None = None,
+        max_new_tokens: int | None = None,
+        **sampling_kwargs: Any,
+    ) -> UGInterleavedResponse:
+        del server_args
+        request = _normalize_sensenova_u1_request(
+            messages,
+            sampling_params,
+            sampling_kwargs,
+        )
+        metadata = dict(request.metadata)
+        metadata["mode"] = "vlm"
+        return self.forward_vlm_request(
+            request,
+            max_new_tokens=max_new_tokens,
+            metadata=metadata,
+        )
+
+    def forward_vlm_batch(
+        self,
+        requests: list[UGInterleavedRequest],
+        server_args: Any | None = None,
+    ) -> list[UGInterleavedResponse]:
+        return [
+            self.forward_vlm(request, server_args=server_args) for request in requests
+        ]
+
+    def forward_vlm_request(
+        self,
+        request: UGInterleavedRequest,
+        *,
+        max_new_tokens: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> UGInterleavedResponse:
+        max_new_tokens = _resolve_vlm_max_new_tokens(
+            request.metadata,
+            explicit_max_new_tokens=max_new_tokens,
+        )
+        result = self.bridge.generate_vlm_text(
+            messages=_normalize_u1_interleaved_messages(request),
+            max_new_tokens=max_new_tokens,
+        )
+        runtime = getattr(self.bridge, "runtime", None)
+        try:
+            segment_metadata = {
+                name: list(value)
+                for name, value in (
+                    ("token_ids", result.token_ids),
+                    ("next_token_ids", result.next_token_ids),
+                    ("position_ids", result.position_ids),
+                )
+                if value
+            }
+            return UGInterleavedResponse.from_legacy_segments(
+                [
+                    {
+                        "type": "text",
+                        "text": result.text,
+                        "metadata": segment_metadata,
+                    }
+                ],
+                stats=_collect_runtime_stats_from_session(self.bridge, result.session),
+                metadata=metadata or {"mode": "vlm"},
+            )
+        finally:
+            if runtime is not None:
+                runtime.close_session(result.session)
+
+    def _run_interleave_loop(
+        self,
+        *,
+        batch: Req,
+        contexts: UGContextBundle,
+        server_args: Any,
+        metadata: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        output_segments = list(batch.extra.get("ug_pre_image_segments", []))
+        max_images = _resolve_positive_metadata_int(
+            metadata,
+            "max_interleave_images",
+            default=1,
+        )
+        max_text_segments = _resolve_positive_metadata_int(
+            metadata,
+            "max_interleave_text_segments",
+            default=1,
+        )
+
+        for _ in range(max_images):
+            generated_segment = self._run_g_segment(
+                batch=batch,
+                contexts=contexts,
+                server_args=server_args,
+            )
+            output_segments.append(
+                {
+                    "type": "image",
+                    "image": generated_segment.image,
+                    "metadata": dict(generated_segment.metadata),
+                }
+            )
+            self.bridge.commit_generated_segment(
+                contexts=contexts,
+                segment=generated_segment,
+            )
+
+            next_image_requested = False
+            for _ in range(max_text_segments):
+                post_segment = self.bridge.continue_u_decode(contexts=contexts)
+                if post_segment.type == "text":
+                    segment = {"type": "text", "text": post_segment.text or ""}
+                    if post_segment.token_ids:
+                        segment["metadata"] = {
+                            "token_ids": [
+                                int(token_id) for token_id in post_segment.token_ids
+                            ]
+                        }
+                    output_segments.append(segment)
+                    continue
+                if post_segment.type == "image_marker":
+                    next_image_requested = True
+                    break
+                if post_segment.type == "done":
+                    return output_segments
+                raise ValueError(
+                    "SenseNova U1 interleave expected U text, image marker, "
+                    f"or done, got {post_segment.type}"
+                )
+            if not next_image_requested:
+                break
+        return output_segments
+
+    def _run_g_segment(
+        self,
+        *,
+        batch: Req,
+        contexts: UGContextBundle,
+        server_args: Any,
+    ) -> Any:
+        return self.bridge.run_g_segment(
+            contexts=contexts,
+            executor=lambda run_contexts: self.g_segment_executor(
+                bridge=self.bridge,
+                contexts=run_contexts,
+                batch=batch,
+                server_args=server_args,
+            ),
+        )
 
 
 class U1UGModelAdapter:
@@ -733,3 +1026,185 @@ class U1SRTBackedUGMiddleBridge:
             messages=messages,
             max_new_tokens=max_new_tokens,
         )
+
+
+def _normalize_sensenova_u1_request(
+    messages: UGInterleavedRequest | list[Any],
+    sampling_params: SenseNovaU1SamplingParams | dict[str, Any] | None,
+    sampling_kwargs: dict[str, Any],
+) -> UGInterleavedRequest:
+    if isinstance(messages, UGInterleavedRequest):
+        if messages.sampling_params is not None and (
+            sampling_params is not None or sampling_kwargs
+        ):
+            raise ValueError(
+                "SenseNova U1 request already contains sampling_params; pass "
+                "overrides by constructing a new UGInterleavedRequest"
+            )
+        return UGInterleavedRequest(
+            messages=messages.messages,
+            sampling_params=_normalize_sensenova_u1_sampling_params(
+                (
+                    messages.sampling_params
+                    if sampling_params is None
+                    else sampling_params
+                ),
+                sampling_kwargs,
+            ),
+            metadata=dict(messages.metadata),
+        )
+    return UGInterleavedRequest.from_segments(
+        messages,
+        sampling_params=_normalize_sensenova_u1_sampling_params(
+            sampling_params,
+            sampling_kwargs,
+        ),
+    )
+
+
+def _normalize_sensenova_u1_sampling_params(
+    sampling_params: SenseNovaU1SamplingParams | dict[str, Any] | None,
+    sampling_kwargs: dict[str, Any],
+) -> SenseNovaU1SamplingParams:
+    if sampling_params is None:
+        return build_sensenova_u1_sampling_params(sampling_kwargs)
+    if isinstance(sampling_params, dict):
+        values = dict(sampling_params)
+        values.update(sampling_kwargs)
+        return build_sensenova_u1_sampling_params(values)
+    if sampling_kwargs:
+        raise ValueError(
+            "SenseNova U1 sampling keyword overrides require sampling_params "
+            "to be omitted or passed as a dict"
+        )
+    return sampling_params
+
+
+def _normalize_u1_interleaved_messages(
+    request: UGInterleavedRequest,
+) -> list[UGInterleavedMessage]:
+    normalized: list[UGInterleavedMessage] = []
+    for message in request.messages:
+        if isinstance(message, UGInputSegment):
+            segment = message.to_legacy_segment()
+        elif isinstance(message, dict):
+            segment = message
+        else:
+            segment = message.to_legacy_segment()
+        message_type = segment.get("type")
+        if message_type == "text":
+            content = segment.get("text", segment.get("content"))
+        elif message_type == "image":
+            content = segment.get("image", segment.get("content"))
+            if content is None:
+                raise ValueError("SenseNova U1 image message is missing content")
+            if isinstance(content, dict) and "image" in content:
+                image_payload = dict(content)
+                image = image_payload["image"]
+                if not isinstance(image, Image.Image):
+                    image = load_image(image)
+                image_payload["image"] = image
+                content = image_payload
+            elif not isinstance(content, Image.Image):
+                content = load_image(content)
+        else:
+            raise ValueError(
+                f"Unsupported SenseNova U1 message type: {message_type!r}"
+            )
+        if content is None:
+            raise ValueError(f"SenseNova U1 {message_type} message is missing content")
+        normalized.append(UGInterleavedMessage(type=message_type, content=content))
+    if not normalized:
+        raise ValueError("SenseNova U1 messages must not be empty")
+    return normalized
+
+
+def _resolve_vlm_max_new_tokens(
+    metadata: dict[str, Any],
+    *,
+    explicit_max_new_tokens: int | None = None,
+) -> int:
+    value = explicit_max_new_tokens
+    if value is None:
+        value = metadata.get(
+            "max_new_tokens",
+            metadata.get("max_length", DEFAULT_UG_TEXT_MAX_NEW_TOKENS),
+        )
+    value = int(value)
+    if value <= 0:
+        raise ValueError(
+            f"SenseNova U1 VLM max_new_tokens must be positive, got {value}"
+        )
+    return value
+
+
+def _resolve_positive_metadata_int(
+    metadata: dict[str, Any],
+    key: str,
+    *,
+    default: int,
+) -> int:
+    value = int(metadata.get(key, default))
+    if value <= 0:
+        raise ValueError(f"SenseNova U1 metadata {key} must be positive, got {value}")
+    return value
+
+
+def _resolve_u1_think(sampling_params: Any, metadata: dict[str, Any]) -> bool:
+    if "think" in metadata:
+        return _coerce_u1_bool(metadata["think"], name="think")
+    return bool(getattr(sampling_params, "think", False))
+
+
+def _resolve_u1_think_max_new_tokens(
+    sampling_params: Any,
+    metadata: dict[str, Any],
+) -> int | None:
+    value = metadata.get(
+        "think_max_new_tokens",
+        getattr(sampling_params, "think_max_new_tokens", None),
+    )
+    if value is None:
+        return None
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"think_max_new_tokens must be positive when set, got {value}")
+    return value
+
+
+def _coerce_u1_bool(value: Any, *, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"{name} must be a bool, got {value!r}")
+
+
+def _collect_interleaved_runtime_stats(
+    bridge: Any,
+    contexts: Any | None,
+) -> UGRuntimeStats | None:
+    if contexts is None or contexts.full.session is None:
+        return None
+    runtime = getattr(bridge, "runtime", None)
+    if runtime is None:
+        return None
+    return UGRuntimeStats.from_debug_counters(
+        runtime.get_debug_counters(contexts.full.session)
+    )
+
+
+def _collect_runtime_stats_from_session(
+    bridge: Any,
+    session: Any | None,
+) -> UGRuntimeStats | None:
+    if session is None:
+        return None
+    runtime = getattr(bridge, "runtime", None)
+    if runtime is None:
+        return None
+    return UGRuntimeStats.from_debug_counters(runtime.get_debug_counters(session))

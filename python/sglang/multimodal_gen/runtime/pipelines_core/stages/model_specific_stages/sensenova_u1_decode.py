@@ -3,20 +3,19 @@
 from typing import Any
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_types import (
+    U1GeneratedSegment,
     U1PixelFlowPrepared,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_utils import (
     forward_context_position,
 )
-from sglang.srt.ug.interleaved import UGGSegmentResult
-
 
 class SenseNovaU1PixelFlowDecodeStage:
     def forward(
         self,
         prepared: U1PixelFlowPrepared,
         image_prediction: Any,
-    ) -> UGGSegmentResult:
+    ) -> U1GeneratedSegment:
         import numpy as np
         import torch
         from PIL import Image
@@ -36,7 +35,7 @@ class SenseNovaU1PixelFlowDecodeStage:
             "grid_hw": prepared.gen_grid_hw[:1].detach().cpu(),
         }
         cfg = prepared.cfg
-        return UGGSegmentResult(
+        return U1GeneratedSegment(
             type="image",
             image=image,
             metadata={

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 U1_T2I_CFG_UNCONDITION_ROLE = "u1_t2i_cfg_uncondition"
@@ -55,3 +55,11 @@ class U1PixelFlowPrepared:
     condition: U1PixelFlowForwardContext
     img_condition: U1PixelFlowForwardContext | None
     uncondition: U1PixelFlowForwardContext | None
+
+
+@dataclass(frozen=True, slots=True)
+class U1GeneratedSegment:
+    type: str
+    image: Any
+    metadata: dict[str, Any] = field(default_factory=dict)
+    commit_image: Any | None = None

@@ -8,73 +8,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[4]
 PYTHON_ROOT = REPO_ROOT / "python"
 
-MIGRATION_ALLOWED_MULTIMODAL_GEN_IMPORTS = {
-    (
-        "python/sglang/multimodal_gen/runtime/pipelines/sensenova_u1.py",
-        23,
-        "sglang.srt.ug.interleaved",
-    ),
-    (
-        "python/sglang/multimodal_gen/runtime/pipelines/sensenova_u1.py",
-        30,
-        "sglang.srt.ug.middle",
-    ),
-    (
-        "python/sglang/multimodal_gen/runtime/pipelines/sensenova_u1.py",
-        31,
-        "sglang.srt.ug.sensenova_u1",
-    ),
-    (
-        "python/sglang/multimodal_gen/runtime/pipelines_core/stages/sensenova_u1.py",
-        13,
-        "sglang.srt.ug.middle",
-    ),
-    (
-        "python/sglang/multimodal_gen/runtime/pipelines_core/stages/sensenova_u1.py",
-        14,
-        "sglang.srt.ug.interleaved",
-    ),
-    (
-        "python/sglang/multimodal_gen/runtime/pipelines_core/stages/sensenova_u1.py",
-        22,
-        "sglang.srt.ug.context",
-    ),
-    (
-        "python/sglang/multimodal_gen/runtime/pipelines_core/stages/sensenova_u1.py",
-        23,
-        "sglang.srt.ug.runtime",
-    ),
-    (
-        "python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/sensenova_u1_context.py",
-        6,
-        "sglang.srt.ug.runtime",
-    ),
-    (
-        "python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/sensenova_u1_decode.py",
-        11,
-        "sglang.srt.ug.interleaved",
-    ),
-    (
-        "python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/sensenova_u1_executor.py",
-        28,
-        "sglang.srt.ug.context",
-    ),
-    (
-        "python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/sensenova_u1_executor.py",
-        29,
-        "sglang.srt.ug.interleaved",
-    ),
-    (
-        "python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/sensenova_u1_executor.py",
-        30,
-        "sglang.srt.ug.middle",
-    ),
-    (
-        "python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/sensenova_u1_prepare.py",
-        19,
-        "sglang.srt.ug.context",
-    ),
-}
+MIGRATION_ALLOWED_MULTIMODAL_GEN_IMPORTS: set[tuple[str, int, str]] = set()
 
 
 class TestUGImportBoundaries(unittest.TestCase):
