@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 # SenseNova U1 keeps image generation inside the unified model. These helpers
-# adapt SRT-owned U context to U1's pixel-flow query path.
+# are model-specific pipeline mechanics, not model layers or stage glue.
 
 U1_T2I_CFG_UNCONDITION_ROLE = "u1_t2i_cfg_uncondition"
 U1_INTERLEAVE_TEXT_UNCONDITION_ROLE = "u1_interleave_text_uncondition"

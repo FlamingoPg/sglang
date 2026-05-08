@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from sglang.multimodal_gen.runtime.models.bridges.sensenova_u1 import (
+from sglang.multimodal_gen.runtime.pipelines_core.model_specific.sensenova_u1 import (
     forward_context_position,
     U1GeneratedSegment,
     U1PixelFlowPrepared,

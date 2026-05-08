@@ -17,7 +17,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_prepare import (
     SenseNovaU1PixelFlowPreparer,
 )
-from sglang.multimodal_gen.runtime.models.bridges.sensenova_u1 import (
+from sglang.multimodal_gen.runtime.pipelines_core.model_specific.sensenova_u1 import (
     U1_EDIT_IMG_CONDITION_ROLE,
     U1_EDIT_UNCONDITION_ROLE,
     U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
