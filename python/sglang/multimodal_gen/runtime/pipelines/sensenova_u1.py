@@ -4,10 +4,11 @@ from typing import Any
 
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    ContextConditionedImageGenerationStage,
+    InputValidationStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
     SenseNovaU1PixelFlowGSegmentExecutor,
+    SenseNovaU1PixelFlowGSegmentStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -35,8 +36,9 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         del server_args
+        self.add_stage(InputValidationStage())
         self.add_stage(
-            ContextConditionedImageGenerationStage(
+            SenseNovaU1PixelFlowGSegmentStage(
                 self.get_module("g_segment_executor"),
                 context_ops_key="sensenova_u1_context_ops",
                 output_extra_key="sensenova_u1_generated_segment",

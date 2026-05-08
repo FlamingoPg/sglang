@@ -2,7 +2,12 @@
 
 from typing import Any
 
+import numpy as np
+from PIL import Image
+
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_decode import (
     SenseNovaU1PixelFlowDecoder,
 )
@@ -23,6 +28,53 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     resolve_pixel_flow_cfg,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+class SenseNovaU1PixelFlowGSegmentStage(PipelineStage):
+    """SenseNova U1 image segment stage for standalone diffusion execution."""
+
+    def __init__(
+        self,
+        executor: Any,
+        *,
+        context_ops_key: str = "sensenova_u1_context_ops",
+        output_extra_key: str = "sensenova_u1_generated_segment",
+    ) -> None:
+        super().__init__()
+        self.executor = executor
+        self.context_ops_key = context_ops_key
+        self.output_extra_key = output_extra_key
+
+    @property
+    def role_affinity(self):
+        return RoleType.DENOISER
+
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        context_ops = batch.extra.get(self.context_ops_key)
+        if context_ops is None:
+            raise RuntimeError(
+                "SenseNova U1 pixel-flow stage requires batch.extra"
+                f"[{self.context_ops_key!r}]"
+            )
+
+        segment = self.executor(
+            context_ops=context_ops,
+            batch=batch,
+            server_args=server_args,
+        )
+        if getattr(segment, "type", None) != "image":
+            raise ValueError(
+                "SenseNova U1 pixel-flow expected an image segment, "
+                f"got {getattr(segment, 'type', None)!r}"
+            )
+
+        batch.extra[self.output_extra_key] = segment
+        batch.output = _image_to_numpy_batch(segment.image)
+        return batch
 
 
 class SenseNovaU1PixelFlowGSegmentExecutor:
@@ -204,3 +256,15 @@ class _SenseNovaU1NativePixelFlowRunner:
             )
             image_prediction = self.denoiser.forward(prepared)
             return self.decoder.forward(prepared, image_prediction)
+
+
+def _image_to_numpy_batch(image: Any) -> np.ndarray:
+    if isinstance(image, Image.Image):
+        array = np.asarray(image.convert("RGB"))
+    else:
+        array = np.asarray(image)
+    if array.ndim == 3:
+        array = array[None, ...]
+    if array.dtype != np.uint8:
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    return array
