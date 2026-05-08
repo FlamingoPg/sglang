@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from sglang.multimodal_gen.runtime.models.sensenova_u1_pixel_flow import (
+from sglang.multimodal_gen.runtime.models.bridges.sensenova_u1 import (
     batch_image_size,
     build_pixel_flow_forward_context,
     model_device,

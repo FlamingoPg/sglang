@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
+# SenseNova U1 keeps image generation inside the unified model. These helpers
+# adapt SRT-owned U context to U1's pixel-flow query path.
+
 U1_T2I_CFG_UNCONDITION_ROLE = "u1_t2i_cfg_uncondition"
 U1_INTERLEAVE_TEXT_UNCONDITION_ROLE = "u1_interleave_text_uncondition"
 U1_EDIT_IMG_CONDITION_ROLE = "u1_edit_img_condition"
