@@ -15,7 +15,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 )
 
 
-class SenseNovaU1PixelFlowDenoiseStage:
+class SenseNovaU1PixelFlowDenoiser:
     def __init__(
         self,
         srt_model: Any,

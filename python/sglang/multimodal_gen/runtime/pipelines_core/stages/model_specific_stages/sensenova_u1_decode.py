@@ -10,7 +10,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     forward_context_position,
 )
 
-class SenseNovaU1PixelFlowDecodeStage:
+
+class SenseNovaU1PixelFlowDecoder:
     def forward(
         self,
         prepared: U1PixelFlowPrepared,

@@ -17,7 +17,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     u1_noise_scale_for_image,
 )
 
-class SenseNovaU1PixelFlowPrepareStage:
+
+class SenseNovaU1PixelFlowPreparer:
     def __init__(self, srt_model: Any) -> None:
         self.srt_model = srt_model
 

@@ -4,13 +4,13 @@ from typing import Any
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_decode import (
-    SenseNovaU1PixelFlowDecodeStage,
+    SenseNovaU1PixelFlowDecoder,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_denoise import (
-    SenseNovaU1PixelFlowDenoiseStage,
+    SenseNovaU1PixelFlowDenoiser,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_prepare import (
-    SenseNovaU1PixelFlowPrepareStage,
+    SenseNovaU1PixelFlowPreparer,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_types import (
     U1_EDIT_IMG_CONDITION_ROLE,
@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     resolve_pixel_flow_cfg,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
 
 class SenseNovaU1PixelFlowGSegmentExecutor:
     """Run SenseNova U1 pixel-flow G through the model-specific diffusion stages."""
@@ -189,12 +190,12 @@ class _SenseNovaU1NativePixelFlowRunner:
         *,
         forward_batch_provider: Any,
     ) -> None:
-        self.prepare_stage = SenseNovaU1PixelFlowPrepareStage(srt_model)
-        self.denoise_stage = SenseNovaU1PixelFlowDenoiseStage(
+        self.preparer = SenseNovaU1PixelFlowPreparer(srt_model)
+        self.denoiser = SenseNovaU1PixelFlowDenoiser(
             srt_model,
             forward_batch_provider=forward_batch_provider,
         )
-        self.decode_stage = SenseNovaU1PixelFlowDecodeStage()
+        self.decoder = SenseNovaU1PixelFlowDecoder()
 
     def generate(
         self,
@@ -210,12 +211,12 @@ class _SenseNovaU1NativePixelFlowRunner:
 
         del server_args
         with torch.inference_mode():
-            prepared = self.prepare_stage.forward(
+            prepared = self.preparer.forward(
                 contexts=contexts,
                 batch=batch,
                 srt_context=srt_context,
                 cfg_img_condition_srt_context=cfg_img_condition_srt_context,
                 cfg_uncondition_srt_context=cfg_uncondition_srt_context,
             )
-            image_prediction = self.denoise_stage.forward(prepared)
-            return self.decode_stage.forward(prepared, image_prediction)
+            image_prediction = self.denoiser.forward(prepared)
+            return self.decoder.forward(prepared, image_prediction)
