@@ -2,11 +2,10 @@
 
 from typing import Any
 
-import numpy as np
-from PIL import Image
-
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    ContextConditionedImageGenerationStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
     SenseNovaU1PixelFlowGSegmentExecutor,
 )
@@ -36,54 +35,13 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         del server_args
-        return None
-
-    def forward(
-        self,
-        batch: Req,
-        server_args: ServerArgs,
-    ) -> Req:
-        context_ops = batch.extra.get("sensenova_u1_context_ops")
-        if context_ops is None:
-            raise RuntimeError(
-                "SenseNovaU1Pipeline is a stateless G segment generator. "
-                "Use the internal UG coordinator to prepare G context ops and "
-                "call generate_segment()."
+        self.add_stage(
+            ContextConditionedImageGenerationStage(
+                self.get_module("g_segment_executor"),
+                context_ops_key="sensenova_u1_context_ops",
+                output_extra_key="sensenova_u1_generated_segment",
             )
-        segment = self.generate_segment(
-            context_ops=context_ops,
-            batch=batch,
-            server_args=server_args,
-        )
-        batch.extra["sensenova_u1_generated_segment"] = segment
-        batch.output = _image_to_numpy_batch(segment.image)
-        return batch
-
-    def generate_segment(
-        self,
-        *,
-        context_ops: Any,
-        batch: Req,
-        server_args: ServerArgs,
-    ) -> Any:
-        executor = self.get_module("g_segment_executor")
-        return executor(
-            context_ops=context_ops,
-            batch=batch,
-            server_args=server_args,
         )
 
 
 EntryClass = SenseNovaU1Pipeline
-
-
-def _image_to_numpy_batch(image) -> np.ndarray:
-    if isinstance(image, Image.Image):
-        array = np.asarray(image.convert("RGB"))
-    else:
-        array = np.asarray(image)
-    if array.ndim == 3:
-        array = array[None, ...]
-    if array.dtype != np.uint8:
-        array = np.clip(array, 0, 255).astype(np.uint8)
-    return array
