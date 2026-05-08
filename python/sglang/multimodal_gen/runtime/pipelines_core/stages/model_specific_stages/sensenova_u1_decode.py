@@ -1,20 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import dataclass, field
 from typing import Any
 
-from sglang.multimodal_gen.runtime.pipelines_core.model_specific.sensenova_u1 import (
-    forward_context_position,
-    U1GeneratedSegment,
-    U1PixelFlowPrepared,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_prepare import (
+    SenseNovaU1PixelFlowPrepared,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class SenseNovaU1GeneratedSegment:
+    type: str
+    image: Any
+    metadata: dict[str, Any] = field(default_factory=dict)
+    commit_image: Any | None = None
 
 
 class SenseNovaU1PixelFlowDecoder:
     def forward(
         self,
-        prepared: U1PixelFlowPrepared,
+        prepared: SenseNovaU1PixelFlowPrepared,
         image_prediction: Any,
-    ) -> U1GeneratedSegment:
+    ) -> SenseNovaU1GeneratedSegment:
         import numpy as np
         import torch
         from PIL import Image
@@ -34,7 +41,7 @@ class SenseNovaU1PixelFlowDecoder:
             "grid_hw": prepared.gen_grid_hw[:1].detach().cpu(),
         }
         cfg = prepared.cfg
-        return U1GeneratedSegment(
+        return SenseNovaU1GeneratedSegment(
             type="image",
             image=image,
             metadata={
@@ -48,10 +55,10 @@ class SenseNovaU1PixelFlowDecoder:
                 "grid": (prepared.token_h, prepared.token_w),
                 "g_position_start": prepared.condition.position_count,
                 "condition_position_count": prepared.condition.position_count,
-                "cfg_img_condition_position_count": forward_context_position(
+                "cfg_img_condition_position_count": _forward_context_position(
                     prepared.img_condition
                 ),
-                "cfg_uncondition_position_count": forward_context_position(
+                "cfg_uncondition_position_count": _forward_context_position(
                     prepared.uncondition
                 ),
                 "noise_scale": prepared.noise_scale,
@@ -61,3 +68,9 @@ class SenseNovaU1PixelFlowDecoder:
             },
             commit_image=commit_image,
         )
+
+
+def _forward_context_position(context: Any | None) -> int | None:
+    if context is None:
+        return None
+    return context.position_count

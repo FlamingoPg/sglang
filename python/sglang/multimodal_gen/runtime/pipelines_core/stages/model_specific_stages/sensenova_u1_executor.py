@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 from PIL import Image
 
+from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+    resolve_sensenova_u1_pixel_flow_cfg,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -17,15 +21,19 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_prepare import (
     SenseNovaU1PixelFlowPreparer,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.model_specific.sensenova_u1 import (
-    U1_EDIT_IMG_CONDITION_ROLE,
-    U1_EDIT_UNCONDITION_ROLE,
-    U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
-    U1_T2I_CFG_UNCONDITION_ROLE,
-    U1GContext,
-    resolve_pixel_flow_cfg,
-)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+_U1_T2I_CFG_UNCONDITION_ROLE = "u1_t2i_cfg_uncondition"
+_U1_INTERLEAVE_TEXT_UNCONDITION_ROLE = "u1_interleave_text_uncondition"
+_U1_EDIT_IMG_CONDITION_ROLE = "u1_edit_img_condition"
+_U1_EDIT_UNCONDITION_ROLE = "u1_edit_uncondition"
+
+
+@dataclass(frozen=True, slots=True)
+class _SenseNovaU1GContext:
+    session_id: str
+    position_count: int
+    sidecar_role: str | None = None
 
 
 class SenseNovaU1PixelFlowGSegmentStage(PipelineStage):
@@ -130,7 +138,11 @@ def _resolve_u1_contexts(
     *,
     context_ops: Any,
     batch: Req,
-) -> tuple[U1GContext, U1GContext | None, U1GContext | None]:
+) -> tuple[
+    _SenseNovaU1GContext,
+    _SenseNovaU1GContext | None,
+    _SenseNovaU1GContext | None,
+]:
     get_position_count = getattr(context_ops, "get_position_count", None)
     if not callable(get_position_count):
         raise RuntimeError(
@@ -145,23 +157,23 @@ def _resolve_u1_contexts(
     cfg_uncondition_context = None
     sampling_params = batch.sampling_params
     mode = getattr(sampling_params, "ug_generation_mode", None)
-    cfg = resolve_pixel_flow_cfg(sampling_params)
+    cfg = resolve_sensenova_u1_pixel_flow_cfg(sampling_params)
 
     t2i_uncondition_role = context_ops.get_role(
         "t2i_cfg_uncondition_role",
-        U1_T2I_CFG_UNCONDITION_ROLE,
+        _U1_T2I_CFG_UNCONDITION_ROLE,
     )
     interleave_text_uncondition_role = context_ops.get_role(
         "interleave_text_uncondition_role",
-        U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
+        _U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
     )
     edit_img_condition_role = context_ops.get_role(
         "edit_img_condition_role",
-        U1_EDIT_IMG_CONDITION_ROLE,
+        _U1_EDIT_IMG_CONDITION_ROLE,
     )
     edit_uncondition_role = context_ops.get_role(
         "edit_uncondition_role",
-        U1_EDIT_UNCONDITION_ROLE,
+        _U1_EDIT_UNCONDITION_ROLE,
     )
 
     if mode == "edit":
@@ -203,12 +215,12 @@ def _require_context(
     context_ops: Any,
     message: str,
     sidecar_role: str | None = None,
-) -> U1GContext:
+) -> _SenseNovaU1GContext:
     position_count = context_ops.get_position_count(sidecar_role=sidecar_role)
     if position_count is None:
         suffix = f" sidecar {sidecar_role}" if sidecar_role is not None else ""
         raise RuntimeError(f"{message} for context {context_ops.session_id}{suffix}")
-    return U1GContext(
+    return _SenseNovaU1GContext(
         session_id=context_ops.session_id,
         sidecar_role=sidecar_role,
         position_count=int(position_count),
@@ -237,9 +249,9 @@ class _SenseNovaU1NativePixelFlowRunner:
         context_metadata: dict[str, Any],
         batch: Any,
         server_args: Any,
-        u1_context: U1GContext,
-        cfg_img_condition_u1_context: U1GContext | None = None,
-        cfg_uncondition_u1_context: U1GContext | None = None,
+        u1_context: _SenseNovaU1GContext,
+        cfg_img_condition_u1_context: _SenseNovaU1GContext | None = None,
+        cfg_uncondition_u1_context: _SenseNovaU1GContext | None = None,
     ) -> Any:
         import torch
 

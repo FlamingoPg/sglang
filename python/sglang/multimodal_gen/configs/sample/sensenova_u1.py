@@ -29,6 +29,9 @@ class SenseNovaU1SamplingParams(SamplingParams):
         super().__post_init__()
         self._validate_sensenova_u1_fields()
 
+    def resolve_pixel_flow_cfg(self) -> "SenseNovaU1PixelFlowCFG":
+        return resolve_sensenova_u1_pixel_flow_cfg(self)
+
     def _validate_sensenova_u1_fields(self) -> None:
         if len(self.cfg_interval) != 2:
             raise ValueError("cfg_interval must contain [start, end]")
@@ -64,6 +67,41 @@ class SenseNovaU1SamplingParams(SamplingParams):
             raise ValueError(
                 f"timestep_shift must be positive, got {self.timestep_shift!r}"
             )
+
+
+@dataclass(frozen=True)
+class SenseNovaU1PixelFlowCFG:
+    text_scale: float
+    img_scale: float
+    needs_cfg: bool
+    needs_img_condition: bool
+    needs_uncondition: bool
+    start: float
+    end: float
+    renorm_min: float
+    renorm_type: str
+
+
+def resolve_sensenova_u1_pixel_flow_cfg(
+    params: Any,
+) -> SenseNovaU1PixelFlowCFG:
+    text_scale = float(getattr(params, "cfg_text_scale", 1.0))
+    img_scale = float(getattr(params, "cfg_img_scale", 1.0))
+    needs_cfg = not (text_scale == 1.0 and img_scale == 1.0)
+    cfg_interval = list(getattr(params, "cfg_interval", [0.0, 1.0]))
+    if len(cfg_interval) != 2:
+        raise ValueError("SenseNova U1 cfg_interval must contain [start, end]")
+    return SenseNovaU1PixelFlowCFG(
+        text_scale=text_scale,
+        img_scale=img_scale,
+        needs_cfg=needs_cfg,
+        needs_img_condition=needs_cfg and (img_scale == 1.0 or text_scale != img_scale),
+        needs_uncondition=needs_cfg and img_scale != 1.0,
+        start=float(cfg_interval[0]),
+        end=float(cfg_interval[1]),
+        renorm_min=float(getattr(params, "cfg_renorm_min", 0.0)),
+        renorm_type=str(getattr(params, "cfg_renorm_type", "none")),
+    )
 
 
 def get_sensenova_u1_explicit_sampling_fields(params: Any | None) -> set[str]:

@@ -2,14 +2,12 @@
 
 from typing import Any
 
-from sglang.multimodal_gen.runtime.pipelines_core.model_specific.sensenova_u1 import (
-    predict_u1_pixel_flow_from_srt,
-    require_forward_context,
-    should_apply_cfg,
-    U1PixelFlowForwardContext,
-    U1PixelFlowPrepared,
-    u1_patchify,
-    u1_unpatchify,
+from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+    SenseNovaU1PixelFlowCFG,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_prepare import (
+    SenseNovaU1PixelFlowForwardContext,
+    SenseNovaU1PixelFlowPrepared,
 )
 
 
@@ -23,7 +21,7 @@ class SenseNovaU1PixelFlowDenoiser:
         self.model = model
         self.forward_batch_provider = forward_batch_provider
 
-    def forward(self, prepared: U1PixelFlowPrepared) -> Any:
+    def forward(self, prepared: SenseNovaU1PixelFlowPrepared) -> Any:
         import torch
 
         image_prediction = prepared.image_prediction
@@ -31,11 +29,11 @@ class SenseNovaU1PixelFlowDenoiser:
         for step_i in range(prepared.steps):
             timestep = prepared.timesteps[step_i]
             next_timestep = prepared.timesteps[step_i + 1]
-            z = u1_patchify(
+            z = _patchify(
                 image_prediction,
                 prepared.patch_size * prepared.merge_size,
             )
-            image_input = u1_patchify(
+            image_input = _patchify(
                 image_prediction,
                 prepared.patch_size,
                 channel_first=True,
@@ -66,7 +64,7 @@ class SenseNovaU1PixelFlowDenoiser:
                 timestep=timestep,
                 z=z,
             )
-            use_cfg = should_apply_cfg(prepared.cfg, timestep)
+            use_cfg = _should_apply_cfg(prepared.cfg, timestep)
             v_pred = self._combine_cfg_velocity(
                 prepared=prepared,
                 image_embeds=image_embeds,
@@ -79,11 +77,11 @@ class SenseNovaU1PixelFlowDenoiser:
                 v_pred = self._apply_cfg_renorm(
                     v_condition=v_condition,
                     v_pred=v_pred,
-                    cfg_renorm_type=prepared.cfg.renorm_type,
+                    cfg=prepared.cfg,
                 )
 
             z = z + (next_timestep - timestep) * v_pred
-            image_prediction = u1_unpatchify(
+            image_prediction = _unpatchify(
                 z,
                 prepared.patch_size * prepared.merge_size,
                 prepared.height,
@@ -94,7 +92,7 @@ class SenseNovaU1PixelFlowDenoiser:
     def _combine_cfg_velocity(
         self,
         *,
-        prepared: U1PixelFlowPrepared,
+        prepared: SenseNovaU1PixelFlowPrepared,
         image_embeds: Any,
         timestep: Any,
         z: Any,
@@ -106,7 +104,7 @@ class SenseNovaU1PixelFlowDenoiser:
             return v_condition
         if cfg.img_scale == 1.0:
             v_img_condition = self._predict_v(
-                forward_context=require_forward_context(prepared.img_condition),
+                forward_context=_require_forward_context(prepared.img_condition),
                 image_embeds=image_embeds,
                 timestep=timestep,
                 z=z,
@@ -114,7 +112,7 @@ class SenseNovaU1PixelFlowDenoiser:
             return v_img_condition + cfg.text_scale * (v_condition - v_img_condition)
         if cfg.text_scale == cfg.img_scale:
             v_uncondition = self._predict_v(
-                forward_context=require_forward_context(prepared.uncondition),
+                forward_context=_require_forward_context(prepared.uncondition),
                 image_embeds=image_embeds,
                 timestep=timestep,
                 z=z,
@@ -122,13 +120,13 @@ class SenseNovaU1PixelFlowDenoiser:
             return v_uncondition + cfg.text_scale * (v_condition - v_uncondition)
 
         v_img_condition = self._predict_v(
-            forward_context=require_forward_context(prepared.img_condition),
+            forward_context=_require_forward_context(prepared.img_condition),
             image_embeds=image_embeds,
             timestep=timestep,
             z=z,
         )
         v_uncondition = self._predict_v(
-            forward_context=require_forward_context(prepared.uncondition),
+            forward_context=_require_forward_context(prepared.uncondition),
             image_embeds=image_embeds,
             timestep=timestep,
             z=z,
@@ -142,7 +140,7 @@ class SenseNovaU1PixelFlowDenoiser:
     def _predict_v(
         self,
         *,
-        forward_context: U1PixelFlowForwardContext,
+        forward_context: SenseNovaU1PixelFlowForwardContext,
         image_embeds: Any,
         timestep: Any,
         z: Any,
@@ -158,7 +156,7 @@ class SenseNovaU1PixelFlowDenoiser:
             forward_batch_context,
         )
         try:
-            return predict_u1_pixel_flow_from_srt(
+            return _predict_pixel_flow_from_srt(
                 self.model,
                 image_embeds=image_embeds,
                 indexes_image=forward_context.indexes_image,
@@ -176,8 +174,9 @@ class SenseNovaU1PixelFlowDenoiser:
         *,
         v_condition: Any,
         v_pred: Any,
-        cfg_renorm_type: str,
+        cfg: SenseNovaU1PixelFlowCFG,
     ) -> Any:
+        cfg_renorm_type = cfg.renorm_type
         if cfg_renorm_type == "none":
             return v_pred
         if cfg_renorm_type == "global":
@@ -191,5 +190,76 @@ class SenseNovaU1PixelFlowDenoiser:
                 "Unsupported SenseNova U1 pixel-flow CFG renorm type: "
                 f"{cfg_renorm_type}"
             )
-        scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
+        scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(
+            min=cfg.renorm_min, max=1.0
+        )
         return v_pred * scale
+
+
+def _should_apply_cfg(cfg: SenseNovaU1PixelFlowCFG, timestep: Any) -> bool:
+    return (float(timestep) > cfg.start and float(timestep) < cfg.end) or (
+        cfg.start == 0.0
+    )
+
+
+def _require_forward_context(
+    context: SenseNovaU1PixelFlowForwardContext | None,
+) -> SenseNovaU1PixelFlowForwardContext:
+    if context is None:
+        raise RuntimeError("SenseNova U1 pixel-flow CFG forward context is missing")
+    return context
+
+
+def _patchify(images: Any, patch_size: int, *, channel_first: bool = False) -> Any:
+    import torch
+
+    h, w = images.shape[2] // patch_size, images.shape[3] // patch_size
+    x = images.reshape(images.shape[0], 3, h, patch_size, w, patch_size)
+    if channel_first:
+        x = torch.einsum("nchpwq->nhwcpq", x)
+    else:
+        x = torch.einsum("nchpwq->nhwpqc", x)
+    return x.reshape(images.shape[0], h * w, patch_size**2 * 3)
+
+
+def _unpatchify(
+    x: Any,
+    patch_size: int,
+    h: int | None = None,
+    w: int | None = None,
+) -> Any:
+    import torch
+
+    if h is None or w is None:
+        h = w = int(x.shape[1] ** 0.5)
+    else:
+        h = h // patch_size
+        w = w // patch_size
+    x = x.reshape(x.shape[0], h, w, patch_size, patch_size, 3)
+    x = torch.einsum("nhwpqc->nchpwq", x)
+    return x.reshape(x.shape[0], 3, h * patch_size, w * patch_size)
+
+
+def _predict_pixel_flow_from_srt(
+    model: Any,
+    *,
+    image_embeds: Any,
+    indexes_image: Any,
+    forward_batch: Any,
+    timestep: Any,
+    z: Any,
+) -> Any:
+    batch_size, image_token_num = image_embeds.shape[:2]
+    hidden_states = model.language_model.forward_u1_gen_embeds(
+        input_embeds=image_embeds.reshape(-1, image_embeds.shape[-1]),
+        positions=indexes_image,
+        forward_batch=forward_batch,
+    ).view(batch_size, image_token_num, -1)
+    x_pred = model.fm_modules["fm_head"](hidden_states).view(
+        batch_size,
+        image_token_num,
+        -1,
+    )
+
+    t = timestep.to(device=z.device, dtype=z.dtype)
+    return (x_pred - z) / (1 - t).clamp_min(float(getattr(model.config, "t_eps", 0.02)))
