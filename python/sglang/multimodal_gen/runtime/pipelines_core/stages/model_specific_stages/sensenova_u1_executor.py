@@ -17,11 +17,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     U1_EDIT_UNCONDITION_ROLE,
     U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
     U1_T2I_CFG_UNCONDITION_ROLE,
-    SRTGContext,
+    U1GContext,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_utils import (
-    require_sidecar_srt_context,
-    require_srt_context,
     resolve_pixel_flow_cfg,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -35,84 +33,63 @@ class SenseNovaU1PixelFlowGSegmentExecutor:
     def __call__(
         self,
         *,
-        bridge: Any,
-        contexts: Any,
+        context_ops: Any,
         batch: Req,
         server_args: ServerArgs,
     ) -> Any:
-        if getattr(bridge, "g_kind", None) != self.required_g_kind:
+        if getattr(context_ops, "g_kind", None) != self.required_g_kind:
             raise ValueError(
                 "SenseNova U1 pixel-flow executor requires g_kind='pixel_flow', got "
-                f"{getattr(bridge, 'g_kind', None)!r}"
+                f"{getattr(context_ops, 'g_kind', None)!r}"
             )
-        runtime = getattr(bridge, "runtime", None)
-        if runtime is None or getattr(runtime, "srt_request_executor", None) is None:
-            raise RuntimeError(
-                "SenseNova U1 pixel-flow requires a SRT-backed UG runtime"
-            )
-        srt_executor = runtime.srt_request_executor
-        get_srt_model = getattr(srt_executor, "get_srt_model", None)
-        if not callable(get_srt_model):
-            raise RuntimeError(
-                "SenseNova U1 pixel-flow requires SRT executor model access"
-            )
+        get_model = getattr(context_ops, "get_model", None)
+        if not callable(get_model):
+            raise RuntimeError("SenseNova U1 pixel-flow requires model access")
         forward_batch_provider = getattr(
-            srt_executor,
-            "build_temporary_context_forward_batch_for_session",
+            context_ops,
+            "build_temporary_forward_batch",
             None,
         )
         if not callable(forward_batch_provider):
             raise RuntimeError(
-                "SenseNova U1 pixel-flow requires SRT temporary G forward batches"
+                "SenseNova U1 pixel-flow requires temporary query forward batches"
             )
         (
-            srt_context,
-            cfg_img_condition_srt_context,
-            cfg_uncondition_srt_context,
-        ) = _resolve_srt_contexts(
-            bridge=bridge,
-            contexts=contexts,
+            u1_context,
+            cfg_img_condition_u1_context,
+            cfg_uncondition_u1_context,
+        ) = _resolve_u1_contexts(
+            context_ops=context_ops,
             batch=batch,
-            srt_executor=srt_executor,
         )
         native_runner = _SenseNovaU1NativePixelFlowRunner(
-            get_srt_model(),
+            get_model(),
             forward_batch_provider=forward_batch_provider,
         )
         return native_runner.generate(
-            contexts=contexts,
+            context_metadata=dict(getattr(context_ops, "metadata", {}) or {}),
             batch=batch,
             server_args=server_args,
-            srt_context=srt_context,
-            cfg_img_condition_srt_context=cfg_img_condition_srt_context,
-            cfg_uncondition_srt_context=cfg_uncondition_srt_context,
+            u1_context=u1_context,
+            cfg_img_condition_u1_context=cfg_img_condition_u1_context,
+            cfg_uncondition_u1_context=cfg_uncondition_u1_context,
         )
 
 
-def _resolve_srt_contexts(
+def _resolve_u1_contexts(
     *,
-    bridge: Any,
-    contexts: Any,
+    context_ops: Any,
     batch: Req,
-    srt_executor: Any,
-) -> tuple[SRTGContext, SRTGContext | None, SRTGContext | None]:
-    if contexts.full.session is None:
-        raise ValueError("SenseNova U1 pixel-flow requires a SRT UG session")
-    get_position_count = getattr(
-        srt_executor,
-        "get_latest_session_position_count",
-        None,
-    )
+) -> tuple[U1GContext, U1GContext | None, U1GContext | None]:
+    get_position_count = getattr(context_ops, "get_position_count", None)
     if not callable(get_position_count):
         raise RuntimeError(
-            "SenseNova U1 pixel-flow requires latest SRT session position count"
+            "SenseNova U1 pixel-flow requires latest context position count"
         )
 
-    session_id = contexts.full.session.session_id
-    srt_context = require_srt_context(
-        get_position_count,
-        session_id,
-        "SenseNova U1 pixel-flow has no SRT session position count",
+    u1_context = _require_context(
+        context_ops,
+        "SenseNova U1 pixel-flow has no context position count",
     )
     cfg_img_condition_context = None
     cfg_uncondition_context = None
@@ -120,79 +97,86 @@ def _resolve_srt_contexts(
     mode = getattr(sampling_params, "ug_generation_mode", None)
     cfg = resolve_pixel_flow_cfg(sampling_params)
 
-    t2i_uncondition_role = getattr(
-        bridge,
+    t2i_uncondition_role = context_ops.get_role(
         "t2i_cfg_uncondition_role",
         U1_T2I_CFG_UNCONDITION_ROLE,
     )
-    interleave_text_uncondition_role = getattr(
-        bridge,
+    interleave_text_uncondition_role = context_ops.get_role(
         "interleave_text_uncondition_role",
         U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
     )
-    edit_img_condition_role = getattr(
-        bridge,
+    edit_img_condition_role = context_ops.get_role(
         "edit_img_condition_role",
         U1_EDIT_IMG_CONDITION_ROLE,
     )
-    edit_uncondition_role = getattr(
-        bridge,
+    edit_uncondition_role = context_ops.get_role(
         "edit_uncondition_role",
         U1_EDIT_UNCONDITION_ROLE,
     )
 
     if mode == "edit":
         if cfg.needs_img_condition:
-            cfg_img_condition_context = require_sidecar_srt_context(
-                get_position_count,
-                session_id,
+            cfg_img_condition_context = _require_context(
+                context_ops,
+                "SenseNova U1 edit image CFG requires sidecar context position count",
                 edit_img_condition_role,
-                "SenseNova U1 edit image CFG requires sidecar SRT position count",
             )
         if cfg.needs_uncondition:
-            cfg_uncondition_context = require_sidecar_srt_context(
-                get_position_count,
-                session_id,
+            cfg_uncondition_context = _require_context(
+                context_ops,
+                "SenseNova U1 edit uncondition CFG requires sidecar context position count",
                 edit_uncondition_role,
-                "SenseNova U1 edit uncondition CFG requires sidecar SRT position count",
             )
     elif mode == "interleave":
         if cfg.needs_img_condition:
-            cfg_img_condition_context = require_sidecar_srt_context(
-                get_position_count,
-                session_id,
+            cfg_img_condition_context = _require_context(
+                context_ops,
+                "SenseNova U1 interleave text CFG requires sidecar context position count",
                 interleave_text_uncondition_role,
-                "SenseNova U1 interleave text CFG requires sidecar SRT position count",
             )
         if cfg.needs_uncondition:
-            cfg_uncondition_context = require_sidecar_srt_context(
-                get_position_count,
-                session_id,
+            cfg_uncondition_context = _require_context(
+                context_ops,
+                "SenseNova U1 interleave image CFG requires sidecar context position count",
                 t2i_uncondition_role,
-                "SenseNova U1 interleave image CFG requires sidecar SRT position count",
             )
     elif cfg.text_scale > 1.0:
-        cfg_img_condition_context = require_sidecar_srt_context(
-            get_position_count,
-            session_id,
+        cfg_img_condition_context = _require_context(
+            context_ops,
+            "SenseNova U1 pixel-flow CFG requires sidecar context position count",
             t2i_uncondition_role,
-            "SenseNova U1 pixel-flow CFG requires sidecar SRT position count",
         )
-    return srt_context, cfg_img_condition_context, cfg_uncondition_context
+    return u1_context, cfg_img_condition_context, cfg_uncondition_context
+
+
+def _require_context(
+    context_ops: Any,
+    message: str,
+    sidecar_role: str | None = None,
+) -> U1GContext:
+    position_count = context_ops.get_position_count(sidecar_role=sidecar_role)
+    if position_count is None:
+        suffix = f" sidecar {sidecar_role}" if sidecar_role is not None else ""
+        raise RuntimeError(f"{message} for context {context_ops.session_id}{suffix}")
+    return U1GContext(
+        session_id=context_ops.session_id,
+        sidecar_role=sidecar_role,
+        position_count=int(position_count),
+    )
 
 
 class _SenseNovaU1NativePixelFlowRunner:
-    """Model-specific pixel-flow runner; SRT only supplies KV-backed forwards."""
+    """Model-specific pixel-flow runner fed by generic context ops."""
 
     def __init__(
         self,
-        srt_model: Any,
+        model: Any,
         *,
         forward_batch_provider: Any,
     ) -> None:
-        self.preparer = SenseNovaU1PixelFlowPreparer(srt_model)
+        self.preparer = SenseNovaU1PixelFlowPreparer(model)
         self.denoiser = SenseNovaU1PixelFlowDenoiser(
-            srt_model,
+            model,
             forward_batch_provider=forward_batch_provider,
         )
         self.decoder = SenseNovaU1PixelFlowDecoder()
@@ -200,23 +184,23 @@ class _SenseNovaU1NativePixelFlowRunner:
     def generate(
         self,
         *,
-        contexts: Any,
+        context_metadata: dict[str, Any],
         batch: Any,
         server_args: Any,
-        srt_context: SRTGContext,
-        cfg_img_condition_srt_context: SRTGContext | None = None,
-        cfg_uncondition_srt_context: SRTGContext | None = None,
+        u1_context: U1GContext,
+        cfg_img_condition_u1_context: U1GContext | None = None,
+        cfg_uncondition_u1_context: U1GContext | None = None,
     ) -> Any:
         import torch
 
         del server_args
         with torch.inference_mode():
             prepared = self.preparer.forward(
-                contexts=contexts,
+                context_metadata=context_metadata,
                 batch=batch,
-                srt_context=srt_context,
-                cfg_img_condition_srt_context=cfg_img_condition_srt_context,
-                cfg_uncondition_srt_context=cfg_uncondition_srt_context,
+                u1_context=u1_context,
+                cfg_img_condition_u1_context=cfg_img_condition_u1_context,
+                cfg_uncondition_u1_context=cfg_uncondition_u1_context,
             )
             image_prediction = self.denoiser.forward(prepared)
             return self.decoder.forward(prepared, image_prediction)

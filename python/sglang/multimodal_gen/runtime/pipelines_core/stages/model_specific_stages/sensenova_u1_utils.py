@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_types import (
-    SRTGContext,
+    U1GContext,
     U1PixelFlowCFG,
     U1PixelFlowForwardContext,
 )
@@ -30,14 +30,14 @@ def resolve_pixel_flow_cfg(sampling_params: Any) -> U1PixelFlowCFG:
 
 
 def build_pixel_flow_forward_context(
-    srt_context: SRTGContext,
+    context: U1GContext,
     *,
     token_h: int,
     token_w: int,
     packed_seqlens: Any,
     device: Any,
 ) -> U1PixelFlowForwardContext:
-    position_count = int(srt_context.position_count)
+    position_count = int(context.position_count)
     indexes_image = u1_build_t2i_image_indexes(
         token_h=token_h,
         token_w=token_w,
@@ -49,8 +49,8 @@ def build_pixel_flow_forward_context(
             "packed_seqlens": packed_seqlens,
             "packed_position_ids": indexes_image,
         },
-        srt_session_id=srt_context.session_id,
-        srt_sidecar_role=srt_context.sidecar_role,
+        session_id=context.session_id,
+        sidecar_role=context.sidecar_role,
     )
     return U1PixelFlowForwardContext(
         prepared=prepared,
@@ -92,38 +92,6 @@ def batch_image_size(batch: Any) -> tuple[int, int]:
         default=1024,
     )
     return width, height
-
-
-def require_srt_context(
-    get_position_count: Any,
-    session_id: str,
-    message: str,
-    *,
-    sidecar_role: str | None = None,
-) -> SRTGContext:
-    position_count = get_position_count(session_id, sidecar_role=sidecar_role)
-    if position_count is None:
-        suffix = f" sidecar {sidecar_role}" if sidecar_role is not None else ""
-        raise RuntimeError(f"{message} for session {session_id}{suffix}")
-    return SRTGContext(
-        session_id=session_id,
-        sidecar_role=sidecar_role,
-        position_count=int(position_count),
-    )
-
-
-def require_sidecar_srt_context(
-    get_position_count: Any,
-    session_id: str,
-    role: str,
-    message: str,
-) -> SRTGContext:
-    return require_srt_context(
-        get_position_count,
-        session_id,
-        message,
-        sidecar_role=role,
-    )
 
 
 def u1_patchify(images: Any, patch_size: int, *, channel_first: bool = False) -> Any:
@@ -297,17 +265,17 @@ def first_int(*values: Any, default: int) -> int:
     return int(default)
 
 
-def model_device(srt_model: Any) -> Any:
-    vision_model = getattr(srt_model, "vision_model", None)
+def model_device(model: Any) -> Any:
+    vision_model = getattr(model, "vision_model", None)
     device = getattr(vision_model, "device", None)
     if device is not None:
         return device
-    return next(srt_model.parameters()).device
+    return next(model.parameters()).device
 
 
-def model_dtype(srt_model: Any) -> Any:
-    vision_model = getattr(srt_model, "vision_model", None)
+def model_dtype(model: Any) -> Any:
+    vision_model = getattr(model, "vision_model", None)
     dtype = getattr(vision_model, "dtype", None)
     if dtype is not None:
         return dtype
-    return next(srt_model.parameters()).dtype
+    return next(model.parameters()).dtype

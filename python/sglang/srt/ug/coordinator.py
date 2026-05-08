@@ -107,9 +107,8 @@ class UGInterleaveCoordinator:
     ) -> Any:
         return self.bridge.run_g_segment(
             contexts=contexts,
-            executor=lambda run_contexts: self.g_segment_executor(
-                bridge=self.bridge,
-                contexts=run_contexts,
+            executor=lambda context_ops: self.g_segment_executor(
+                context_ops=context_ops,
                 batch=batch,
                 server_args=server_args,
             ),

@@ -10,7 +10,7 @@ U1_EDIT_UNCONDITION_ROLE = "u1_edit_uncondition"
 
 
 @dataclass(frozen=True, slots=True)
-class SRTGContext:
+class U1GContext:
     session_id: str
     position_count: int
     sidecar_role: str | None = None

@@ -29,8 +29,8 @@ class TestUGInterleaveCoordinator(unittest.TestCase):
         )
         calls = []
 
-        def g_segment_executor(*, bridge, contexts, batch, server_args):
-            calls.append(("g", contexts, batch, server_args))
+        def g_segment_executor(*, context_ops, batch, server_args):
+            calls.append(("g", context_ops, batch, server_args))
             return SimpleNamespace(type="image", image="image0", metadata={"step": 0})
 
         coordinator = module.UGInterleaveCoordinator(

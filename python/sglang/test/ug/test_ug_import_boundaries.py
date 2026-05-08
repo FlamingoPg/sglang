@@ -4,7 +4,6 @@ import ast
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[4]
 PYTHON_ROOT = REPO_ROOT / "python"
 
@@ -35,6 +34,46 @@ class TestUGImportBoundaries(unittest.TestCase):
         )
 
         self.assertEqual([], _format_violations(violations))
+
+    def test_multimodal_gen_u1_uses_only_context_ops(self):
+        root = (
+            PYTHON_ROOT
+            / "sglang"
+            / "multimodal_gen"
+            / "runtime"
+            / "pipelines_core"
+            / "stages"
+            / "model_specific_stages"
+        )
+        files = [
+            PYTHON_ROOT
+            / "sglang"
+            / "multimodal_gen"
+            / "runtime"
+            / "pipelines"
+            / "sensenova_u1.py",
+            root / "sensenova_u1_executor.py",
+            root / "sensenova_u1_prepare.py",
+            root / "sensenova_u1_denoise.py",
+            root / "sensenova_u1_decode.py",
+        ]
+        forbidden_patterns = (
+            "bridge.runtime",
+            "srt_request_executor",
+            "sensenova_u1_bridge",
+            "sensenova_u1_contexts",
+            "UGSessionRuntime",
+        )
+        violations = []
+        for path in files:
+            text = path.read_text(encoding="utf-8-sig")
+            for pattern in forbidden_patterns:
+                if pattern in text:
+                    violations.append(
+                        f"{path.relative_to(REPO_ROOT)} contains {pattern}"
+                    )
+
+        self.assertEqual([], violations)
 
 
 def _find_imports(
@@ -88,7 +127,9 @@ def _is_test_or_cache_path(path: Path) -> bool:
 
 def _is_skipped(path: Path, skip_dirs: set[Path]) -> bool:
     resolved = path.resolve()
-    return any(resolved == skip_dir or skip_dir in resolved.parents for skip_dir in skip_dirs)
+    return any(
+        resolved == skip_dir or skip_dir in resolved.parents for skip_dir in skip_dirs
+    )
 
 
 def _format_violations(violations: list[tuple[Path, int, str]]) -> list[str]:

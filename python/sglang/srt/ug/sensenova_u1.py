@@ -53,7 +53,11 @@ from sglang.srt.ug.interleaved import (
     UGRuntimeStats,
     normalize_ug_generation_mode,
 )
-from sglang.srt.ug.middle import SRTBackedUGMiddleBridge, UGGSegmentExecutor
+from sglang.srt.ug.middle import (
+    SRTBackedGContextOps,
+    SRTBackedUGMiddleBridge,
+    UGGSegmentExecutor,
+)
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
@@ -851,7 +855,12 @@ class U1SRTBackedUGMiddleBridge:
         contexts: UGContextBundle,
         executor: UGGSegmentExecutor,
     ) -> Any:
-        return self._bridge.run_g_segment(contexts=contexts, executor=executor)
+        if contexts.full.session is None:
+            raise ValueError("SRT-backed UG contexts require a session handle")
+        segment = executor(SRTBackedGContextOps(self, contexts))
+        if segment.type != "image":
+            raise ValueError(f"UG G segment expected image output, got {segment.type}")
+        return segment
 
     def commit_generated_segment(
         self,

@@ -43,17 +43,15 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        bridge = batch.extra.get("sensenova_u1_bridge")
-        contexts = batch.extra.get("sensenova_u1_contexts")
-        if bridge is None or contexts is None:
+        context_ops = batch.extra.get("sensenova_u1_context_ops")
+        if context_ops is None:
             raise RuntimeError(
                 "SenseNovaU1Pipeline is a stateless G segment generator. "
-                "Use the internal UG coordinator to prepare SRT context and "
+                "Use the internal UG coordinator to prepare G context ops and "
                 "call generate_segment()."
             )
         segment = self.generate_segment(
-            bridge=bridge,
-            contexts=contexts,
+            context_ops=context_ops,
             batch=batch,
             server_args=server_args,
         )
@@ -64,15 +62,13 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
     def generate_segment(
         self,
         *,
-        bridge: Any,
-        contexts: Any,
+        context_ops: Any,
         batch: Req,
         server_args: ServerArgs,
     ) -> Any:
         executor = self.get_module("g_segment_executor")
         return executor(
-            bridge=bridge,
-            contexts=contexts,
+            context_ops=context_ops,
             batch=batch,
             server_args=server_args,
         )

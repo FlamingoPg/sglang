@@ -41,8 +41,8 @@ class SenseNovaU1PixelFlowDecoder:
             image=image,
             metadata={
                 "g_kind": "pixel_flow",
-                "native_srt_pixel_flow": True,
-                "temporary_g_kv": True,
+                "native_context_pixel_flow": True,
+                "temporary_context_kv": True,
                 "timesteps": prepared.steps,
                 "seed": prepared.seed,
                 "width": prepared.width,

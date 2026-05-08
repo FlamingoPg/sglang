@@ -18,11 +18,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 class SenseNovaU1PixelFlowDenoiser:
     def __init__(
         self,
-        srt_model: Any,
+        model: Any,
         *,
         forward_batch_provider: Any,
     ) -> None:
-        self.srt_model = srt_model
+        self.model = model
         self.forward_batch_provider = forward_batch_provider
 
     def forward(self, prepared: U1PixelFlowPrepared) -> Any:
@@ -42,22 +42,22 @@ class SenseNovaU1PixelFlowDenoiser:
                 prepared.patch_size,
                 channel_first=True,
             )
-            image_embeds = self.srt_model.extract_feature(
+            image_embeds = self.model.extract_feature(
                 image_input.view(prepared.grid_h * prepared.grid_w, -1),
                 gen_model=True,
                 grid_hw=prepared.gen_grid_hw,
             ).view(1, prepared.token_h * prepared.token_w, -1)
             timestep_values = timestep.expand(prepared.token_h * prepared.token_w)
-            timestep_embeddings = self.srt_model.fm_modules["timestep_embedder"](
+            timestep_embeddings = self.model.fm_modules["timestep_embedder"](
                 timestep_values
             ).view(1, prepared.token_h * prepared.token_w, -1)
-            if getattr(self.srt_model.config, "add_noise_scale_embedding", False):
+            if getattr(self.model.config, "add_noise_scale_embedding", False):
                 noise_values = torch.full_like(
                     timestep_values,
                     prepared.noise_scale
-                    / float(self.srt_model.config.noise_scale_max_value),
+                    / float(self.model.config.noise_scale_max_value),
                 )
-                timestep_embeddings = timestep_embeddings + self.srt_model.fm_modules[
+                timestep_embeddings = timestep_embeddings + self.model.fm_modules[
                     "noise_scale_embedder"
                 ](noise_values).view(1, prepared.token_h * prepared.token_w, -1)
             image_embeds = image_embeds + timestep_embeddings
@@ -161,7 +161,7 @@ class SenseNovaU1PixelFlowDenoiser:
         )
         try:
             return predict_u1_pixel_flow_from_srt(
-                self.srt_model,
+                self.model,
                 image_embeds=image_embeds,
                 indexes_image=forward_context.indexes_image,
                 forward_batch=forward_batch,
