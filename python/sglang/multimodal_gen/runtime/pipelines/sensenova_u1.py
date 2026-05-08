@@ -73,30 +73,6 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
             server_args=server_args,
         )
 
-    def forward_interleaved(self, *args, **kwargs):
-        raise RuntimeError(
-            "SenseNova U1 interleave is owned by the internal UG coordinator, "
-            "not by multimodal_gen. Use sglang.srt.ug.sensenova_u1 entrypoints."
-        )
-
-    def forward_interleaved_batch(self, *args, **kwargs):
-        raise RuntimeError(
-            "SenseNova U1 interleave batching is owned by the internal UG coordinator, "
-            "not by multimodal_gen."
-        )
-
-    def forward_vlm(self, *args, **kwargs):
-        raise RuntimeError(
-            "SenseNova U1 VLM is owned by the internal UG coordinator, "
-            "not by multimodal_gen."
-        )
-
-    def forward_vlm_batch(self, *args, **kwargs):
-        raise RuntimeError(
-            "SenseNova U1 VLM batching is owned by the internal UG coordinator, "
-            "not by multimodal_gen."
-        )
-
 
 EntryClass = SenseNovaU1Pipeline
 

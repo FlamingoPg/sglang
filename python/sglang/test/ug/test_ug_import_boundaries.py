@@ -49,6 +49,12 @@ class TestUGImportBoundaries(unittest.TestCase):
             PYTHON_ROOT
             / "sglang"
             / "multimodal_gen"
+            / "configs"
+            / "sample"
+            / "sensenova_u1.py",
+            PYTHON_ROOT
+            / "sglang"
+            / "multimodal_gen"
             / "runtime"
             / "pipelines"
             / "sensenova_u1.py",
@@ -63,6 +69,10 @@ class TestUGImportBoundaries(unittest.TestCase):
             "sensenova_u1_bridge",
             "sensenova_u1_contexts",
             "UGSessionRuntime",
+            "forward_vlm",
+            "VLM",
+            "vlm",
+            "think_max_new_tokens",
         )
         violations = []
         for path in files:

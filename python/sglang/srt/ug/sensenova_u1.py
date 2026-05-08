@@ -758,7 +758,7 @@ class U1SRTBackedUGMiddleBridge:
         think_max_new_tokens: int | None = None,
         sampling_params: Any | None = None,
     ) -> UGContextBundle:
-        with self._temporary_generation_settings(sampling_params):
+        with self._temporary_generation_settings(sampling_params, think=think):
             bridge_think = (
                 False
                 if getattr(sampling_params, "ug_generation_mode", None) == "interleave"
@@ -781,7 +781,7 @@ class U1SRTBackedUGMiddleBridge:
         think_max_new_tokens: int | None = None,
         sampling_params: Any | None = None,
     ) -> UGContextBundle:
-        with self._temporary_generation_settings(sampling_params):
+        with self._temporary_generation_settings(sampling_params, think=think):
             bridge_think = (
                 False
                 if getattr(sampling_params, "ug_generation_mode", None) == "interleave"
@@ -796,7 +796,12 @@ class U1SRTBackedUGMiddleBridge:
         return contexts
 
     @contextmanager
-    def _temporary_generation_settings(self, sampling_params: Any | None):
+    def _temporary_generation_settings(
+        self,
+        sampling_params: Any | None,
+        *,
+        think: bool,
+    ):
         adapter = getattr(self.runtime.model_runner, "adapter", None)
         old_cfg = getattr(adapter, "include_t2i_cfg_uncondition", False)
         old_interleave_text_uncondition = getattr(
@@ -833,9 +838,7 @@ class U1SRTBackedUGMiddleBridge:
                 mode == "edit" and needs_cfg and cfg_img_scale != 1.0
             )
             adapter.native_generation_mode = mode
-            adapter.native_interleave_think_mode = bool(
-                getattr(sampling_params, "think", False)
-            )
+            adapter.native_interleave_think_mode = bool(think)
         try:
             yield
         finally:
@@ -952,7 +955,14 @@ def _normalize_sensenova_u1_request(
     sampling_params: SenseNovaU1SamplingParams | dict[str, Any] | None,
     sampling_kwargs: dict[str, Any],
 ) -> UGInterleavedRequest:
+    sampling_kwargs, kwargs_metadata = _split_u1_request_metadata(sampling_kwargs)
     if isinstance(messages, UGInterleavedRequest):
+        request_sampling_params = (
+            messages.sampling_params if sampling_params is None else sampling_params
+        )
+        request_sampling_params, params_metadata = (
+            _extract_u1_request_metadata_from_params(request_sampling_params)
+        )
         if messages.sampling_params is not None and (
             sampling_params is not None or sampling_kwargs
         ):
@@ -960,24 +970,30 @@ def _normalize_sensenova_u1_request(
                 "SenseNova U1 request already contains sampling_params; pass "
                 "overrides by constructing a new UGInterleavedRequest"
             )
+        metadata = dict(messages.metadata)
+        metadata.update(params_metadata)
+        metadata.update(kwargs_metadata)
         return UGInterleavedRequest(
             messages=messages.messages,
             sampling_params=_normalize_sensenova_u1_sampling_params(
-                (
-                    messages.sampling_params
-                    if sampling_params is None
-                    else sampling_params
-                ),
+                request_sampling_params,
                 sampling_kwargs,
             ),
-            metadata=dict(messages.metadata),
+            metadata=metadata,
         )
+    sampling_params, params_metadata = _extract_u1_request_metadata_from_params(
+        sampling_params
+    )
+    metadata = {}
+    metadata.update(params_metadata)
+    metadata.update(kwargs_metadata)
     return UGInterleavedRequest.from_segments(
         messages,
         sampling_params=_normalize_sensenova_u1_sampling_params(
             sampling_params,
             sampling_kwargs,
         ),
+        metadata=metadata,
     )
 
 
@@ -997,6 +1013,36 @@ def _normalize_sensenova_u1_sampling_params(
             "to be omitted or passed as a dict"
         )
     return sampling_params
+
+
+_U1_REQUEST_METADATA_FIELDS = {
+    "mode",
+    "max_new_tokens",
+    "max_length",
+    "max_interleave_images",
+    "max_interleave_text_segments",
+    "think",
+    "think_max_new_tokens",
+}
+
+
+def _extract_u1_request_metadata_from_params(
+    sampling_params: SenseNovaU1SamplingParams | dict[str, Any] | None,
+) -> tuple[SenseNovaU1SamplingParams | dict[str, Any] | None, dict[str, Any]]:
+    if not isinstance(sampling_params, dict):
+        return sampling_params, {}
+    return _split_u1_request_metadata(sampling_params)
+
+
+def _split_u1_request_metadata(
+    values: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    sampling_values = dict(values)
+    metadata = {}
+    for key in tuple(sampling_values):
+        if key in _U1_REQUEST_METADATA_FIELDS:
+            metadata[key] = sampling_values.pop(key)
+    return sampling_values, metadata
 
 
 def _normalize_u1_interleaved_messages(
@@ -1056,19 +1102,18 @@ def _resolve_vlm_max_new_tokens(
 
 
 def _resolve_u1_think(sampling_params: Any, metadata: dict[str, Any]) -> bool:
+    del sampling_params
     if "think" in metadata:
         return _coerce_u1_bool(metadata["think"], name="think")
-    return bool(getattr(sampling_params, "think", False))
+    return False
 
 
 def _resolve_u1_think_max_new_tokens(
     sampling_params: Any,
     metadata: dict[str, Any],
 ) -> int | None:
-    value = metadata.get(
-        "think_max_new_tokens",
-        getattr(sampling_params, "think_max_new_tokens", None),
-    )
+    del sampling_params
+    value = metadata.get("think_max_new_tokens")
     if value is None:
         return None
     value = int(value)
