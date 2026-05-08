@@ -23,6 +23,47 @@ class _SRTGContext:
     sidecar_role: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _U1PixelFlowCFG:
+    text_scale: float
+    img_scale: float
+    needs_cfg: bool
+    needs_img_condition: bool
+    needs_uncondition: bool
+    start: float
+    end: float
+    renorm_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class _U1PixelFlowForwardContext:
+    prepared: Any
+    indexes_image: Any
+    position_count: int
+
+
+@dataclass(slots=True)
+class _U1PixelFlowPrepared:
+    width: int
+    height: int
+    patch_size: int
+    merge_size: int
+    token_h: int
+    token_w: int
+    grid_h: int
+    grid_w: int
+    steps: int
+    seed: int
+    noise_scale: float
+    image_prediction: Any
+    gen_grid_hw: Any
+    timesteps: Any
+    cfg: _U1PixelFlowCFG
+    condition: _U1PixelFlowForwardContext
+    img_condition: _U1PixelFlowForwardContext | None
+    uncondition: _U1PixelFlowForwardContext | None
+
+
 class SenseNovaU1PixelFlowGSegmentExecutor:
     """Run SenseNova U1 pixel-flow G through the model-specific diffusion stage."""
 
@@ -114,13 +155,7 @@ def _resolve_srt_contexts(
     cfg_uncondition_context = None
     sampling_params = batch.sampling_params
     mode = getattr(sampling_params, "ug_generation_mode", None)
-    cfg_text_scale = float(getattr(sampling_params, "cfg_text_scale", 1.0))
-    cfg_img_scale = float(getattr(sampling_params, "cfg_img_scale", 1.0))
-    needs_cfg = not (cfg_text_scale == 1.0 and cfg_img_scale == 1.0)
-    needs_img_condition = needs_cfg and (
-        cfg_img_scale == 1.0 or cfg_text_scale != cfg_img_scale
-    )
-    needs_uncondition = needs_cfg and cfg_img_scale != 1.0
+    cfg = _resolve_pixel_flow_cfg(sampling_params)
 
     t2i_uncondition_role = getattr(
         bridge,
@@ -144,14 +179,14 @@ def _resolve_srt_contexts(
     )
 
     if mode == "edit":
-        if needs_img_condition:
+        if cfg.needs_img_condition:
             cfg_img_condition_context = _require_sidecar_srt_context(
                 get_position_count,
                 session_id,
                 edit_img_condition_role,
                 "SenseNova U1 edit image CFG requires sidecar SRT position count",
             )
-        if needs_uncondition:
+        if cfg.needs_uncondition:
             cfg_uncondition_context = _require_sidecar_srt_context(
                 get_position_count,
                 session_id,
@@ -159,21 +194,21 @@ def _resolve_srt_contexts(
                 "SenseNova U1 edit uncondition CFG requires sidecar SRT position count",
             )
     elif mode == "interleave":
-        if needs_img_condition:
+        if cfg.needs_img_condition:
             cfg_img_condition_context = _require_sidecar_srt_context(
                 get_position_count,
                 session_id,
                 interleave_text_uncondition_role,
                 "SenseNova U1 interleave text CFG requires sidecar SRT position count",
             )
-        if needs_uncondition:
+        if cfg.needs_uncondition:
             cfg_uncondition_context = _require_sidecar_srt_context(
                 get_position_count,
                 session_id,
                 t2i_uncondition_role,
                 "SenseNova U1 interleave image CFG requires sidecar SRT position count",
             )
-    elif cfg_text_scale > 1.0:
+    elif cfg.text_scale > 1.0:
         cfg_img_condition_context = _require_sidecar_srt_context(
             get_position_count,
             session_id,
@@ -194,6 +229,12 @@ class _SenseNovaU1NativePixelFlowRunner:
     ) -> None:
         self.srt_model = srt_model
         self.forward_batch_provider = forward_batch_provider
+        self.prepare_stage = _SenseNovaU1PixelFlowPrepareStage(srt_model)
+        self.denoise_stage = _SenseNovaU1PixelFlowDenoiseStage(
+            srt_model,
+            forward_batch_provider=forward_batch_provider,
+        )
+        self.decode_stage = _SenseNovaU1PixelFlowDecodeStage()
 
     def generate(
         self,
@@ -207,60 +248,56 @@ class _SenseNovaU1NativePixelFlowRunner:
     ) -> UGGSegmentResult:
         import torch
 
+        del server_args
         with torch.inference_mode():
-            return self._generate_impl(
+            prepared = self.prepare_stage.forward(
                 contexts=contexts,
                 batch=batch,
-                server_args=server_args,
                 srt_context=srt_context,
                 cfg_img_condition_srt_context=cfg_img_condition_srt_context,
                 cfg_uncondition_srt_context=cfg_uncondition_srt_context,
             )
+            image_prediction = self.denoise_stage.forward(prepared)
+            return self.decode_stage.forward(prepared, image_prediction)
 
-    def _generate_impl(
+
+class _SenseNovaU1PixelFlowPrepareStage:
+    def __init__(self, srt_model: Any) -> None:
+        self.srt_model = srt_model
+
+    def forward(
         self,
         *,
         contexts: UGContextBundle,
         batch: Any,
-        server_args: Any,
         srt_context: _SRTGContext,
         cfg_img_condition_srt_context: _SRTGContext | None = None,
         cfg_uncondition_srt_context: _SRTGContext | None = None,
-    ) -> UGGSegmentResult:
-        del server_args
-        import numpy as np
+    ) -> _U1PixelFlowPrepared:
         import torch
-        from PIL import Image
 
         if contexts.full.session is None:
             raise ValueError("SenseNova U1 pixel-flow requires contexts.full.session")
         sampling_params = batch.sampling_params
-        cfg_text_scale = float(getattr(sampling_params, "cfg_text_scale", 1.0))
-        cfg_img_scale = float(getattr(sampling_params, "cfg_img_scale", 1.0))
-        needs_cfg = not (cfg_text_scale == 1.0 and cfg_img_scale == 1.0)
-        needs_img_condition = needs_cfg and (
-            cfg_img_scale == 1.0 or cfg_text_scale != cfg_img_scale
-        )
-        needs_uncondition = needs_cfg and cfg_img_scale != 1.0
+        cfg = _resolve_pixel_flow_cfg(sampling_params)
         if (
-            needs_img_condition
+            cfg.needs_img_condition
             and cfg_img_condition_srt_context is None
-            and not needs_uncondition
+            and not cfg.needs_uncondition
             and cfg_uncondition_srt_context is not None
         ):
             cfg_img_condition_srt_context = cfg_uncondition_srt_context
             cfg_uncondition_srt_context = None
-        if needs_img_condition and cfg_img_condition_srt_context is None:
+        if cfg.needs_img_condition and cfg_img_condition_srt_context is None:
             raise RuntimeError(
-                "SenseNova U1 pixel-flow CFG requires an image-condition " "SRT context"
+                "SenseNova U1 pixel-flow CFG requires an image-condition SRT context"
             )
-        if needs_uncondition and cfg_uncondition_srt_context is None:
+        if cfg.needs_uncondition and cfg_uncondition_srt_context is None:
             raise RuntimeError(
                 "SenseNova U1 pixel-flow CFG requires an uncondition SRT context"
             )
 
-        image_size = _batch_image_size(batch)
-        width, height = image_size
+        width, height = _batch_image_size(batch)
         patch_size = int(self.srt_model.config.vision_config.patch_size)
         merge_size = int(1 / float(self.srt_model.config.downsample_ratio))
         divisor = patch_size * merge_size
@@ -303,220 +340,193 @@ class _SenseNovaU1NativePixelFlowRunner:
             image_seq_len=token_h * token_w,
             timestep_shift=float(getattr(sampling_params, "timestep_shift", 1.0)),
         )
-        g_position_start = int(srt_context.position_count)
-        indexes_image = _u1_build_t2i_image_indexes(
+        packed_seqlens = torch.tensor(
+            [token_h * token_w], dtype=torch.int32, device=device
+        )
+        condition = _build_pixel_flow_forward_context(
+            srt_context,
             token_h=token_h,
             token_w=token_w,
-            text_len=g_position_start,
+            packed_seqlens=packed_seqlens,
             device=device,
         )
-        cfg_img_condition_position_count = None
-        indexes_image_img_condition = None
+        img_condition = None
         if cfg_img_condition_srt_context is not None:
-            cfg_img_condition_position_count = int(
-                cfg_img_condition_srt_context.position_count
-            )
-            indexes_image_img_condition = _u1_build_t2i_image_indexes(
+            img_condition = _build_pixel_flow_forward_context(
+                cfg_img_condition_srt_context,
                 token_h=token_h,
                 token_w=token_w,
-                text_len=cfg_img_condition_position_count,
+                packed_seqlens=packed_seqlens,
                 device=device,
             )
-        cfg_uncondition_position_count = None
-        indexes_image_uncondition = None
+        uncondition = None
         if cfg_uncondition_srt_context is not None:
-            cfg_uncondition_position_count = int(
-                cfg_uncondition_srt_context.position_count
-            )
-            indexes_image_uncondition = _u1_build_t2i_image_indexes(
+            uncondition = _build_pixel_flow_forward_context(
+                cfg_uncondition_srt_context,
                 token_h=token_h,
                 token_w=token_w,
-                text_len=cfg_uncondition_position_count,
+                packed_seqlens=packed_seqlens,
                 device=device,
             )
-        generation_input = {
-            "packed_seqlens": torch.tensor(
-                [token_h * token_w], dtype=torch.int32, device=device
-            ),
-            "packed_position_ids": indexes_image,
-        }
-        prepared = SimpleNamespace(
-            generation_input=generation_input,
-            srt_session_id=srt_context.session_id,
-            srt_sidecar_role=srt_context.sidecar_role,
-        )
-        prepared_img_condition = None
-        if cfg_img_condition_srt_context is not None:
-            prepared_img_condition = SimpleNamespace(
-                generation_input={
-                    "packed_seqlens": generation_input["packed_seqlens"],
-                    "packed_position_ids": indexes_image_img_condition,
-                },
-                srt_session_id=cfg_img_condition_srt_context.session_id,
-                srt_sidecar_role=cfg_img_condition_srt_context.sidecar_role,
-            )
-        prepared_uncondition = None
-        if cfg_uncondition_srt_context is not None:
-            prepared_uncondition = SimpleNamespace(
-                generation_input={
-                    "packed_seqlens": generation_input["packed_seqlens"],
-                    "packed_position_ids": indexes_image_uncondition,
-                },
-                srt_session_id=cfg_uncondition_srt_context.session_id,
-                srt_sidecar_role=cfg_uncondition_srt_context.sidecar_role,
-            )
-        cfg_interval = list(getattr(sampling_params, "cfg_interval", [0.0, 1.0]))
-        if len(cfg_interval) != 2:
-            raise ValueError(
-                "SenseNova U1 pixel-flow cfg_interval must have two values"
-            )
-        cfg_start, cfg_end = float(cfg_interval[0]), float(cfg_interval[1])
-        cfg_renorm_type = str(getattr(sampling_params, "cfg_renorm_type", "none"))
 
-        for step_i in range(steps):
-            timestep = timesteps[step_i]
-            next_timestep = timesteps[step_i + 1]
-            use_cfg = (float(timestep) > cfg_start and float(timestep) < cfg_end) or (
-                cfg_start == 0.0
+        return _U1PixelFlowPrepared(
+            width=width,
+            height=height,
+            patch_size=patch_size,
+            merge_size=merge_size,
+            token_h=token_h,
+            token_w=token_w,
+            grid_h=grid_h,
+            grid_w=grid_w,
+            steps=steps,
+            seed=seed,
+            noise_scale=noise_scale,
+            image_prediction=image_prediction,
+            gen_grid_hw=gen_grid_hw,
+            timesteps=timesteps,
+            cfg=cfg,
+            condition=condition,
+            img_condition=img_condition,
+            uncondition=uncondition,
+        )
+
+
+class _SenseNovaU1PixelFlowDenoiseStage:
+    def __init__(
+        self,
+        srt_model: Any,
+        *,
+        forward_batch_provider: Any,
+    ) -> None:
+        self.srt_model = srt_model
+        self.forward_batch_provider = forward_batch_provider
+
+    def forward(self, prepared: _U1PixelFlowPrepared) -> Any:
+        import torch
+
+        image_prediction = prepared.image_prediction
+
+        for step_i in range(prepared.steps):
+            timestep = prepared.timesteps[step_i]
+            next_timestep = prepared.timesteps[step_i + 1]
+            z = _u1_patchify(
+                image_prediction,
+                prepared.patch_size * prepared.merge_size,
             )
-            z = _u1_patchify(image_prediction, patch_size * merge_size)
             image_input = _u1_patchify(
                 image_prediction,
-                patch_size,
+                prepared.patch_size,
                 channel_first=True,
             )
             image_embeds = self.srt_model.extract_feature(
-                image_input.view(grid_h * grid_w, -1),
+                image_input.view(prepared.grid_h * prepared.grid_w, -1),
                 gen_model=True,
-                grid_hw=gen_grid_hw,
-            ).view(1, token_h * token_w, -1)
-            timestep_values = timestep.expand(token_h * token_w)
+                grid_hw=prepared.gen_grid_hw,
+            ).view(1, prepared.token_h * prepared.token_w, -1)
+            timestep_values = timestep.expand(prepared.token_h * prepared.token_w)
             timestep_embeddings = self.srt_model.fm_modules["timestep_embedder"](
                 timestep_values
-            ).view(1, token_h * token_w, -1)
+            ).view(1, prepared.token_h * prepared.token_w, -1)
             if getattr(self.srt_model.config, "add_noise_scale_embedding", False):
                 noise_values = torch.full_like(
                     timestep_values,
-                    noise_scale / float(self.srt_model.config.noise_scale_max_value),
+                    prepared.noise_scale
+                    / float(self.srt_model.config.noise_scale_max_value),
                 )
                 timestep_embeddings = timestep_embeddings + self.srt_model.fm_modules[
                     "noise_scale_embedder"
-                ](noise_values).view(1, token_h * token_w, -1)
+                ](noise_values).view(1, prepared.token_h * prepared.token_w, -1)
             image_embeds = image_embeds + timestep_embeddings
 
             v_condition = self._predict_v(
-                prepared=prepared,
+                forward_context=prepared.condition,
                 image_embeds=image_embeds,
-                indexes_image=indexes_image,
                 timestep=timestep,
                 z=z,
             )
-            if not use_cfg or not needs_cfg:
-                v_pred = v_condition
-            elif cfg_img_scale == 1.0:
-                v_img_condition = self._predict_v(
-                    prepared=prepared_img_condition,
-                    image_embeds=image_embeds,
-                    indexes_image=indexes_image_img_condition,
-                    timestep=timestep,
-                    z=z,
-                )
-                v_pred = v_img_condition + cfg_text_scale * (
-                    v_condition - v_img_condition
-                )
-            elif cfg_text_scale == cfg_img_scale:
-                v_uncondition = self._predict_v(
-                    prepared=prepared_uncondition,
-                    image_embeds=image_embeds,
-                    indexes_image=indexes_image_uncondition,
-                    timestep=timestep,
-                    z=z,
-                )
-                v_pred = v_uncondition + cfg_text_scale * (v_condition - v_uncondition)
-            else:
-                v_img_condition = self._predict_v(
-                    prepared=prepared_img_condition,
-                    image_embeds=image_embeds,
-                    indexes_image=indexes_image_img_condition,
-                    timestep=timestep,
-                    z=z,
-                )
-                v_uncondition = self._predict_v(
-                    prepared=prepared_uncondition,
-                    image_embeds=image_embeds,
-                    indexes_image=indexes_image_uncondition,
-                    timestep=timestep,
-                    z=z,
-                )
-                v_pred = (
-                    v_uncondition
-                    + cfg_text_scale * (v_condition - v_img_condition)
-                    + cfg_img_scale * (v_img_condition - v_uncondition)
-                )
-            if needs_cfg and use_cfg:
+            use_cfg = _should_apply_cfg(prepared.cfg, timestep)
+            v_pred = self._combine_cfg_velocity(
+                prepared=prepared,
+                image_embeds=image_embeds,
+                timestep=timestep,
+                z=z,
+                v_condition=v_condition,
+                use_cfg=use_cfg,
+            )
+            if prepared.cfg.needs_cfg and use_cfg:
                 v_pred = self._apply_cfg_renorm(
                     v_condition=v_condition,
                     v_pred=v_pred,
-                    cfg_renorm_type=cfg_renorm_type,
+                    cfg_renorm_type=prepared.cfg.renorm_type,
                 )
 
             z = z + (next_timestep - timestep) * v_pred
             image_prediction = _u1_unpatchify(
                 z,
-                patch_size * merge_size,
-                height,
-                width,
+                prepared.patch_size * prepared.merge_size,
+                prepared.height,
+                prepared.width,
             )
+        return image_prediction
 
-        array = (
-            (image_prediction[0].float() * 0.5 + 0.5)
-            .clamp(0, 1)
-            .permute(1, 2, 0)
-            .detach()
-            .cpu()
-            .numpy()
+    def _combine_cfg_velocity(
+        self,
+        *,
+        prepared: _U1PixelFlowPrepared,
+        image_embeds: Any,
+        timestep: Any,
+        z: Any,
+        v_condition: Any,
+        use_cfg: bool,
+    ) -> Any:
+        cfg = prepared.cfg
+        if not use_cfg or not cfg.needs_cfg:
+            return v_condition
+        if cfg.img_scale == 1.0:
+            v_img_condition = self._predict_v(
+                forward_context=_require_forward_context(prepared.img_condition),
+                image_embeds=image_embeds,
+                timestep=timestep,
+                z=z,
+            )
+            return v_img_condition + cfg.text_scale * (v_condition - v_img_condition)
+        if cfg.text_scale == cfg.img_scale:
+            v_uncondition = self._predict_v(
+                forward_context=_require_forward_context(prepared.uncondition),
+                image_embeds=image_embeds,
+                timestep=timestep,
+                z=z,
+            )
+            return v_uncondition + cfg.text_scale * (v_condition - v_uncondition)
+
+        v_img_condition = self._predict_v(
+            forward_context=_require_forward_context(prepared.img_condition),
+            image_embeds=image_embeds,
+            timestep=timestep,
+            z=z,
         )
-        image = Image.fromarray((array * 255.0).round().astype(np.uint8), "RGB")
-        commit_image = {
-            "pixel_values": image_prediction.detach().to(torch.bfloat16).cpu(),
-            "value_range": "minus_one_to_one",
-            "grid_hw": gen_grid_hw[:1].detach().cpu(),
-        }
-        return UGGSegmentResult(
-            type="image",
-            image=image,
-            metadata={
-                "g_kind": "pixel_flow",
-                "native_srt_pixel_flow": True,
-                "temporary_g_kv": True,
-                "timesteps": steps,
-                "seed": seed,
-                "width": width,
-                "height": height,
-                "grid": (token_h, token_w),
-                "g_position_start": g_position_start,
-                "condition_position_count": g_position_start,
-                "cfg_img_condition_position_count": (cfg_img_condition_position_count),
-                "cfg_uncondition_position_count": cfg_uncondition_position_count,
-                "noise_scale": noise_scale,
-                "cfg_text_scale": cfg_text_scale,
-                "cfg_img_scale": cfg_img_scale,
-                "cfg_renorm_type": (cfg_renorm_type if needs_cfg else "none"),
-            },
-            commit_image=commit_image,
+        v_uncondition = self._predict_v(
+            forward_context=_require_forward_context(prepared.uncondition),
+            image_embeds=image_embeds,
+            timestep=timestep,
+            z=z,
+        )
+        return (
+            v_uncondition
+            + cfg.text_scale * (v_condition - v_img_condition)
+            + cfg.img_scale * (v_img_condition - v_uncondition)
         )
 
     def _predict_v(
         self,
         *,
-        prepared: Any,
+        forward_context: _U1PixelFlowForwardContext,
         image_embeds: Any,
-        indexes_image: Any,
         timestep: Any,
         z: Any,
     ) -> Any:
         forward_batch_context = self.forward_batch_provider(
-            prepared=prepared,
+            prepared=forward_context.prepared,
             g_query_embeds=image_embeds,
             timestep=timestep,
         )
@@ -529,7 +539,7 @@ class _SenseNovaU1NativePixelFlowRunner:
             return _predict_u1_pixel_flow_from_srt(
                 self.srt_model,
                 image_embeds=image_embeds,
-                indexes_image=indexes_image,
+                indexes_image=forward_context.indexes_image,
                 forward_batch=forward_batch,
                 timestep=timestep,
                 z=z,
@@ -561,6 +571,129 @@ class _SenseNovaU1NativePixelFlowRunner:
             )
         scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
         return v_pred * scale
+
+
+class _SenseNovaU1PixelFlowDecodeStage:
+    def forward(
+        self,
+        prepared: _U1PixelFlowPrepared,
+        image_prediction: Any,
+    ) -> UGGSegmentResult:
+        import numpy as np
+        import torch
+        from PIL import Image
+
+        array = (
+            (image_prediction[0].float() * 0.5 + 0.5)
+            .clamp(0, 1)
+            .permute(1, 2, 0)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        image = Image.fromarray((array * 255.0).round().astype(np.uint8), "RGB")
+        commit_image = {
+            "pixel_values": image_prediction.detach().to(torch.bfloat16).cpu(),
+            "value_range": "minus_one_to_one",
+            "grid_hw": prepared.gen_grid_hw[:1].detach().cpu(),
+        }
+        cfg = prepared.cfg
+        return UGGSegmentResult(
+            type="image",
+            image=image,
+            metadata={
+                "g_kind": "pixel_flow",
+                "native_srt_pixel_flow": True,
+                "temporary_g_kv": True,
+                "timesteps": prepared.steps,
+                "seed": prepared.seed,
+                "width": prepared.width,
+                "height": prepared.height,
+                "grid": (prepared.token_h, prepared.token_w),
+                "g_position_start": prepared.condition.position_count,
+                "condition_position_count": prepared.condition.position_count,
+                "cfg_img_condition_position_count": (
+                    _forward_context_position(prepared.img_condition)
+                ),
+                "cfg_uncondition_position_count": _forward_context_position(
+                    prepared.uncondition
+                ),
+                "noise_scale": prepared.noise_scale,
+                "cfg_text_scale": cfg.text_scale,
+                "cfg_img_scale": cfg.img_scale,
+                "cfg_renorm_type": cfg.renorm_type if cfg.needs_cfg else "none",
+            },
+            commit_image=commit_image,
+        )
+
+
+def _resolve_pixel_flow_cfg(sampling_params: Any) -> _U1PixelFlowCFG:
+    text_scale = float(getattr(sampling_params, "cfg_text_scale", 1.0))
+    img_scale = float(getattr(sampling_params, "cfg_img_scale", 1.0))
+    needs_cfg = not (text_scale == 1.0 and img_scale == 1.0)
+    cfg_interval = list(getattr(sampling_params, "cfg_interval", [0.0, 1.0]))
+    if len(cfg_interval) != 2:
+        raise ValueError("SenseNova U1 pixel-flow cfg_interval must have two values")
+    return _U1PixelFlowCFG(
+        text_scale=text_scale,
+        img_scale=img_scale,
+        needs_cfg=needs_cfg,
+        needs_img_condition=needs_cfg and (img_scale == 1.0 or text_scale != img_scale),
+        needs_uncondition=needs_cfg and img_scale != 1.0,
+        start=float(cfg_interval[0]),
+        end=float(cfg_interval[1]),
+        renorm_type=str(getattr(sampling_params, "cfg_renorm_type", "none")),
+    )
+
+
+def _build_pixel_flow_forward_context(
+    srt_context: _SRTGContext,
+    *,
+    token_h: int,
+    token_w: int,
+    packed_seqlens: Any,
+    device: Any,
+) -> _U1PixelFlowForwardContext:
+    position_count = int(srt_context.position_count)
+    indexes_image = _u1_build_t2i_image_indexes(
+        token_h=token_h,
+        token_w=token_w,
+        text_len=position_count,
+        device=device,
+    )
+    prepared = SimpleNamespace(
+        generation_input={
+            "packed_seqlens": packed_seqlens,
+            "packed_position_ids": indexes_image,
+        },
+        srt_session_id=srt_context.session_id,
+        srt_sidecar_role=srt_context.sidecar_role,
+    )
+    return _U1PixelFlowForwardContext(
+        prepared=prepared,
+        indexes_image=indexes_image,
+        position_count=position_count,
+    )
+
+
+def _should_apply_cfg(cfg: _U1PixelFlowCFG, timestep: Any) -> bool:
+    return (float(timestep) > cfg.start and float(timestep) < cfg.end) or (
+        cfg.start == 0.0
+    )
+
+
+def _require_forward_context(
+    context: _U1PixelFlowForwardContext | None,
+) -> _U1PixelFlowForwardContext:
+    if context is None:
+        raise RuntimeError("SenseNova U1 pixel-flow CFG forward context is missing")
+    return context
+
+
+def _forward_context_position(context: _U1PixelFlowForwardContext | None) -> int | None:
+    if context is None:
+        return None
+    return context.position_count
 
 
 def _batch_image_size(batch: Any) -> tuple[int, int]:
