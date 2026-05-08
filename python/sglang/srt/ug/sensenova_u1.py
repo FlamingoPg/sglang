@@ -43,6 +43,7 @@ from sglang.srt.ug.adapter import (
     UGModelRunnerAdapter,
 )
 from sglang.srt.ug.context import UGContextBundle
+from sglang.srt.ug.coordinator import UGInterleaveCoordinator
 from sglang.srt.ug.interleaved import (
     DEFAULT_UG_TEXT_MAX_NEW_TOKENS,
     UGGKind,
@@ -131,6 +132,10 @@ class SenseNovaU1UGCoordinator:
             if g_segment_executor is not None
             else SenseNovaU1PixelFlowGSegmentExecutor()
         )
+        self._coordinator = UGInterleaveCoordinator(
+            bridge=self.bridge,
+            g_segment_executor=self.g_segment_executor,
+        )
 
     def forward_interleaved(
         self,
@@ -180,26 +185,12 @@ class SenseNovaU1UGCoordinator:
             batch.extra["ug_pre_image_segments"] = contexts.full.metadata.get(
                 "pre_image_segments", []
             )
-            if metadata["mode"] == "interleave":
-                output_segments = self._run_interleave_loop(
-                    batch=batch,
-                    contexts=contexts,
-                    server_args=server_args,
-                    metadata=metadata,
-                )
-            else:
-                generated_segment = self._run_g_segment(
-                    batch=batch,
-                    contexts=contexts,
-                    server_args=server_args,
-                )
-                output_segments = [
-                    {
-                        "type": "image",
-                        "image": generated_segment.image,
-                        "metadata": dict(generated_segment.metadata),
-                    }
-                ]
+            output_segments = self._coordinator.run_generation(
+                batch=batch,
+                contexts=contexts,
+                server_args=server_args,
+                metadata=metadata,
+            )
             return UGInterleavedResponse.from_legacy_segments(
                 output_segments,
                 stats=_collect_interleaved_runtime_stats(self.bridge, contexts),
@@ -290,87 +281,6 @@ class SenseNovaU1UGCoordinator:
         finally:
             if runtime is not None:
                 runtime.close_session(result.session)
-
-    def _run_interleave_loop(
-        self,
-        *,
-        batch: Req,
-        contexts: UGContextBundle,
-        server_args: Any,
-        metadata: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        output_segments = list(batch.extra.get("ug_pre_image_segments", []))
-        max_images = _resolve_positive_metadata_int(
-            metadata,
-            "max_interleave_images",
-            default=1,
-        )
-        max_text_segments = _resolve_positive_metadata_int(
-            metadata,
-            "max_interleave_text_segments",
-            default=1,
-        )
-
-        for _ in range(max_images):
-            generated_segment = self._run_g_segment(
-                batch=batch,
-                contexts=contexts,
-                server_args=server_args,
-            )
-            output_segments.append(
-                {
-                    "type": "image",
-                    "image": generated_segment.image,
-                    "metadata": dict(generated_segment.metadata),
-                }
-            )
-            self.bridge.commit_generated_segment(
-                contexts=contexts,
-                segment=generated_segment,
-            )
-
-            next_image_requested = False
-            for _ in range(max_text_segments):
-                post_segment = self.bridge.continue_u_decode(contexts=contexts)
-                if post_segment.type == "text":
-                    segment = {"type": "text", "text": post_segment.text or ""}
-                    if post_segment.token_ids:
-                        segment["metadata"] = {
-                            "token_ids": [
-                                int(token_id) for token_id in post_segment.token_ids
-                            ]
-                        }
-                    output_segments.append(segment)
-                    continue
-                if post_segment.type == "image_marker":
-                    next_image_requested = True
-                    break
-                if post_segment.type == "done":
-                    return output_segments
-                raise ValueError(
-                    "SenseNova U1 interleave expected U text, image marker, "
-                    f"or done, got {post_segment.type}"
-                )
-            if not next_image_requested:
-                break
-        return output_segments
-
-    def _run_g_segment(
-        self,
-        *,
-        batch: Req,
-        contexts: UGContextBundle,
-        server_args: Any,
-    ) -> Any:
-        return self.bridge.run_g_segment(
-            contexts=contexts,
-            executor=lambda run_contexts: self.g_segment_executor(
-                bridge=self.bridge,
-                contexts=run_contexts,
-                batch=batch,
-                server_args=server_args,
-            ),
-        )
 
 
 class U1UGModelAdapter:
@@ -1108,9 +1018,7 @@ def _normalize_u1_interleaved_messages(
             elif not isinstance(content, Image.Image):
                 content = load_image(content)
         else:
-            raise ValueError(
-                f"Unsupported SenseNova U1 message type: {message_type!r}"
-            )
+            raise ValueError(f"Unsupported SenseNova U1 message type: {message_type!r}")
         if content is None:
             raise ValueError(f"SenseNova U1 {message_type} message is missing content")
         normalized.append(UGInterleavedMessage(type=message_type, content=content))
@@ -1135,18 +1043,6 @@ def _resolve_vlm_max_new_tokens(
         raise ValueError(
             f"SenseNova U1 VLM max_new_tokens must be positive, got {value}"
         )
-    return value
-
-
-def _resolve_positive_metadata_int(
-    metadata: dict[str, Any],
-    key: str,
-    *,
-    default: int,
-) -> int:
-    value = int(metadata.get(key, default))
-    if value <= 0:
-        raise ValueError(f"SenseNova U1 metadata {key} must be positive, got {value}")
     return value
 
 
