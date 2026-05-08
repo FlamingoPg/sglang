@@ -15,7 +15,7 @@ class UGSRTSchedulerExecutorError(RuntimeError):
 
 @dataclass
 class UGSRTTemporaryForwardBatch:
-    """ForwardBatch wrapper that releases temporary G-step scheduler state."""
+    """ForwardBatch wrapper that releases temporary context-query scheduler state."""
 
     forward_batch: Any
     req_to_token_pool: Any
@@ -67,30 +67,35 @@ class UGSRTSchedulerExecutor:
         self.require_idle_scheduler = require_idle_scheduler
         self.token_bindings: list[UGSRTKVTokenBinding] = []
         self._request_token_bindings: dict[str, UGSRTKVTokenBinding] = {}
-        self.ug_u_forward_observer = None
+        self.session_forward_observer = None
         self.sync_step_count = 0
-        self.temp_g_forward_count = 0
-        self.temp_g_allocated_token_count = 0
+        self.temporary_context_forward_count = 0
+        self.temporary_context_allocated_token_count = 0
 
     @property
     def session_controller(self):
         return self.scheduler.session_controller
 
-    def set_ug_u_forward_observer(self, observer) -> None:
-        self.ug_u_forward_observer = observer
+    def set_session_forward_observer(self, observer) -> None:
+        self.session_forward_observer = observer
         model_runner = self._model_runner()
         if model_runner is None:
             return
-        setter = getattr(model_runner, "set_ug_u_forward_observer", None)
+        setter = getattr(model_runner, "set_session_forward_observer", None)
+        if not callable(setter):
+            setter = getattr(model_runner, "set_ug_u_forward_observer", None)
         if callable(setter):
             setter(observer)
         else:
-            model_runner.ug_u_forward_observer = observer
+            model_runner.session_forward_observer = observer
+
+    def set_ug_u_forward_observer(self, observer) -> None:
+        self.set_session_forward_observer(observer)
 
     def execute_ug_request(self, *, record, req, state) -> None:
         del record, state
-        if self.ug_u_forward_observer is not None:
-            self.set_ug_u_forward_observer(self.ug_u_forward_observer)
+        if self.session_forward_observer is not None:
+            self.set_session_forward_observer(self.session_forward_observer)
         self._check_scheduler_idle(req)
         if hasattr(self.scheduler, "init_req_max_new_tokens"):
             self.scheduler.init_req_max_new_tokens(req)
@@ -102,7 +107,7 @@ class UGSRTSchedulerExecutor:
         if self.run_synchronously:
             self._run_until_request_complete(req)
 
-    def get_ug_request_token_binding(
+    def get_request_token_binding(
         self,
         *,
         record,
@@ -124,6 +129,15 @@ class UGSRTSchedulerExecutor:
             position_count=self._request_position_count(req),
         )
 
+    def get_ug_request_token_binding(
+        self,
+        *,
+        record,
+        req,
+        state,
+    ) -> UGSRTKVTokenBinding | None:
+        return self.get_request_token_binding(record=record, req=req, state=state)
+
     def get_srt_model(self) -> Any:
         """Return the SRT model owned by the attached scheduler's ModelRunner."""
         model_runner = self._require_model_runner()
@@ -134,13 +148,13 @@ class UGSRTSchedulerExecutor:
             )
         return srt_model
 
-    def get_latest_ug_session_position_count(
+    def get_latest_session_position_count(
         self,
         session_id: str,
         *,
         sidecar_role: str | None = None,
     ) -> int | None:
-        binding = self.get_latest_ug_session_token_binding(
+        binding = self.get_latest_session_token_binding(
             self._binding_session_id(session_id, sidecar_role)
         )
         if binding is None:
@@ -150,7 +164,18 @@ class UGSRTSchedulerExecutor:
             return int(position_count)
         return int(getattr(binding, "token_count"))
 
-    def get_latest_ug_session_token_binding(
+    def get_latest_ug_session_position_count(
+        self,
+        session_id: str,
+        *,
+        sidecar_role: str | None = None,
+    ) -> int | None:
+        return self.get_latest_session_position_count(
+            session_id,
+            sidecar_role=sidecar_role,
+        )
+
+    def get_latest_session_token_binding(
         self,
         session_id: str,
     ) -> UGSRTKVTokenBinding | None:
@@ -158,6 +183,12 @@ class UGSRTSchedulerExecutor:
             if binding.session_id == session_id:
                 return binding
         return None
+
+    def get_latest_ug_session_token_binding(
+        self,
+        session_id: str,
+    ) -> UGSRTKVTokenBinding | None:
+        return self.get_latest_session_token_binding(session_id)
 
     def pad_input_ids(self, input_ids: list[int], mm_inputs: Any) -> list[int]:
         model_runner = self._require_model_runner()
@@ -167,7 +198,7 @@ class UGSRTSchedulerExecutor:
             return list(input_ids)
         return pad_input_ids(list(input_ids), mm_inputs)
 
-    def build_ug_g_forward_batch_for_session(
+    def build_temporary_context_forward_batch_for_session(
         self,
         *,
         prepared: Any,
@@ -177,76 +208,89 @@ class UGSRTSchedulerExecutor:
         session_id = getattr(prepared, "srt_session_id", None)
         if session_id is None:
             raise UGSRTSchedulerExecutorError(
-                "UG G forward requires prepared.srt_session_id"
+                "Temporary context forward requires prepared.srt_session_id"
             )
         sidecar_role = getattr(prepared, "srt_sidecar_role", None)
         binding_session_id = self._binding_session_id(session_id, sidecar_role)
-        binding = self.get_latest_ug_session_token_binding(binding_session_id)
+        binding = self.get_latest_session_token_binding(binding_session_id)
         if binding is None:
             raise UGSRTSchedulerExecutorError(
-                "UG G forward has no SRT KV token binding for session "
+                "Temporary context forward has no SRT KV token binding for session "
                 f"{binding_session_id}"
             )
         prepared_data = dict(getattr(prepared, "__dict__", {}))
         prepared_data["srt_kv_token_binding"] = binding
         prepared_with_binding = SimpleNamespace(**prepared_data)
-        return self.build_ug_g_forward_batch(
+        return self.build_temporary_context_forward_batch(
             prepared=prepared_with_binding,
             g_query_embeds=g_query_embeds,
             timestep=timestep,
         )
 
-    def build_ug_g_forward_batch(
+    def build_ug_g_forward_batch_for_session(
         self,
         *,
         prepared: Any,
         g_query_embeds: torch.Tensor,
         timestep: torch.Tensor,
     ) -> UGSRTTemporaryForwardBatch:
-        """Build a temporary extend batch for one UG G generation step.
+        return self.build_temporary_context_forward_batch_for_session(
+            prepared=prepared,
+            g_query_embeds=g_query_embeds,
+            timestep=timestep,
+        )
 
-        The batch reuses the U session's committed KV indices as prefix context, but
-        allocates fresh request/query KV slots for this timestep and releases them as
-        soon as the native G forward returns.
+    def build_temporary_context_forward_batch(
+        self,
+        *,
+        prepared: Any,
+        g_query_embeds: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> UGSRTTemporaryForwardBatch:
+        """Build a temporary extend batch that reads a committed SRT context.
+
+        The batch reuses the session's committed KV indices as prefix context, but
+        allocates fresh request/query KV slots for this query and releases them as
+        soon as the caller returns.
         """
 
         del g_query_embeds, timestep
-        self._check_scheduler_idle_for_temp_g()
+        self._check_scheduler_idle_for_temporary_context()
         model_runner = self._require_model_runner()
         req_to_token_pool = self._require_attr(
             model_runner,
             "req_to_token_pool",
-            "UG G forward requires model_runner.req_to_token_pool",
+            "Temporary context forward requires model_runner.req_to_token_pool",
         )
         token_to_kv_pool_allocator = self._require_attr(
             model_runner,
             "token_to_kv_pool_allocator",
-            "UG G forward requires model_runner.token_to_kv_pool_allocator",
+            "Temporary context forward requires model_runner.token_to_kv_pool_allocator",
         )
         attn_backend = self._require_attr(
             model_runner,
             "attn_backend",
-            "UG G forward requires model_runner.attn_backend",
+            "Temporary context forward requires model_runner.attn_backend",
         )
 
         binding = getattr(prepared, "srt_kv_token_binding", None)
         if binding is None:
             raise UGSRTSchedulerExecutorError(
-                "UG G forward requires prepared.srt_kv_token_binding"
+                "Temporary context forward requires prepared.srt_kv_token_binding"
             )
         prefix_indices = getattr(binding, "token_indices", None)
         if prefix_indices is None:
             raise UGSRTSchedulerExecutorError(
-                "UG G forward requires SRT token indices on the U context binding"
+                "Temporary context forward requires SRT token indices on the context binding"
             )
         prefix_len = int(getattr(binding, "token_count", 0) or 0)
         if prefix_len < 0:
             raise UGSRTSchedulerExecutorError(
-                "UG G forward binding token_count cannot be negative"
+                "Temporary context forward binding token_count cannot be negative"
             )
         if int(prefix_indices.numel()) < prefix_len:
             raise UGSRTSchedulerExecutorError(
-                "UG G forward binding token_count exceeds token_indices length"
+                "Temporary context forward binding token_count exceeds token_indices length"
             )
 
         generation_input = getattr(prepared, "generation_input", None) or {}
@@ -254,16 +298,16 @@ class UGSRTSchedulerExecutor:
         packed_position_ids = generation_input.get("packed_position_ids")
         if packed_seqlens is None or packed_position_ids is None:
             raise UGSRTSchedulerExecutorError(
-                "UG G forward requires packed_seqlens and packed_position_ids"
+                "Temporary context forward requires packed_seqlens and packed_position_ids"
             )
         if int(packed_seqlens.numel()) != 1:
             raise UGSRTSchedulerExecutorError(
-                "UG G temporary batch currently supports one packed G sequence"
+                "Temporary context forward currently supports one packed query sequence"
             )
         extend_num_tokens = int(packed_seqlens.to("cpu").sum().item())
         if extend_num_tokens <= 0:
             raise UGSRTSchedulerExecutorError(
-                "UG G forward requires at least one timestep query token"
+                "Temporary context forward requires at least one query token"
             )
         position_token_count = (
             int(packed_position_ids.shape[-1])
@@ -272,7 +316,7 @@ class UGSRTSchedulerExecutor:
         )
         if position_token_count != extend_num_tokens:
             raise UGSRTSchedulerExecutorError(
-                "UG G packed_position_ids must match packed_seqlens"
+                "Temporary context forward packed_position_ids must match packed_seqlens"
             )
 
         device = torch.device(getattr(model_runner, "device", req_to_token_pool.device))
@@ -289,7 +333,7 @@ class UGSRTSchedulerExecutor:
         owned_cache_loc = None
         context = None
         try:
-            out_cache_loc, owned_cache_loc = self._alloc_temp_g_cache(
+            out_cache_loc, owned_cache_loc = self._alloc_temporary_context_cache(
                 model_runner=model_runner,
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
                 prefix_indices=prefix_indices,
@@ -306,7 +350,7 @@ class UGSRTSchedulerExecutor:
                 prefix_len=prefix_len,
                 seq_len=seq_len,
             )
-            forward_batch = self._make_temp_g_forward_batch(
+            forward_batch = self._make_temporary_context_forward_batch(
                 model_runner=model_runner,
                 req_to_token_pool=req_to_token_pool,
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
@@ -336,8 +380,8 @@ class UGSRTSchedulerExecutor:
             if callable(prepare_forward_batch):
                 prepare_forward_batch(forward_batch)
             attn_backend.init_forward_metadata(forward_batch)
-            self.temp_g_forward_count += 1
-            self.temp_g_allocated_token_count += extend_num_tokens
+            self.temporary_context_forward_count += 1
+            self.temporary_context_allocated_token_count += extend_num_tokens
             return context
         except Exception:
             if context is not None:
@@ -420,7 +464,7 @@ class UGSRTSchedulerExecutor:
             f"enqueuing request {req.rid}"
         )
 
-    def _check_scheduler_idle_for_temp_g(self) -> None:
+    def _check_scheduler_idle_for_temporary_context(self) -> None:
         if not self.require_idle_scheduler:
             return
         if not hasattr(self.scheduler, "is_fully_idle"):
@@ -428,7 +472,7 @@ class UGSRTSchedulerExecutor:
         if self.scheduler.is_fully_idle():
             return
         raise UGSRTSchedulerExecutorError(
-            "UG temporary G forward requires an idle scheduler before borrowing "
+            "Temporary context forward requires an idle scheduler before borrowing "
             "ModelRunner KV slots"
         )
 
@@ -454,7 +498,7 @@ class UGSRTSchedulerExecutor:
             return
         if seq_len > int(max_context_len):
             raise UGSRTSchedulerExecutorError(
-                "UG G temporary batch exceeds req_to_token_pool.max_context_len: "
+                "Temporary context forward exceeds req_to_token_pool.max_context_len: "
                 f"{seq_len} > {max_context_len}"
             )
 
@@ -485,7 +529,7 @@ class UGSRTSchedulerExecutor:
         req_pool_indices = req_to_token_pool.alloc([temp_req])
         if req_pool_indices is None:
             raise UGSRTSchedulerExecutorError(
-                "UG G temporary batch could not allocate a req_to_token slot"
+                "Temporary context forward could not allocate a req_to_token slot"
             )
         if temp_req.req_pool_idx is None:
             temp_req.req_pool_idx = int(req_pool_indices[0])
@@ -504,7 +548,7 @@ class UGSRTSchedulerExecutor:
             if getattr(temp_req, "req_pool_idx", None) is not None:
                 req_to_token_pool.free(temp_req)
 
-    def _alloc_temp_g_cache(
+    def _alloc_temporary_context_cache(
         self,
         *,
         model_runner: Any,
@@ -524,7 +568,7 @@ class UGSRTSchedulerExecutor:
             )
         )
         owned_num_tokens = self._ceil_to_page(extend_num_tokens, page_size)
-        self._evict_for_temp_g(
+        self._evict_for_temporary_context(
             tree_cache,
             extend_num_tokens=owned_num_tokens,
             page_size=page_size,
@@ -532,7 +576,7 @@ class UGSRTSchedulerExecutor:
         owned_cache_loc = token_to_kv_pool_allocator.alloc(owned_num_tokens)
         if owned_cache_loc is None:
             raise UGSRTSchedulerExecutorError(
-                "UG G temporary batch could not allocate KV cache slots"
+                "Temporary context forward could not allocate KV cache slots"
             )
         owned_cache_loc = owned_cache_loc.to(
             device=device,
@@ -549,7 +593,7 @@ class UGSRTSchedulerExecutor:
         return ((num_tokens + page_size - 1) // page_size) * page_size
 
     @staticmethod
-    def _evict_for_temp_g(
+    def _evict_for_temporary_context(
         tree_cache: Any,
         *,
         extend_num_tokens: int,
@@ -594,7 +638,7 @@ class UGSRTSchedulerExecutor:
         )
 
     @staticmethod
-    def _make_temp_g_forward_batch(
+    def _make_temporary_context_forward_batch(
         *,
         model_runner: Any,
         req_to_token_pool: Any,
@@ -672,9 +716,9 @@ class UGSRTSchedulerExecutor:
             all_extend_in_batch=True,
             global_forward_mode=ForwardMode.EXTEND,
             is_prefill_only=True,
-            rids=[f"{binding.session_id}:ug_g_temp"],
+            rids=[f"{binding.session_id}:temporary_context"],
         )
-        forward_batch.ug_g_forward_metadata = {
+        forward_batch.temporary_context_forward_metadata = {
             "session_id": binding.session_id,
             "request_id": binding.request_id,
             "prefix_len": prefix_len,
@@ -803,18 +847,18 @@ class UGSRTSchedulerExecutor:
     @staticmethod
     def _request_position_count(req: Any) -> int | None:
         position_count = UGSRTSchedulerExecutor._position_count_from_position_ids(
-            getattr(req, "ug_position_ids", None)
+            getattr(req, "custom_position_ids", None)
         )
         if position_count is not None:
             return position_count
 
-        metadata = getattr(req, "ug_u_forward_metadata", {}) or {}
+        metadata = getattr(req, "session_forward_metadata", {}) or {}
         adapter_metadata = metadata.get("adapter_metadata") or {}
         position_count = adapter_metadata.get("ug_srt_position_count")
         if position_count is not None:
             return int(position_count)
 
-        decode_position_id = getattr(req, "ug_decode_position_id", None)
+        decode_position_id = getattr(req, "custom_decode_position_id", None)
         if decode_position_id is not None:
             return int(decode_position_id) + 1
         return None

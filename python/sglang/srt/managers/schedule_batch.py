@@ -1394,7 +1394,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
     custom_position_ids: Optional[torch.Tensor] = None
-    ug_decode_position_ids: Optional[torch.Tensor] = None
+    custom_decode_position_ids: Optional[torch.Tensor] = None
     ne_token_table: torch.Tensor = None
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
@@ -1745,7 +1745,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         has_replace_embeds = False
         custom_position_ids = []
         has_custom_position_ids = any(
-            getattr(req, "ug_position_ids", None) is not None for req in reqs
+            getattr(req, "custom_position_ids", None) is not None for req in reqs
         )
         input_id_pointer = 0
         input_id_lens = [len(input_id) for input_id in input_ids]
@@ -1793,11 +1793,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
                     all_replace_positions.extend(positions)
 
-            req_ug_replace_embeds = getattr(req, "ug_replace_embeds", None)
-            req_ug_replace_positions = getattr(req, "ug_replace_positions", None)
-            if req_ug_replace_embeds is not None:
+            req_context_replace_embeds = getattr(req, "context_replace_embeds", None)
+            req_context_replace_positions = getattr(
+                req, "context_replace_positions", None
+            )
+            if req_context_replace_embeds is not None:
                 embeds_to_add = []
-                for embed_idx, pos in enumerate(req_ug_replace_positions or []):
+                for embed_idx, pos in enumerate(req_context_replace_positions or []):
                     extend_pos = pos - pre_len
                     if extend_pos < 0 or extend_pos >= req.extend_input_len:
                         continue
@@ -1806,11 +1808,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     has_replace_embeds = True
                     indices, positions = zip(*embeds_to_add)
                     all_replace_embeds.append(
-                        torch.tensor(req_ug_replace_embeds)[list(indices)]
+                        torch.tensor(req_context_replace_embeds)[list(indices)]
                     )
                     all_replace_positions.extend(positions)
 
-            req_custom_position_ids = getattr(req, "ug_position_ids", None)
+            req_custom_position_ids = getattr(req, "custom_position_ids", None)
             if req_custom_position_ids is not None:
                 custom_position_ids.extend(
                     req_custom_position_ids[pre_len : pre_len + req.extend_input_len]
@@ -1948,7 +1950,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if has_custom_position_ids
             else None
         )
-        self.ug_decode_position_ids = None
+        self.custom_decode_position_ids = None
         for mm_input in multimodal_inputs:
             if mm_input is None:
                 continue
@@ -2312,9 +2314,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
         self.custom_position_ids = None
-        self.ug_decode_position_ids = None
+        self.custom_decode_position_ids = None
         decode_position_ids = [
-            getattr(req, "ug_decode_position_id", None) for req in self.reqs
+            getattr(req, "custom_decode_position_id", None) for req in self.reqs
         ]
         if any(position is not None for position in decode_position_ids):
             if self.seq_lens_cpu is not None:
@@ -2324,7 +2326,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     int(getattr(req, "seqlen", len(req.origin_input_ids))) - 1
                     for req in self.reqs
                 ]
-            self.ug_decode_position_ids = torch.tensor(
+            self.custom_decode_position_ids = torch.tensor(
                 [
                     int(position) if position is not None else fallback_position
                     for position, fallback_position in zip(
@@ -2334,7 +2336,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.int64,
                 device=self.device,
             )
-            self.custom_position_ids = self.ug_decode_position_ids
+            self.custom_position_ids = self.custom_decode_position_ids
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -2635,7 +2637,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             replace_embeds=self.replace_embeds,
             replace_positions=self.replace_positions,
             custom_position_ids=self.custom_position_ids,
-            ug_decode_position_ids=self.ug_decode_position_ids,
+            custom_decode_position_ids=self.custom_decode_position_ids,
             ne_token_table=self.ne_token_table,
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
@@ -2660,8 +2662,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
             reqs=self.reqs,
-            ug_u_forward_metadata=[
-                getattr(req, "ug_u_forward_metadata", None) for req in self.reqs
+            session_forward_metadata=[
+                getattr(req, "session_forward_metadata", None) for req in self.reqs
             ],
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
@@ -2836,7 +2838,7 @@ class ModelWorkerBatch:
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
     custom_position_ids: Optional[torch.Tensor] = None
-    ug_decode_position_ids: Optional[torch.Tensor] = None
+    custom_decode_position_ids: Optional[torch.Tensor] = None
 
     # token table for ngram embedding
     ne_token_table: Optional[torch.Tensor] = None
@@ -2872,7 +2874,7 @@ class ModelWorkerBatch:
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
-    ug_u_forward_metadata: Optional[List[Dict[str, Any]]] = None
+    session_forward_metadata: Optional[List[Dict[str, Any]]] = None
     has_grammar: bool = False
 
     # For hidden states before normal

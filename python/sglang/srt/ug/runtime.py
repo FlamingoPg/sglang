@@ -178,9 +178,15 @@ class UGSessionRuntime:
         self._records: dict[str, UGSessionRecord] = {}
         register_observer = getattr(
             self.srt_request_executor,
-            "set_ug_u_forward_observer",
+            "set_session_forward_observer",
             None,
         )
+        if not callable(register_observer):
+            register_observer = getattr(
+                self.srt_request_executor,
+                "set_ug_u_forward_observer",
+                None,
+            )
         if callable(register_observer):
             register_observer(self._observe_srt_u_forward_from_model_runner)
 
@@ -343,7 +349,7 @@ class UGSessionRuntime:
                 raise RuntimeError(
                     "UG SRT U decode commit requires a non-empty token input"
                 )
-            req.ug_position_ids = list(range(prefix_len)) + [int(position_id)]
+            req.custom_position_ids = list(range(prefix_len)) + [int(position_id)]
         self._record_srt_req(record, req, request_id=request_id)
         adapter_metadata = {
             "ug_srt_added_token_count": 1,
@@ -761,19 +767,19 @@ class UGSessionRuntime:
                     continue
                 shifted_embeds.append(embed)
                 shifted_positions.append(prefix_len + position - stripped)
-            req.ug_replace_embeds = shifted_embeds
-            req.ug_replace_positions = shifted_positions
+            req.context_replace_embeds = shifted_embeds
+            req.context_replace_positions = shifted_positions
 
         if prepared.position_ids is not None:
             suffix_positions = prepared.position_ids[stripped:]
             if self._uses_multidim_positions(suffix_positions):
-                req.ug_position_ids = self._full_multidim_positions(
+                req.custom_position_ids = self._full_multidim_positions(
                     prefix_len=prefix_len,
                     suffix_positions=suffix_positions,
                 )
                 self._install_multidim_mm_positions(req)
             else:
-                req.ug_position_ids = list(range(prefix_len)) + [
+                req.custom_position_ids = list(range(prefix_len)) + [
                     int(position) for position in suffix_positions
                 ]
 
@@ -811,7 +817,7 @@ class UGSessionRuntime:
     @staticmethod
     def _install_multidim_mm_positions(req: Any) -> None:
         mm_inputs = getattr(req, "multimodal_inputs", None)
-        positions = getattr(req, "ug_position_ids", None)
+        positions = getattr(req, "custom_position_ids", None)
         if mm_inputs is None or not positions:
             return
         if not isinstance(positions[0], (list, tuple)):
@@ -873,19 +879,19 @@ class UGSessionRuntime:
                 raise RuntimeError(
                     "UG SRT U decode input length is inconsistent with session request"
                 )
-            req.ug_position_ids = list(range(prefix_len)) + [
+            req.custom_position_ids = list(range(prefix_len)) + [
                 int(position) for position in position_ids
             ]
         if decode_position_id is not None:
-            req.ug_decode_position_id = int(decode_position_id)
+            req.custom_decode_position_id = int(decode_position_id)
             if not input_ids:
                 if not req.origin_input_ids:
                     raise RuntimeError(
                         "UG SRT U decode_position_id requires a non-empty "
                         "session context"
                     )
-                req.ug_position_ids = list(range(len(req.origin_input_ids)))
-                req.ug_position_ids[-1] = int(decode_position_id)
+                req.custom_position_ids = list(range(len(req.origin_input_ids)))
+                req.custom_position_ids[-1] = int(decode_position_id)
         self._record_srt_req(record, req, request_id=request_id)
         adapter_metadata = {
             "ug_srt_added_token_count": len(input_ids),
@@ -1004,7 +1010,7 @@ class UGSessionRuntime:
         messages: list[UGInterleavedMessage],
         adapter_metadata: dict[str, Any] | None = None,
     ) -> None:
-        req.ug_u_forward_metadata = {
+        req.session_forward_metadata = {
             "session": record.handle(),
             "state": state.value,
             "request_id": req.rid,
@@ -1113,7 +1119,7 @@ class UGSessionRuntime:
         state: UGSegmentState,
     ) -> dict[str, Any]:
         metadata = dict(
-            getattr(req, "ug_u_forward_metadata", {}).get("adapter_metadata", {})
+            getattr(req, "session_forward_metadata", {}).get("adapter_metadata", {})
         )
         metadata.setdefault(
             "ug_model_state", self._copy_ug_model_state(record.ug_model_state)
@@ -1172,8 +1178,12 @@ class UGSessionRuntime:
         state: UGSegmentState,
     ) -> UGSRTKVTokenBinding | None:
         provider = getattr(
-            self.srt_request_executor, "get_ug_request_token_binding", None
+            self.srt_request_executor, "get_request_token_binding", None
         )
+        if not callable(provider):
+            provider = getattr(
+                self.srt_request_executor, "get_ug_request_token_binding", None
+            )
         if not callable(provider):
             return None
 

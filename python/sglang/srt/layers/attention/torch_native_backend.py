@@ -402,7 +402,7 @@ class TorchNativeAttnBackend(AttentionBackend):
 
     @staticmethod
     def _should_use_u1_reference_eager(forward_batch: ForwardBatch) -> bool:
-        metadata = getattr(forward_batch, "ug_u_forward_metadata", None)
+        metadata = getattr(forward_batch, "session_forward_metadata", None)
         if not metadata:
             return False
         for item in metadata:

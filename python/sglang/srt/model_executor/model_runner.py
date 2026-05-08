@@ -389,7 +389,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
-        self.ug_u_forward_observer = None
+        self.session_forward_observer = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
@@ -3384,17 +3384,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
 
-        self._notify_ug_u_forward_observer(forward_batch)
+        self._notify_session_forward_observer(forward_batch)
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
-    def set_ug_u_forward_observer(self, observer: Callable | None) -> None:
-        self.ug_u_forward_observer = observer
+    def set_session_forward_observer(self, observer: Callable | None) -> None:
+        self.session_forward_observer = observer
 
-    def _notify_ug_u_forward_observer(self, forward_batch: ForwardBatch) -> None:
-        observer = self.ug_u_forward_observer
+    def _notify_session_forward_observer(self, forward_batch: ForwardBatch) -> None:
+        observer = self.session_forward_observer
         if observer is None:
             return
-        metadata_list = getattr(forward_batch, "ug_u_forward_metadata", None)
+        metadata_list = getattr(forward_batch, "session_forward_metadata", None)
         if not metadata_list:
             return
 
@@ -3407,7 +3407,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 continue
 
             session = metadata["session"]
-            token_binding = self._ug_token_binding_from_forward_batch(
+            token_binding = self._session_token_binding_from_forward_batch(
                 forward_batch,
                 batch_index=batch_index,
                 metadata=metadata,
@@ -3433,7 +3433,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     @staticmethod
-    def _ug_token_binding_from_forward_batch(
+    def _session_token_binding_from_forward_batch(
         forward_batch: ForwardBatch,
         *,
         batch_index: int,

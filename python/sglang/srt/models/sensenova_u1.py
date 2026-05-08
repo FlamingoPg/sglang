@@ -1033,10 +1033,10 @@ class NEOChatModel(nn.Module):
 
         if (
             getattr(forward_batch.forward_mode, "is_decode", lambda: False)()
-            and getattr(forward_batch, "ug_decode_position_ids", None) is not None
+            and getattr(forward_batch, "custom_decode_position_ids", None) is not None
         ):
             return _u1_text_only_thw_positions(
-                forward_batch.ug_decode_position_ids.to(
+                forward_batch.custom_decode_position_ids.to(
                     dtype=torch.int64, device=input_ids.device
                 )
             )

@@ -324,7 +324,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Position information
     positions: torch.Tensor = None
-    ug_decode_position_ids: Optional[torch.Tensor] = None
+    custom_decode_position_ids: Optional[torch.Tensor] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -441,8 +441,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
-    # Experimental UG request metadata threaded from SRT scheduler requests.
-    ug_u_forward_metadata: Optional[List[Dict[str, Any]]] = None
+    # Optional session/request metadata threaded from SRT scheduler requests.
+    session_forward_metadata: Optional[List[Dict[str, Any]]] = None
 
     @classmethod
     def init_new(
@@ -488,14 +488,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             input_embeds=batch.input_embeds,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
-            ug_decode_position_ids=batch.ug_decode_position_ids,
+            custom_decode_position_ids=batch.custom_decode_position_ids,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
             rids=[req.rid for req in batch.reqs],
-            ug_u_forward_metadata=batch.ug_u_forward_metadata,
+            session_forward_metadata=batch.session_forward_metadata,
         )
         device = model_runner.device
 

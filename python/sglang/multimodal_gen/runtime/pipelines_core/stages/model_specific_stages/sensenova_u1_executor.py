@@ -57,7 +57,7 @@ class SenseNovaU1PixelFlowGSegmentExecutor:
             )
         forward_batch_provider = getattr(
             srt_executor,
-            "build_ug_g_forward_batch_for_session",
+            "build_temporary_context_forward_batch_for_session",
             None,
         )
         if not callable(forward_batch_provider):
@@ -99,7 +99,7 @@ def _resolve_srt_contexts(
         raise ValueError("SenseNova U1 pixel-flow requires a SRT UG session")
     get_position_count = getattr(
         srt_executor,
-        "get_latest_ug_session_position_count",
+        "get_latest_session_position_count",
         None,
     )
     if not callable(get_position_count):
