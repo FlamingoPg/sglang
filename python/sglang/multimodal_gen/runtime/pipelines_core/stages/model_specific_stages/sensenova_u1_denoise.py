@@ -2,14 +2,12 @@
 
 from typing import Any
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_types import (
-    U1PixelFlowForwardContext,
-    U1PixelFlowPrepared,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_utils import (
+from sglang.multimodal_gen.runtime.models.sensenova_u1_pixel_flow import (
     predict_u1_pixel_flow_from_srt,
     require_forward_context,
     should_apply_cfg,
+    U1PixelFlowForwardContext,
+    U1PixelFlowPrepared,
     u1_patchify,
     u1_unpatchify,
 )

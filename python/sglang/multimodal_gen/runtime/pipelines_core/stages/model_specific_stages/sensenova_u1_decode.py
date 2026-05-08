@@ -2,12 +2,10 @@
 
 from typing import Any
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_types import (
+from sglang.multimodal_gen.runtime.models.sensenova_u1_pixel_flow import (
+    forward_context_position,
     U1GeneratedSegment,
     U1PixelFlowPrepared,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_utils import (
-    forward_context_position,
 )
 
 
