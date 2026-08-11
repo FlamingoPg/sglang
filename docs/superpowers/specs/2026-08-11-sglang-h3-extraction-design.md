@@ -33,8 +33,8 @@ The first product is an installable package that can run the current verified Mi
   - `sglang.srt.*` used by H3 -> `sglang_h3.runtime_core.*`
   - `sglang.kernels.*` used by H3 -> `sglang_h3.kernels.*`
   - native ops stay external via the `sgl_kernel` wheel (`sglang-kernel`), e.g. the verified `0.4.5+cu129` build for H20.
-- `runtime_core/` vendors only pure-Python utilities required by H3: environment flags, trace hooks, minimal distributed world-group state, JSON/network response helpers, small utils. It does **not** vendor LLM scheduler, model executor, FSDP/deep_gemm, or compiled kernels.
-- `kernels/` vendors only the Python kernel wrappers/JIT reachable from the H3 closure, e.g. qknorm, flash/varlen attention helpers, diffusion triton scale/shift, and required quantization helpers.
+- `runtime_core/` rewrites the small pure-Python runtime surface required by H3 instead of carrying over coupled SGLang code: environment flags, trace hooks, minimal distributed world-group state, JSON/network response helpers, small utils. It does **not** vendor LLM scheduler, model executor, FSDP/deep_gemm, or compiled kernels.
+- `kernels/` extracts only the kernel wrappers/JIT reachable from the H3 closure, e.g. qknorm, flash/varlen attention helpers, diffusion triton scale/shift, and required quantization helpers. Do not spend effort preserving unrelated kernel machinery; rewrite call sites when that is simpler than keeping legacy abstraction.
 
 ### 3.3 Kept serving surface
 
@@ -80,7 +80,7 @@ Required before calling v1 done:
 
 ## 6. Risks and mitigations
 
-- **Kernel wrapper closure is larger than expected.** `python/sglang/kernels` is large and coupled to `srt`. Mitigate by computing the closure from entrypoints and deleting JIT/wrapper paths not used by H3 resident serving.
+- **Kernel wrapper closure is larger than expected.** `python/sglang/kernels` is large and coupled to `srt`. Mitigate by extracting only the H3-needed kernels and rewriting other call sites; do not preserve unrelated kernel abstraction for its own sake.
 - **Distributed state sync with LLM `srt` world group.** Remove `_sync_srt_*` behavior; use a standalone H3 world group.
 - **Model loading environment.** H3 weights live on HDFS/fuse paths; document required mounts and keep RunAI streamer behavior inside the vendored loader path.
 - **Rename collisions.** Do a single mechanical rewrite commit, then a separate behavior commit; never mix rename and feature changes.
