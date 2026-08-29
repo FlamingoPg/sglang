@@ -619,6 +619,35 @@ class TestNixlUnified(CustomTestCase):
         self.assertEqual(len(captured["host_buffers"]), 4)
         self.assertEqual(captured["direction"], "WRITE")
 
+    def test_batch_exists_v2_uses_pool_query_keys(self):
+        pool = MockHybridPool(expose_zero_copy=False)
+        self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+        self.hicache.batch_exists = lambda keys, extra_info=None: 2
+        captured = {}
+
+        def fake_query(keys):
+            captured["keys"] = keys
+            return [True] * len(keys)
+
+        self.hicache._query_keys_exist = fake_query
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=["actual-tail"],
+            query_keys=["tp8-page0", "tp8-page1"],
+        )
+
+        result = self.hicache.batch_exists_v2(["kv0", "kv1"], [transfer])
+
+        self.assertEqual(result.kv_hit_pages, 2)
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.MAMBA], 2)
+        self.assertEqual(
+            captured["keys"],
+            [
+                self.hicache._get_suffixed_key("tp8-page0") + "_mamba",
+                self.hicache._get_suffixed_key("tp8-page1") + "_mamba",
+            ],
+        )
+
     def test_batch_get_v2_uses_bounce_buffer_for_non_zero_copy_pool(self):
         pool = MockHybridPool(expose_zero_copy=False)
         self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)

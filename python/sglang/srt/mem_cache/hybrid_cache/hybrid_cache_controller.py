@@ -575,6 +575,59 @@ class HybridCacheController(BaseHiCacheController):
         self.backup_queue.put(operation)
         return operation.id
 
+    def _scope_pool_keys(self, pool_name: PoolName, keys: list[str]) -> list[str]:
+        if pool_name == PoolName.MAMBA:
+            return self.storage_key_namespace.scope_tp_shard_many(
+                keys,
+                tp_rank=self.storage_config.tp_rank,
+                tp_size=self.storage_config.tp_size,
+            )
+        return self._scope_storage_keys(keys)
+
+    def _scope_pool_transfers(
+        self, transfers: list[PoolTransfer]
+    ) -> list[PoolTransfer]:
+        return [
+            replace(
+                transfer,
+                keys=(
+                    self._scope_pool_keys(transfer.name, transfer.keys)
+                    if transfer.keys is not None
+                    else None
+                ),
+            )
+            for transfer in transfers
+        ]
+
+    def _scope_pool_query_transfers(
+        self, transfers: list[PoolTransfer], query_keys: list[str]
+    ) -> list[PoolTransfer]:
+        return [
+            replace(
+                transfer,
+                query_keys=self._scope_pool_keys(transfer.name, query_keys),
+            )
+            for transfer in self._scope_pool_transfers(transfers)
+        ]
+
+    def _storage_pool_transfers(
+        self, transfers: list[PoolTransfer]
+    ) -> list[PoolTransfer]:
+        scoped = self._scope_pool_transfers(transfers)
+        return [
+            replace(
+                transfer,
+                host_indices=(
+                    self.mem_pool_host.get_pool(transfer.name).get_storage_indices(
+                        transfer.host_indices
+                    )
+                    if transfer.host_indices is not None
+                    else None
+                ),
+            )
+            for transfer in scoped
+        ]
+
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
@@ -584,12 +637,18 @@ class HybridCacheController(BaseHiCacheController):
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
         )
+        storage_hashes = self._scope_storage_keys(hash_value)
+        storage_extra_info = self._scope_storage_extra_info(extra_info)
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
-                hash_value, operation.pool_transfers, extra_info
+                storage_hashes,
+                self._scope_pool_query_transfers(operation.pool_transfers, hash_value),
+                storage_extra_info,
             )
         else:
-            kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
+            kv_hit_count = self.storage_backend.batch_exists(
+                storage_hashes, storage_extra_info
+            )
             hit_result = PoolTransferResult(
                 kv_hit_pages=kv_hit_count, extra_pool_hit_pages={}
             )
@@ -626,6 +685,7 @@ class HybridCacheController(BaseHiCacheController):
                         keys=transfer.keys,
                         hit_policy=transfer.hit_policy,
                         indices_from_pool=transfer.indices_from_pool,
+                        query_keys=transfer.query_keys,
                     )
                 )
         return host_indices, device_indices, resolved_pool_transfers
@@ -661,7 +721,9 @@ class HybridCacheController(BaseHiCacheController):
                 transfers_nonkv, operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(transfers_nonkv)
+            results = self.storage_backend.batch_get_v2(
+                self._storage_pool_transfers(transfers_nonkv)
+            )
             pool_hits = count_pool_hits(results)
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
@@ -676,8 +738,8 @@ class HybridCacheController(BaseHiCacheController):
         return
 
     def _page_backup(self, operation):
-        # MLA KV is replicated across TP ranks and should still be written only
-        # by TP0. Rank-sharded sidecars still need every TP rank.
+        # MLA KV has one storage writer per physical DCP shard. Rank-sharded
+        # sidecars may still need replica ranks that do not own the MLA shard.
         backup_transfers = [
             transfer
             for transfer in operation.pool_transfers or []
@@ -687,7 +749,9 @@ class HybridCacheController(BaseHiCacheController):
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(backup_transfers)
+            results = self.storage_backend.batch_set_v2(
+                self._storage_pool_transfers(backup_transfers)
+            )
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
@@ -737,11 +801,11 @@ class HybridCacheController(BaseHiCacheController):
         return False
 
     def backup_thread_func(self):
-        """Back up rank-sharded sidecars on every TP rank.
+        """Back up rank-sharded sidecars even on non-writer replica ranks.
 
-        The base implementation skips the entire operation on non-zero MLA TP
-        ranks. That optimization is valid for replicated MLA KV, but not for
-        hybrid rank-sharded pools such as Kimi-K3 Mamba state.
+        The base implementation skips the entire operation when this rank does
+        not own an MLA storage shard. That is valid for replicated MLA KV, but
+        not for hybrid rank-sharded pools such as Kimi-K3 Mamba state.
         """
         while not self.storage_stop_event.is_set():
             try:

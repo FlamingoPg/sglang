@@ -171,6 +171,9 @@ class HostPoolGroup:
     def size_per_token(self):
         return self.anchor_entry.host_pool.size_per_token
 
+    def get_storage_indices(self, logical_indices: torch.Tensor) -> torch.Tensor:
+        return self.anchor_entry.host_pool.get_storage_indices(logical_indices)
+
     def clear(self) -> None:
         for entry in self.entries:
             entry.host_pool.clear()

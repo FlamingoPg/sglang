@@ -167,6 +167,9 @@ class LogicalHostPool:
     def get_page_buffer_meta(self, indices):
         return None
 
+    def get_storage_indices(self, logical_indices: torch.Tensor) -> torch.Tensor:
+        return logical_indices
+
     def get_ksize_per_token(self):
         return 0
 

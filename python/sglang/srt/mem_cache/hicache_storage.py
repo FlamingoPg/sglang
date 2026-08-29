@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -38,6 +39,70 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    dcp_rank: int = 0
+    dcp_size: int = 1
+
+
+@dataclass(frozen=True)
+class StorageKeyNamespace:
+    dcp_rank: int = 0
+    dcp_size: int = 1
+
+    def __post_init__(self) -> None:
+        if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
+            raise ValueError(
+                f"Invalid DCP storage namespace: rank={self.dcp_rank}, "
+                f"size={self.dcp_size}."
+            )
+
+    def scope(self, key: str) -> str:
+        if self.dcp_size == 1:
+            return key
+        payload = (
+            f"sglang-hicache-dcp-v1:{self.dcp_size}:{self.dcp_rank}:{key}"
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def scope_many(self, keys: List[str]) -> List[str]:
+        return [self.scope(key) for key in keys]
+
+    def scope_tp_shard(self, key: str, *, tp_rank: int, tp_size: int) -> str:
+        if tp_size < 1 or not 0 <= tp_rank < tp_size:
+            raise ValueError(
+                f"Invalid TP storage namespace: rank={tp_rank}, size={tp_size}."
+            )
+        if self.dcp_size == 1:
+            return key
+        payload = (
+            "sglang-hicache-dcp-tp-v1:"
+            f"{self.dcp_size}:{self.dcp_rank}:{tp_size}:{tp_rank}:{key}"
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def scope_tp_shard_many(
+        self, keys: List[str], *, tp_rank: int, tp_size: int
+    ) -> List[str]:
+        return [
+            self.scope_tp_shard(key, tp_rank=tp_rank, tp_size=tp_size) for key in keys
+        ]
+
+
+def is_mla_storage_writer(config: HiCacheStorageConfig) -> bool:
+    if config.dcp_size < 1 or not 0 <= config.dcp_rank < config.dcp_size:
+        raise ValueError(
+            f"Invalid DCP storage topology: rank={config.dcp_rank}, "
+            f"size={config.dcp_size}."
+        )
+    if not config.is_mla_model:
+        return True
+    if config.dcp_size == 1:
+        return config.tp_rank == 0
+    if config.tp_size % config.dcp_size != 0:
+        raise ValueError(
+            f"tp_size={config.tp_size} must be divisible by "
+            f"dcp_size={config.dcp_size}."
+        )
+    return config.tp_rank < config.dcp_size
 
 
 @dataclass
@@ -107,6 +172,15 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    # Pool-scoped candidate prefix used only by batch_exists_v2. ``keys`` keeps
+    # the actual transfer window so trailing-page semantics remain unchanged.
+    query_keys: Optional[List[str]] = None
+
+    def get_query_keys(
+        self, fallback_keys: List[str], max_pages: Optional[int] = None
+    ) -> List[str]:
+        keys = fallback_keys if self.query_keys is None else self.query_keys
+        return keys if max_pages is None else keys[:max_pages]
 
 
 @dataclass(frozen=True)
@@ -187,6 +261,10 @@ class HiCacheStorage(ABC):
         - ``"trailing_pages"``:  only the *last* ``len(transfer.keys)`` pages
           of the KV prefix need to exist.  Used for pools whose data covers
           only the tail of a prefix (e.g. Mamba/SWA Pool).
+
+        A transfer may provide ``query_keys`` when its storage namespace differs
+        from the primary KV namespace. Backends use those keys to probe the full
+        candidate prefix while retaining ``keys`` as the actual transfer window.
 
         Returns
         -------
@@ -388,6 +466,16 @@ class HiCacheFile(HiCacheStorage):
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        # Give each DCP shard its own LRU namespace. The controller-scoped key
+        # prevents object collisions; this suffix also prevents independent
+        # shard owners from scanning or evicting one another's files.
+        if storage_config.dcp_size > 1:
+            self.config_suffix += (
+                f"_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
+            )
+        self._tp_sharded_config_suffix = self.config_suffix
+        if storage_config.dcp_size > 1:
+            self._tp_sharded_config_suffix += f"_tp{tp_rank}_{tp_size}"
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -428,19 +516,52 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix,
             tp_rank=tp_rank,
             is_mla_model=is_mla_model,
+            is_storage_owner=is_mla_storage_writer(storage_config),
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
             ),
         )
+        if storage_config.dcp_size > 1:
+            self._tp_sharded_evictor = LRUFileEvictor(
+                self.file_path,
+                self._tp_sharded_config_suffix,
+                tp_rank=tp_rank,
+                is_mla_model=is_mla_model,
+                is_storage_owner=True,
+                extra_config=storage_config.extra_config,
+                on_evict=(
+                    self.metadata_cache.remove
+                    if self.metadata_cache is not None
+                    else None
+                ),
+            )
+        else:
+            self._tp_sharded_evictor = self._evictor
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
+    @staticmethod
+    def _is_tp_sharded_component(component_name: Optional[str]) -> bool:
+        return component_name == PoolName.MAMBA
+
+    def _get_component_suffix(self, component_name: Optional[str]) -> str:
+        if self._is_tp_sharded_component(component_name):
+            return self._tp_sharded_config_suffix
+        return self.config_suffix
+
+    def _get_component_evictor(self, component_name: Optional[str]):
+        if self._is_tp_sharded_component(component_name):
+            return self._tp_sharded_evictor
+        return self._evictor
+
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
-            return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+            component_key = key
+        else:
+            component_key = f"{key}.{component_name}"
+        return component_key + self._get_component_suffix(component_name)
 
     def _get_component_path(
         self, key: str, component_name: Optional[str] = None
@@ -458,25 +579,27 @@ class HiCacheFile(HiCacheStorage):
             if not fn.endswith(".bin"):
                 continue
             stem = fn[:-4]
-            # Only files belonging to this rank/model.
-            if stem.endswith(self.config_suffix):
+            # Include both the DCP-aligned target namespace and this TP rank's
+            # sidecar namespace.
+            if stem.endswith((self.config_suffix, self._tp_sharded_config_suffix)):
                 self.metadata_cache.add(stem)
 
-    def get(
+    def _get_value(
         self,
         key: str,
         target_location: torch.Tensor,
-        target_sizes: Optional[Any] = None,
+        component_name: Optional[str] = None,
     ) -> torch.Tensor | None:
-        suffixed = self._get_suffixed_key(key)
+        suffixed = self._get_component_key(key, component_name)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+        evictor = self._get_component_evictor(component_name)
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
                 if f.readinto(buf) != expected:
                     raise IOError(f"Short read for {suffixed}")
-            self._evictor.touch(suffixed, tensor_path)
+            evictor.touch(suffixed, tensor_path)
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
             return target_location
@@ -485,6 +608,14 @@ class HiCacheFile(HiCacheStorage):
                 self.metadata_cache.remove(suffixed)
             logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
             return None
+
+    def get(
+        self,
+        key: str,
+        target_location: torch.Tensor,
+        target_sizes: Optional[Any] = None,
+    ) -> torch.Tensor | None:
+        return self._get_value(key, target_location)
 
     def batch_get(
         self,
@@ -499,20 +630,20 @@ class HiCacheFile(HiCacheStorage):
             )
         ]
 
-    def set(
+    def _set_value(
         self,
         key: str,
         value: Optional[Any] = None,
-        target_location: Optional[Any] = None,
-        target_sizes: Optional[Any] = None,
+        component_name: Optional[str] = None,
     ) -> bool:
-        suffixed = self._get_suffixed_key(key)
+        suffixed = self._get_component_key(key, component_name)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+        evictor = self._get_component_evictor(component_name)
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
-        if self.exists(key):
+        if self._component_exists(key, component_name):
             logger.debug(f"Key {key} already exists. Skipped.")
-            self._evictor.touch(suffixed, tensor_path)
+            evictor.touch(suffixed, tensor_path)
             return True
 
         tmp_path = None
@@ -520,7 +651,7 @@ class HiCacheFile(HiCacheStorage):
         try:
             value_bytes = value.numel() * value.element_size()
             # Ask the evictor to admit + reserve disk space (evicting if needed).
-            if not self._evictor.reserve(suffixed, value_bytes, key=key):
+            if not evictor.reserve(suffixed, value_bytes, key=key):
                 return False
             reserved = True
 
@@ -530,7 +661,7 @@ class HiCacheFile(HiCacheStorage):
             )
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tmp_path)
             os.replace(tmp_path, tensor_path)
-            self._evictor.commit(suffixed)
+            evictor.commit(suffixed)
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
             return True
@@ -538,7 +669,7 @@ class HiCacheFile(HiCacheStorage):
             logger.error(f"Failed to save tensor {key}: {e}")
             # Roll back the reservation and clean up any half-written file.
             if reserved:
-                self._evictor.abort(suffixed)
+                evictor.abort(suffixed)
             if tmp_path is not None:
                 try:
                     os.remove(tmp_path)
@@ -547,6 +678,15 @@ class HiCacheFile(HiCacheStorage):
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
             return False
+
+    def set(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        return self._set_value(key, value)
 
     def batch_set(
         self,
@@ -560,16 +700,19 @@ class HiCacheFile(HiCacheStorage):
                 return False
         return True
 
-    def exists(self, key: str) -> bool:
-        key = self._get_suffixed_key(key)
-        if self.metadata_cache is not None and self.metadata_cache.contains(key):
+    def _component_exists(self, key: str, component_name: Optional[str] = None) -> bool:
+        suffixed = self._get_component_key(key, component_name)
+        if self.metadata_cache is not None and self.metadata_cache.contains(suffixed):
             return True
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
+        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
         if os.path.exists(tensor_path):
             if self.metadata_cache is not None:
-                self.metadata_cache.add(key)
+                self.metadata_cache.add(suffixed)
             return True
         return False
+
+    def exists(self, key: str) -> bool:
+        return self._component_exists(key)
 
     def _collect_existing_component_keys(
         self,
@@ -578,7 +721,7 @@ class HiCacheFile(HiCacheStorage):
     ) -> Set[str]:
         target_files = {f"{self._get_component_key(key)}.bin" for key in keys}
         for transfer in pool_transfers or []:
-            for key in keys:
+            for key in transfer.get_query_keys(keys, len(keys)):
                 target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
 
         if self.metadata_cache is None:
@@ -608,10 +751,18 @@ class HiCacheFile(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
         existing_files = self._collect_existing_component_keys(keys, pool_transfers)
+        pool_query_keys = {
+            transfer.name: transfer.get_query_keys(keys, len(keys))
+            for transfer in pool_transfers or []
+        }
 
         def has_component(page_idx: int, name: str) -> bool:
+            query_keys = pool_query_keys[name]
+            if page_idx >= len(query_keys):
+                return False
             return (
-                f"{self._get_component_key(keys[page_idx], name)}.bin" in existing_files
+                f"{self._get_component_key(query_keys[page_idx], name)}.bin"
+                in existing_files
             )
 
         # Longest contiguous KV prefix present in storage.
@@ -651,13 +802,11 @@ class HiCacheFile(HiCacheStorage):
 
         return PoolTransferResult(final_pages, hit_count)
 
-    def _log_key(self, pool_name: str, key: str) -> str:
-        return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
-
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
-        storage_key = self._log_key(pool_name, key)
-        data_page = self.get(storage_key, host_pool.get_dummy_flat_data_page())
+        data_page = self._get_value(
+            key, host_pool.get_dummy_flat_data_page(), component_name=pool_name
+        )
         if data_page is None:
             return False
         host_pool.set_from_flat_data_page(page_offset, data_page)
@@ -667,9 +816,8 @@ class HiCacheFile(HiCacheStorage):
         self, pool_name: str, key: str, host_pool, page_offset: int
     ) -> bool:
         """Write one page from host_pool at page_offset to storage as raw bytes."""
-        storage_key = self._log_key(pool_name, key)
         data_page = host_pool.get_data_page(page_offset, flat=True)
-        return self.set(storage_key, data_page)
+        return self._set_value(key, data_page, component_name=pool_name)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], op_fn):
         results: dict[str, List[bool]] = {}
@@ -718,6 +866,8 @@ class HiCacheFile(HiCacheStorage):
                 if os.path.isfile(file_path):
                     os.remove(file_path)
             self._evictor.clear()
+            if self._tp_sharded_evictor is not self._evictor:
+                self._tp_sharded_evictor.clear()
             if self.metadata_cache is not None:
                 self.metadata_cache.clear()
             logger.info("Cleared all entries in HiCacheFile storage.")

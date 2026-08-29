@@ -1,5 +1,6 @@
 import types
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -194,6 +195,18 @@ class FakeMultiBufferPool:
             ptrs.extend([4000 + i * 10, 4001 + i * 10])
             sizes.extend([8, 16])
         return ptrs, sizes
+
+
+class FakeMambaPool:
+    page_size = 1
+    temporal_state_elem_size = 8
+
+    def __init__(self):
+        self.temporal_buffer = torch.empty((128,), dtype=torch.uint8)
+        self.conv_buffer = []
+
+    def get_hybrid_pool_buffer(self):
+        return [self.temporal_buffer]
 
 
 def _make_config(
@@ -451,6 +464,25 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             call["args"][0].group_ids,
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
         )
+
+    def test_v2_exists_uses_pool_query_keys(self):
+        store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
+        store.mem_pool_host = SimpleNamespace(kv_buffer=None)
+        store.register_mem_host_pool_v2(FakeMambaPool(), PoolName.MAMBA)
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=["actual-tail"],
+            query_keys=["tp8-page0", "tp8-page1"],
+        )
+        component_keys, _ = store._get_hybrid_page_component_keys(
+            transfer.query_keys, transfer
+        )
+        fake_store.existing_keys.update(store._tag_keys(component_keys))
+
+        result = store.batch_exists_v2(["kv0", "kv1"], [transfer])
+
+        self.assertEqual(result.kv_hit_pages, 2)
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.MAMBA], 2)
 
     def test_model_names_isolate_the_same_logical_key(self):
         store_a, fake_store_a = _make_store(

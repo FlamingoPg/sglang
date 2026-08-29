@@ -384,6 +384,10 @@ class HostKVCache(abc.ABC):
         )
         return indices[self.dcp_rank :: self.dcp_size] // self.dcp_size
 
+    def get_storage_indices(self, logical_indices: torch.Tensor) -> torch.Tensor:
+        """Map controller-visible slots to rows materialized by this host pool."""
+        return self.maybe_dcp_kernel_indices(logical_indices)
+
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         assert (

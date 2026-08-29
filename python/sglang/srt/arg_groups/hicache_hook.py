@@ -73,14 +73,6 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
         return
-    if cfg.hicache_storage_backend is not None:
-        raise NotImplementedError(
-            "--hicache-storage-backend (L3) with --dcp-size > 1 is not "
-            "supported yet: under DCP each rank holds a distinct "
-            "interleaved MLA KV shard, so the rank-0-only replicated-MLA "
-            "backup and the storage keys must become dcp_rank-aware "
-            "first. Run HiCache+DCP with L1/L2 only."
-        )
     if cfg.speculative_algorithm not in (None, "DSPARK"):
         raise NotImplementedError(
             "HiCache with --dcp-size > 1 only supports DSPARK speculative "
@@ -103,10 +95,25 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
             "the index translation lives in MLATokenToKVPoolHost, and the "
             "MHA host pool has none."
         )
+    if cfg.hicache_storage_backend in ("hf3fs", "mori"):
+        raise NotImplementedError(
+            f"--hicache-storage-backend {cfg.hicache_storage_backend} with "
+            "--dcp-size > 1 is not supported: this backend retains internal "
+            "MLA leader/follower ownership that is not DCP-shard-aware. "
+            "Use a DCP-aware backend such as file."
+        )
+    if cfg.hicache_storage_backend == "aibrix":
+        raise NotImplementedError(
+            "--hicache-storage-backend aibrix with --dcp-size > 1 is not "
+            "supported: AibrixKVCacheStorage does not support MLA models. "
+            "Use a DCP-aware MLA backend such as file."
+        )
+    enabled_tiers = "L1/L2/L3" if cfg.hicache_storage_backend is not None else "L1/L2"
     logger.info(
-        "HiCache + DCP enabled (L1/L2 only): host pool uses widened "
+        "HiCache + DCP enabled (%s): host pool uses widened "
         "logical slot accounting with per-rank physical translation at "
         "the transfer boundary (dcp_size=%d).",
+        enabled_tiers,
         cfg.dcp_size,
     )
 

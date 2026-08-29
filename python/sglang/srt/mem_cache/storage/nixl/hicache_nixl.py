@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    is_mla_storage_writer,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
@@ -103,7 +104,7 @@ class HiCacheNixl(HiCacheStorage):
         self.is_mla_model = storage_config.is_mla_model
         self.is_zero_copy = False
         self.storage_config = storage_config
-        self.backup_skip = self.is_mla_model and storage_config.tp_rank != 0
+        self.backup_skip = not is_mla_storage_writer(storage_config)
 
         model_name = "-".join(model_name.split("/")) if model_name else ""
 
@@ -906,11 +907,13 @@ class HiCacheNixl(HiCacheStorage):
                 if ctx.is_zero_copy
                 else 1
             )
+            query_keys = transfer.get_query_keys(keys, kv_pages)
             component_keys = self._get_hybrid_component_keys(
-                keys[:kv_pages], transfer.name, key_multiplier
+                query_keys, transfer.name, key_multiplier
             )
             exists_results = self._query_keys_exist(component_keys)
             page_exists = self._page_results(exists_results, key_multiplier)
+            page_exists.extend([False] * (kv_pages - len(page_exists)))
 
             boundary = 0
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:

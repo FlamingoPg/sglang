@@ -17,7 +17,7 @@ limitations under the License.
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
@@ -29,7 +29,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
+    StorageKeyNamespace,
     count_pool_hits,
+    is_mla_storage_writer,
 )
 
 if TYPE_CHECKING:
@@ -145,6 +147,10 @@ class CacheOperation:
                 host_indices=cat_or_none(t.host_indices for t in transfers),
                 device_indices=cat_or_none(t.device_indices for t in transfers),
                 keys=[key for t in transfers if t.keys for key in t.keys] or None,
+                query_keys=[
+                    key for t in transfers if t.query_keys for key in t.query_keys
+                ]
+                or None,
                 hit_policy=transfers[0].hit_policy,
                 indices_from_pool=transfers[0].indices_from_pool,
             )
@@ -553,12 +559,11 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
+        self.storage_key_namespace = StorageKeyNamespace(
+            dcp_rank=self.storage_config.dcp_rank,
+            dcp_size=self.storage_config.dcp_size,
         )
+        self.backup_skip = not is_mla_storage_writer(self.storage_config)
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
@@ -740,7 +745,25 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            dcp_rank=get_parallel().attn_dcp_rank,
+            dcp_size=get_parallel().attn_dcp_size,
         )
+
+    def _scope_storage_keys(self, keys: List[str]) -> List[str]:
+        return self.storage_key_namespace.scope_many(keys)
+
+    def _scope_storage_extra_info(
+        self, extra_info: Optional[HiCacheStorageExtraInfo]
+    ) -> Optional[HiCacheStorageExtraInfo]:
+        if extra_info is None or extra_info.prefix_keys is None:
+            return extra_info
+        return replace(
+            extra_info,
+            prefix_keys=self._scope_storage_keys(extra_info.prefix_keys),
+        )
+
+    def _storage_host_indices(self, logical_indices: torch.Tensor) -> torch.Tensor:
+        return self.mem_pool_host.get_storage_indices(logical_indices)
 
     def reset(self):
         self.storage_stop_event.set()
@@ -1034,8 +1057,10 @@ class HiCacheController:
                 break
             if operation.is_terminated():
                 break
+            # Must set the data before increasing the completed tokens.
+            # Otherwise this page may be read before being set.
             self.storage_host_pool.set_from_flat_data_page(
-                host_indices[i * self.page_size],
+                host_indices[i * self.storage_host_pool.page_size],
                 page_data[i],
             )
             count += 1
@@ -1104,17 +1129,29 @@ class HiCacheController:
         """
         # Read from KV pool.
         kv_hits = self.page_get_func(
-            operation, batch_hashes, batch_host_indices, extra_info
+            operation,
+            self._scope_storage_keys(batch_hashes),
+            self._storage_host_indices(batch_host_indices),
+            self._scope_storage_extra_info(extra_info),
         )
 
         # Read from KV-derived sidecar pools, if any.
         sidecar_hits: dict[str, int] = {}
         if len(kv_derived_transfers) > 0:
+            sidecar_keys = self._scope_storage_keys(batch_hashes)
+            get_pool = getattr(self.mem_pool_host, "get_pool", None)
             current_kv_derived_transfers = [
                 PoolTransfer(
                     name=transfer.name,
-                    host_indices=batch_host_indices,
-                    keys=batch_hashes,
+                    # Each pool translates the anchor's logical indices for its
+                    # own layout: DCP-sharded pools go physical, replicated
+                    # pools (e.g. the DSpark draft) stay logical.
+                    host_indices=(
+                        get_pool(transfer.name).get_storage_indices(batch_host_indices)
+                        if get_pool is not None
+                        else batch_host_indices
+                    ),
+                    keys=sidecar_keys,
                 )
                 for transfer in kv_derived_transfers
             ]
@@ -1182,7 +1219,10 @@ class HiCacheController:
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            hit_page_num = self.storage_backend.batch_exists(
+                self._scope_storage_keys(batch_hashes),
+                self._scope_storage_extra_info(extra_info),
+            )
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -1245,7 +1285,9 @@ class HiCacheController:
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
         data = [
-            self.storage_host_pool.get_data_page(host_indices[i * self.page_size])
+            self.storage_host_pool.get_data_page(
+                host_indices[i * self.storage_host_pool.page_size]
+            )
             for i in range(len(hash_values))
         ]
         return self.storage_backend.batch_set(hash_values, data)
@@ -1267,7 +1309,11 @@ class HiCacheController:
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            success = self.page_set_func(
+                self._scope_storage_keys(batch_hashes),
+                self._storage_host_indices(batch_host_indices),
+                self._scope_storage_extra_info(extra_info),
+            )
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."

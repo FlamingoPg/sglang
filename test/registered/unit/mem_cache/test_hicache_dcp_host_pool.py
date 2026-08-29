@@ -16,6 +16,8 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -42,17 +44,49 @@ def _fake_mla_device_pool(size: int = 1024) -> SimpleNamespace:
     )
 
 
-def _make_host_pool(dcp_rank: int, device_size: int = 1024) -> MLATokenToKVPoolHost:
+def _make_host_pool(
+    dcp_rank: int,
+    device_size: int = 1024,
+    *,
+    dcp_size: int = DCP_SIZE,
+    layout: str = "layer_first",
+) -> MLATokenToKVPoolHost:
     return MLATokenToKVPoolHost(
         _fake_mla_device_pool(device_size),
         host_to_device_ratio=2.0,
         host_size=0,
-        page_size=WIDENED_PAGE,
-        layout="layer_first",
+        page_size=PHYSICAL_PAGE * dcp_size,
+        layout=layout,
         pin_memory=False,
         device="cpu",
-        dcp_size=DCP_SIZE,
+        dcp_size=dcp_size,
         dcp_rank=dcp_rank,
+    )
+
+
+def _physical_page_view(
+    pool: MLATokenToKVPoolHost, physical_offset: int
+) -> torch.Tensor:
+    if pool.layout == "layer_first":
+        return pool.kv_buffer[
+            :, physical_offset : physical_offset + pool.page_size, :, :
+        ]
+    if pool.layout == "page_first":
+        return pool.kv_buffer[
+            physical_offset : physical_offset + pool.page_size, :, :, :
+        ]
+    if pool.layout == "page_first_direct":
+        page_index = physical_offset // pool.page_size
+        return pool.kv_buffer[page_index : page_index + 1, :, :, :, :]
+    raise AssertionError(f"Unexpected test layout: {pool.layout}")
+
+
+def _assert_byte_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    torch.testing.assert_close(
+        actual.contiguous().view(torch.uint8),
+        expected.contiguous().view(torch.uint8),
+        rtol=0,
+        atol=0,
     )
 
 
@@ -67,6 +101,7 @@ class TestDcpKernelIndices(CustomTestCase):
         pool = self._bare_pool(1, 0)
         indices = torch.arange(37)
         self.assertIs(pool.maybe_dcp_kernel_indices(indices), indices)
+        self.assertIs(pool.get_storage_indices(indices), indices)
 
     def test_aligned_page_translates_to_full_physical_page(self):
         # One widened page starting at logical 512 covers physical rows
@@ -200,10 +235,85 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
         torch.testing.assert_close(kwargs["src_indices"], expected)
         torch.testing.assert_close(kwargs["dst_indices"], expected)
 
-    def test_l3_data_page_is_guarded(self):
-        pool = _make_host_pool(dcp_rank=0)
-        with self.assertRaises(AssertionError):
-            pool.get_data_page(0)
+
+class TestDcpStoragePageRoundTrip(CustomTestCase):
+    def test_rank_local_page_round_trip_for_all_storage_layouts(self):
+        logical_page = torch.arange(WIDENED_PAGE, 2 * WIDENED_PAGE)
+        layouts = ("layer_first", "page_first", "page_first_direct")
+
+        for layout in layouts:
+            for rank in range(DCP_SIZE):
+                with self.subTest(layout=layout, rank=rank):
+                    pool = _make_host_pool(dcp_rank=rank, layout=layout)
+                    physical_indices = pool.get_storage_indices(logical_page)
+                    torch.testing.assert_close(
+                        physical_indices,
+                        torch.arange(PHYSICAL_PAGE, 2 * PHYSICAL_PAGE),
+                    )
+                    physical_offset = int(physical_indices[0].item())
+
+                    first_page = _physical_page_view(pool, 0)
+                    first_page.fill_(-(rank + 1))
+                    second_page = _physical_page_view(pool, physical_offset)
+                    expected = (
+                        torch.arange(second_page.numel(), dtype=torch.int64)
+                        .remainder(97)
+                        .add(rank * 100)
+                        .to(pool.dtype)
+                        .reshape(second_page.shape)
+                    )
+                    second_page.copy_(expected)
+
+                    serialized = pool.get_data_page(physical_offset, flat=True).clone()
+                    self.assertEqual(
+                        serialized.numel(),
+                        pool.layer_num * PHYSICAL_PAGE * pool.kv_cache_dim,
+                    )
+                    _assert_byte_equal(serialized, expected.flatten())
+
+                    second_page.zero_()
+                    pool.set_from_flat_data_page(physical_offset, serialized)
+                    _assert_byte_equal(second_page, expected)
+                    self.assertTrue(torch.all(first_page == -(rank + 1)))
+
+    def test_non_dcp_storage_page_round_trip_is_unchanged(self):
+        logical_page = torch.arange(PHYSICAL_PAGE, 2 * PHYSICAL_PAGE)
+        for layout in ("layer_first", "page_first", "page_first_direct"):
+            with self.subTest(layout=layout):
+                pool = _make_host_pool(dcp_rank=0, dcp_size=1, layout=layout)
+                self.assertIs(pool.get_storage_indices(logical_page), logical_page)
+                page = _physical_page_view(pool, PHYSICAL_PAGE)
+                expected = (
+                    torch.arange(page.numel(), dtype=torch.int64)
+                    .remainder(89)
+                    .to(pool.dtype)
+                    .reshape(page.shape)
+                )
+                page.copy_(expected)
+
+                serialized = pool.get_data_page(PHYSICAL_PAGE, flat=True).clone()
+                page.zero_()
+                pool.set_from_flat_data_page(PHYSICAL_PAGE, serialized)
+                _assert_byte_equal(page, expected)
+
+    def test_host_pool_group_delegates_storage_index_translation(self):
+        pool = _make_host_pool(dcp_rank=6)
+        group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=pool,
+                    device_pool=pool.device_pool,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=True,
+                )
+            ]
+        )
+        logical_page = torch.arange(2 * WIDENED_PAGE, 3 * WIDENED_PAGE)
+        torch.testing.assert_close(
+            group.get_storage_indices(logical_page),
+            torch.arange(2 * PHYSICAL_PAGE, 3 * PHYSICAL_PAGE),
+        )
 
 
 if __name__ == "__main__":

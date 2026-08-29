@@ -21,6 +21,7 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
 from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache,
     handle_hicache_ratio_default,
+    resolve_hicache_dcp_compatibility,
 )
 from sglang.srt.arg_groups.hisparse_hook import (
     validate_hisparse_dsa_backend,
@@ -1555,6 +1556,108 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(resolution_result(args, "hicache_io_backend"), "kernel")
         self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_first")
         self.assertIsNone(resolution_result(args, "decode_attention_backend"))
+
+    def test_hicache_dcp8_file_storage_is_allowed_for_mla(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="file",
+            dcp_size=8,
+        )
+
+        with (
+            patch(
+                "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                return_value=True,
+            ),
+            self.assertLogs("sglang.srt.arg_groups.hicache_hook", level="INFO") as logs,
+        ):
+            resolve_hicache_dcp_compatibility(args)
+
+        self.assertIn("L1/L2/L3", "\n".join(logs.output))
+
+    def test_hicache_dcp8_file_storage_keeps_unsupported_guards(self):
+        cases = [
+            (
+                "speculative",
+                {"speculative_algorithm": "EAGLE"},
+                True,
+                "only supports DSPARK speculative decoding",
+            ),
+            (
+                "lmcache",
+                {"enable_lmcache": True},
+                True,
+                "LMCache has no DCP-aware index translation",
+            ),
+            (
+                "hisparse",
+                {"enable_hisparse": True},
+                True,
+                "HiSparse host pool is constructed without DCP translation",
+            ),
+            (
+                "non_mla",
+                {},
+                False,
+                "only supported for MLA models",
+            ),
+        ]
+
+        for name, overrides, use_mla, message in cases:
+            with self.subTest(case=name):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    hicache_storage_backend="file",
+                    dcp_size=8,
+                    **overrides,
+                )
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                        return_value=use_mla,
+                    ),
+                    self.assertRaisesRegex(NotImplementedError, message),
+                ):
+                    resolve_hicache_dcp_compatibility(args)
+
+    def test_hicache_dcp8_rejects_rank0_only_storage_backends(self):
+        for backend in ("hf3fs", "mori"):
+            with self.subTest(backend=backend):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    hicache_storage_backend=backend,
+                    dcp_size=8,
+                )
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                        return_value=True,
+                    ),
+                    self.assertRaisesRegex(
+                        NotImplementedError,
+                        "internal MLA leader/follower ownership",
+                    ),
+                ):
+                    resolve_hicache_dcp_compatibility(args)
+
+    def test_hicache_dcp8_rejects_aibrix_for_mla(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="aibrix",
+            dcp_size=8,
+        )
+
+        with (
+            patch(
+                "sglang.srt.arg_groups.hicache_hook.use_mla_backend",
+                return_value=True,
+            ),
+            self.assertRaisesRegex(
+                NotImplementedError,
+                "AibrixKVCacheStorage does not support MLA",
+            ),
+        ):
+            resolve_hicache_dcp_compatibility(args)
 
     def test_decode_offload_rejects_host_pool_retraction(self):
         args = self._make_args(

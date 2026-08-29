@@ -185,13 +185,16 @@ class SimHiCacheStorage(HiCacheStorage):
             if final_pages == 0:
                 break
             name = transfer.name
+            query_keys = transfer.get_query_keys(keys, kv_pages)
+
+            def has_component(page_idx: int) -> bool:
+                return page_idx < len(query_keys) and (
+                    self._scoped(name, query_keys[page_idx]) in snapshot
+                )
+
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 boundary = next(
-                    (
-                        i
-                        for i in range(kv_pages)
-                        if self._scoped(name, keys[i]) not in snapshot
-                    ),
+                    (i for i in range(kv_pages) if not has_component(i)),
                     kv_pages,
                 )
             else:  # trailing_pages
@@ -199,7 +202,7 @@ class SimHiCacheStorage(HiCacheStorage):
                 boundary = 0
                 for prefix_len in range(kv_pages, 0, -1):
                     if all(
-                        self._scoped(name, keys[i]) in snapshot
+                        has_component(i)
                         for i in range(max(0, prefix_len - trailing), prefix_len)
                     ):
                         boundary = prefix_len

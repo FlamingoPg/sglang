@@ -845,8 +845,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for transfer in pool_transfers or []:
             if final_pages == 0:
                 break
+            query_keys = transfer.get_query_keys(keys, kv_pages)
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
+                query_keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
@@ -856,8 +857,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         r == 1
                         for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
                     )
-                    for i in range(kv_pages)
+                    for i in range(len(query_keys))
                 ]
+                page_exists.extend([False] * (kv_pages - len(page_exists)))
             else:
                 page_exists = [False] * kv_pages
             boundary = 0

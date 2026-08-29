@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     MetadataCache,
+    PoolName,
 )
 from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
 from sglang.test.test_utils import CustomTestCase
@@ -48,6 +49,8 @@ def _make_config(
     pp_size=1,
     attn_cp_rank=0,
     attn_cp_size=1,
+    dcp_rank=0,
+    dcp_size=1,
     is_mla=False,
     model="testmodel",
     extra_config=None,
@@ -59,6 +62,8 @@ def _make_config(
         pp_size=pp_size,
         attn_cp_rank=attn_cp_rank,
         attn_cp_size=attn_cp_size,
+        dcp_rank=dcp_rank,
+        dcp_size=dcp_size,
         is_mla_model=is_mla,
         enable_storage_metrics=False,
         is_page_first_layout=True,
@@ -83,6 +88,8 @@ class _BackendBuilder:
         tp_size=1,
         attn_cp_rank=0,
         attn_cp_size=1,
+        dcp_rank=0,
+        dcp_size=1,
         is_mla=False,
         model="testmodel",
         subdir=None,
@@ -100,6 +107,8 @@ class _BackendBuilder:
             tp_size=tp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
+            dcp_rank=dcp_rank,
+            dcp_size=dcp_size,
             is_mla=is_mla,
             model=model,
             extra_config={
@@ -275,6 +284,23 @@ class TestScanExistingFiles(HiCacheFileLRUTestBase):
 class TestCPSuffix(HiCacheFileLRUTestBase):
     """Distinct CP ranks must not share a file key."""
 
+    def test_dcp1_mla_suffix_is_unchanged(self):
+        backend = self.make_backend(
+            is_mla=True,
+            tp_rank=0,
+            tp_size=8,
+            dcp_rank=0,
+            dcp_size=1,
+            subdir="dcp1",
+        )
+        self.assertEqual(backend.config_suffix, "_testmodel")
+        self.assertEqual(backend._tp_sharded_config_suffix, backend.config_suffix)
+        self.assertIs(backend._tp_sharded_evictor, backend._evictor)
+        self.assertEqual(
+            backend._get_component_key("k", PoolName.MAMBA),
+            "k.mamba_testmodel",
+        )
+
     def test_cp_disabled_has_no_cp_suffix(self):
         b = self.make_backend(attn_cp_size=1, attn_cp_rank=0)
         self.assertNotIn("_cp", b.config_suffix)
@@ -295,6 +321,27 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
         self.assertTrue(b0.config_suffix.endswith("_cp0_4"))
         self.assertTrue(b1.config_suffix.endswith("_cp3_4"))
         self.assertNotEqual(b0.config_suffix, b1.config_suffix)
+
+    def test_dcp_suffix_isolates_shard_lru_namespaces(self):
+        b0 = self.make_backend(
+            is_mla=True,
+            tp_rank=0,
+            tp_size=8,
+            dcp_rank=0,
+            dcp_size=8,
+            subdir="dcp",
+        )
+        b5 = self.make_backend(
+            is_mla=True,
+            tp_rank=5,
+            tp_size=8,
+            dcp_rank=5,
+            dcp_size=8,
+            subdir="dcp",
+        )
+        self.assertTrue(b0.config_suffix.endswith("_dcp0_8"))
+        self.assertTrue(b5.config_suffix.endswith("_dcp5_8"))
+        self.assertNotEqual(b0.config_suffix, b5.config_suffix)
 
 
 class TestMLAOwnerGating(HiCacheFileLRUTestBase):
@@ -322,6 +369,30 @@ class TestMLAOwnerGating(HiCacheFileLRUTestBase):
         self.assertTrue(b.set("a", _t(50)))
         self.assertTrue(b.exists("a"))
         self.assertEqual(len(b._evictor._lru), 0)
+
+    def test_dcp_mla_nonzero_rank_owns_its_shard(self):
+        b = self.make_backend(
+            max_size="200",
+            is_mla=True,
+            tp_rank=5,
+            tp_size=8,
+            dcp_rank=5,
+            dcp_size=8,
+        )
+        self.assertTrue(b._evictor.is_storage_owner)
+        self.assertTrue(b._evictor.enabled)
+
+    def test_dcp_mla_second_replica_group_skips_eviction(self):
+        b = self.make_backend(
+            max_size="200",
+            is_mla=True,
+            tp_rank=13,
+            tp_size=16,
+            dcp_rank=5,
+            dcp_size=8,
+        )
+        self.assertFalse(b._evictor.is_storage_owner)
+        self.assertFalse(b._evictor.enabled)
 
     def test_non_mla_each_rank_owns_its_files(self):
         # Non-MLA: even rank > 0 is its own owner because suffix isolates files.
